@@ -1,0 +1,5 @@
+node_modules/
+.env.example
+firebase-service-account.json
+aiven-ca.pem
+*.pem

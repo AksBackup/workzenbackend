@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HRMS License Admin</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80; --red:#f87171; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 32px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 24px; max-width: 900px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input { background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+  button { background: var(--accent); color: #0f172a; border: none; padding: 9px 16px; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; }
+  button.secondary { background: var(--border); color: var(--text); }
+  button.danger { background: var(--red); color: #0f172a; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; }
+  .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .badge.unused { background: #334155; color: var(--muted); }
+  .badge.active { background: rgba(74,222,128,0.15); color: var(--green); }
+  .badge.revoked, .badge.expired { background: rgba(248,113,113,0.15); color: var(--red); }
+  .keyval { font-family: monospace; font-size: 13px; letter-spacing: 0.5px; }
+  #gateScreen { max-width: 380px; margin: 100px auto; }
+  #mainScreen { display: none; }
+</style>
+</head>
+<body>
+
+<div id="gateScreen">
+  <h1>HRMS License Admin</h1>
+  <p class="subtitle">Internal tool &mdash; enter the panel secret to continue</p>
+  <div class="card">
+    <label for="panelKey">Panel Secret</label>
+    <input type="password" id="panelKey" style="width:100%; margin-bottom: 12px;">
+    <button onclick="unlockPanel()" style="width:100%;">Unlock</button>
+  </div>
+</div>
+
+<div id="mainScreen">
+  <h1>HRMS License Admin</h1>
+  <p class="subtitle">Generate and manage license keys &mdash; one company, one license, one admin</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="maxEmployees">Max Employees</label>
+        <input type="number" id="maxEmployees" value="50">
+      </div>
+      <div>
+        <label for="expiresDays">Expires In (days, blank = never)</label>
+        <input type="number" id="expiresDays" placeholder="365">
+      </div>
+      <button onclick="generateKey()">Generate License Key</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <strong>All Licenses</strong>
+      <button class="secondary" onclick="loadLicenses()">Refresh</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Key</th><th>Company</th><th>Status</th><th>Max Emp.</th><th>Expires</th><th>Activated</th><th></th>
+        </tr>
+      </thead>
+      <tbody id="licenseTableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const API_BASE = window.location.origin;
+
+  function getSecret() { return localStorage.getItem('panelSecret') || ''; }
+
+  function unlockPanel() {
+    const key = document.getElementById('panelKey').value.trim();
+    if (!key) return;
+    localStorage.setItem('panelSecret', key);
+    checkAccess();
+  }
+
+  async function checkAccess() {
+    try {
+      const res = await fetch(`${API_BASE}/license/admin/list`, {
+        headers: { 'x-panel-key': getSecret() }
+      });
+      if (res.ok) {
+        document.getElementById('gateScreen').style.display = 'none';
+        document.getElementById('mainScreen').style.display = 'block';
+        loadLicenses();
+      } else {
+        localStorage.removeItem('panelSecret');
+      }
+    } catch (e) { /* server unreachable, stay on gate screen */ }
+  }
+
+  async function generateKey() {
+    const max_employees = parseInt(document.getElementById('maxEmployees').value, 10) || 50;
+    const expiresDaysVal = document.getElementById('expiresDays').value;
+    const expires_in_days = expiresDaysVal ? parseInt(expiresDaysVal, 10) : null;
+
+    const res = await fetch(`${API_BASE}/license/admin/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-panel-key': getSecret() },
+      body: JSON.stringify({ max_employees, expires_in_days })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      alert(`New license key: ${data.license_key}`);
+      loadLicenses();
+    } else {
+      alert('Failed to generate key');
+    }
+  }
+
+  async function loadLicenses() {
+    const res = await fetch(`${API_BASE}/license/admin/list`, {
+      headers: { 'x-panel-key': getSecret() }
+    });
+    if (!res.ok) return;
+    const rows = await res.json();
+    const tbody = document.getElementById('licenseTableBody');
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td class="keyval">${r.license_key}</td>
+        <td>${r.company_name || '<span style="color:var(--muted)">unassigned</span>'}</td>
+        <td><span class="badge ${r.status}">${r.status}</span></td>
+        <td>${r.max_employees}</td>
+        <td>${r.expires_at ? new Date(r.expires_at).toLocaleDateString() : '&mdash;'}</td>
+        <td>${r.activated_at ? new Date(r.activated_at).toLocaleDateString() : '&mdash;'}</td>
+        <td>${r.status === 'active' ? `<button class="danger" onclick="revokeKey(${r.id})">Revoke</button>` : ''}</td>
+      </tr>
+    `).join('');
+  }
+
+  async function revokeKey(id) {
+    if (!confirm('Revoke this license? The company will lose access.')) return;
+    await fetch(`${API_BASE}/license/admin/revoke/${id}`, {
+      method: 'POST',
+      headers: { 'x-panel-key': getSecret() }
+    });
+    loadLicenses();
+  }
+
+  checkAccess();
+</script>
+</body>
+</html>
