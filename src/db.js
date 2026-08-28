@@ -40,7 +40,14 @@ const pool = mysql.createPool({
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0,
-    ssl: buildSslConfig()
+    ssl: buildSslConfig(),
+    // mysql2 returns DECIMAL columns as strings by default (avoids float
+    // precision loss on their end) - this makes them come back as JS
+    // numbers instead, matching what every client (Flutter, this file's
+    // own callers) actually expects from a JSON API. Affects salary,
+    // leave_balances.allocated/used, leave_applications.days_count - all
+    // DECIMAL-typed in schema.sql.
+    decimalNumbers: true
 });
 
 module.exports = pool;
