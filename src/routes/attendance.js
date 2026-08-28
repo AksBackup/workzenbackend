@@ -1,12 +1,13 @@
 const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
+const asyncHandler = require('../utils/asyncHandler');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
 // Admin: any employee in the company (optionally filtered). Employee: only self.
-router.get('/', async (req, res) => {
+router.get('/', asyncHandler(async (req, res) => {
     const { employee_id, month, year } = req.query;
     const params = [req.user.companyId];
     let sql = 'SELECT * FROM attendance WHERE company_id = ?';
@@ -27,10 +28,10 @@ router.get('/', async (req, res) => {
 
     const [rows] = await pool.query(sql, params);
     return res.json(rows);
-});
+}));
 
 // Single punch write (e.g. an online-connected device posting directly)
-router.post('/', requireAdmin, async (req, res) => {
+router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { employee_id, date, check_in, check_out, source, device_id } = req.body;
     if (!employee_id || !date) return res.status(400).json({ error: 'employee_id and date required' });
 
@@ -43,7 +44,7 @@ router.post('/', requireAdmin, async (req, res) => {
         [req.user.companyId, employee_id, date, check_in || null, check_out || null, source || 'manual', device_id || null]
     );
     return res.status(201).json({ message: 'Recorded' });
-});
+}));
 
 /**
  * POST /attendance/sync
@@ -51,7 +52,7 @@ router.post('/', requireAdmin, async (req, res) => {
  * Idempotent against the (employee_id, date) unique constraint - safe
  * to retry/resend the same batch if a sync gets interrupted.
  */
-router.post('/sync', requireAdmin, async (req, res) => {
+router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
     const { records } = req.body;
     if (!Array.isArray(records) || records.length === 0) {
         return res.status(400).json({ error: 'records array required' });
@@ -80,6 +81,6 @@ router.post('/sync', requireAdmin, async (req, res) => {
     } finally {
         conn.release();
     }
-});
+}));
 
 module.exports = router;

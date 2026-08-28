@@ -1,11 +1,12 @@
 const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
+const asyncHandler = require('../utils/asyncHandler');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
-router.get('/', async (req, res) => {
+router.get('/', asyncHandler(async (req, res) => {
     let sql = 'SELECT * FROM leave_applications WHERE company_id = ?';
     const params = [req.user.companyId];
 
@@ -17,9 +18,9 @@ router.get('/', async (req, res) => {
 
     const [rows] = await pool.query(sql, params);
     return res.json(rows);
-});
+}));
 
-router.post('/', async (req, res) => {
+router.post('/', asyncHandler(async (req, res) => {
     const { leave_type_id, from_date, to_date, days_count, reason } = req.body;
     if (!leave_type_id || !from_date || !to_date || !days_count) {
         return res.status(400).json({ error: 'Missing required fields' });
@@ -44,9 +45,9 @@ router.post('/', async (req, res) => {
         [req.user.companyId, employeeId, leave_type_id, from_date, to_date, days_count, reason || null]
     );
     return res.status(201).json({ id: result.insertId });
-});
+}));
 
-router.post('/:id/approve', requireAdmin, async (req, res) => {
+router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
     const [adminRows] = await pool.query('SELECT id FROM admins WHERE firebase_uid = ?', [req.user.uid]);
     const adminId = adminRows[0] ? adminRows[0].id : null;
 
@@ -57,9 +58,9 @@ router.post('/:id/approve', requireAdmin, async (req, res) => {
         [adminId, req.params.id, req.user.companyId]
     );
     return res.json({ message: 'Approved' });
-});
+}));
 
-router.post('/:id/reject', requireAdmin, async (req, res) => {
+router.post('/:id/reject', requireAdmin, asyncHandler(async (req, res) => {
     const [adminRows] = await pool.query('SELECT id FROM admins WHERE firebase_uid = ?', [req.user.uid]);
     const adminId = adminRows[0] ? adminRows[0].id : null;
 
@@ -70,6 +71,6 @@ router.post('/:id/reject', requireAdmin, async (req, res) => {
         [adminId, req.params.id, req.user.companyId]
     );
     return res.json({ message: 'Rejected' });
-});
+}));
 
 module.exports = router;

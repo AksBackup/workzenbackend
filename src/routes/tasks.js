@@ -1,11 +1,12 @@
 const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
+const asyncHandler = require('../utils/asyncHandler');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
-router.get('/', async (req, res) => {
+router.get('/', asyncHandler(async (req, res) => {
     let sql = 'SELECT * FROM tasks WHERE company_id = ?';
     const params = [req.user.companyId];
 
@@ -17,9 +18,9 @@ router.get('/', async (req, res) => {
 
     const [rows] = await pool.query(sql, params);
     return res.json(rows);
-});
+}));
 
-router.post('/', requireAdmin, async (req, res) => {
+router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { employee_id, title, description, due_date } = req.body;
     if (!employee_id || !title) return res.status(400).json({ error: 'employee_id and title required' });
 
@@ -32,9 +33,9 @@ router.post('/', requireAdmin, async (req, res) => {
             adminRows[0] ? adminRows[0].id : null]
     );
     return res.status(201).json({ id: result.insertId });
-});
+}));
 
-router.put('/:id/status', async (req, res) => {
+router.put('/:id/status', asyncHandler(async (req, res) => {
     const { status } = req.body;
     if (!['pending', 'in_progress', 'completed'].includes(status)) {
         return res.status(400).json({ error: 'Invalid status' });
@@ -44,6 +45,6 @@ router.put('/:id/status', async (req, res) => {
         [status, req.params.id, req.user.companyId]
     );
     return res.json({ message: 'Updated' });
-});
+}));
 
 module.exports = router;

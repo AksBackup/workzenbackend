@@ -3,6 +3,7 @@ const admin = require('firebase-admin');
 const pool = require('../db');
 const adminPanelAuth = require('../middleware/adminPanelAuth');
 const generateLicenseKey = require('../utils/generateLicenseKey');
+const asyncHandler = require('../utils/asyncHandler');
 
 const router = express.Router();
 
@@ -12,7 +13,7 @@ const router = express.Router();
  * company, the ONE admin account (Firebase Auth + admins row), and
  * binds the license permanently to that company.
  */
-router.post('/activate', async (req, res) => {
+router.post('/activate', asyncHandler(async (req, res) => {
     const { license_key, company_name, admin_name, admin_email, admin_password, device_fingerprint } = req.body;
     if (!license_key || !company_name || !admin_name || !admin_email || !admin_password) {
         return res.status(400).json({ error: 'Missing required fields' });
@@ -77,14 +78,14 @@ router.post('/activate', async (req, res) => {
     } finally {
         conn.release();
     }
-});
+}));
 
 /**
  * POST /license/verify
  * Called on app startup when online. The Flutter app caches the last
  * good result and tolerates ~7 days offline before requiring a fresh check.
  */
-router.post('/verify', async (req, res) => {
+router.post('/verify', asyncHandler(async (req, res) => {
     const { license_key } = req.body;
     if (!license_key) return res.status(400).json({ error: 'license_key required' });
 
@@ -99,14 +100,14 @@ router.post('/verify', async (req, res) => {
     const valid = license.status === 'active' && !expired;
 
     return res.json({ valid, status: expired ? 'expired' : license.status });
-});
+}));
 
 /* ------------------------------------------------------------------
    Internal only - used by public/index.html, the vendor's own tool.
    Never expose these paths to customers.
    ------------------------------------------------------------------ */
 
-router.post('/admin/generate', adminPanelAuth, async (req, res) => {
+router.post('/admin/generate', adminPanelAuth, asyncHandler(async (req, res) => {
     const { max_employees, expires_in_days } = req.body;
     const key = generateLicenseKey();
     const expiresAt = expires_in_days
@@ -118,9 +119,9 @@ router.post('/admin/generate', adminPanelAuth, async (req, res) => {
         [key, max_employees || 50, expiresAt]
     );
     return res.status(201).json({ license_key: key });
-});
+}));
 
-router.get('/admin/list', adminPanelAuth, async (req, res) => {
+router.get('/admin/list', adminPanelAuth, asyncHandler(async (req, res) => {
     const [rows] = await pool.query(
         `SELECT l.id, l.license_key, l.status, l.max_employees, l.expires_at, l.activated_at,
                 c.name AS company_name
@@ -129,11 +130,11 @@ router.get('/admin/list', adminPanelAuth, async (req, res) => {
          ORDER BY l.created_at DESC`
     );
     return res.json(rows);
-});
+}));
 
-router.post('/admin/revoke/:id', adminPanelAuth, async (req, res) => {
+router.post('/admin/revoke/:id', adminPanelAuth, asyncHandler(async (req, res) => {
     await pool.query('UPDATE licenses SET status = "revoked" WHERE id = ?', [req.params.id]);
     return res.json({ message: 'Revoked' });
-});
+}));
 
 module.exports = router;
