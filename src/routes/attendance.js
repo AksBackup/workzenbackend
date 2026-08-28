@@ -7,24 +7,35 @@ const router = express.Router();
 router.use(verifyFirebaseToken);
 
 // Admin: any employee in the company (optionally filtered). Employee: only self.
+// Joins employees so callers (e.g. the app's Today/Yesterday/Calendar attendance
+// view) get a display name directly instead of having to cross-reference a
+// separate /employees call themselves.
 router.get('/', asyncHandler(async (req, res) => {
-    const { employee_id, month, year } = req.query;
+    const { employee_id, month, year, date } = req.query;
     const params = [req.user.companyId];
-    let sql = 'SELECT * FROM attendance WHERE company_id = ?';
+    let sql = `SELECT a.*, e.name AS employee_name, e.emp_code AS employee_code
+               FROM attendance a
+               JOIN employees e ON e.id = a.employee_id
+               WHERE a.company_id = ?`;
 
     if (req.user.role === 'employee') {
-        sql += ' AND employee_id = (SELECT id FROM employees WHERE firebase_uid = ? AND company_id = ?)';
+        sql += ' AND a.employee_id = (SELECT id FROM employees WHERE firebase_uid = ? AND company_id = ?)';
         params.push(req.user.uid, req.user.companyId);
     } else if (employee_id) {
-        sql += ' AND employee_id = ?';
+        sql += ' AND a.employee_id = ?';
         params.push(employee_id);
     }
 
-    if (month && year) {
-        sql += ' AND MONTH(date) = ? AND YEAR(date) = ?';
+    // Single-day filter (?date=YYYY-MM-DD) - takes precedence over month/year
+    // since it's more specific. Used by the app's Today/Yesterday/Calendar tabs.
+    if (date) {
+        sql += ' AND a.date = ?';
+        params.push(date);
+    } else if (month && year) {
+        sql += ' AND MONTH(a.date) = ? AND YEAR(a.date) = ?';
         params.push(month, year);
     }
-    sql += ' ORDER BY date DESC';
+    sql += ' ORDER BY a.date DESC, e.name ASC';
 
     const [rows] = await pool.query(sql, params);
     return res.json(rows);
