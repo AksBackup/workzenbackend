@@ -28,7 +28,7 @@ router.get('/', asyncHandler(async (req, res) => {
  * and returns the credentials for the admin to hand to the employee.
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, designation, department, doj, salary, biometric_template_id, photo_url } = req.body;
+    const { name, designation, department, department_id, designation_id, doj, salary, biometric_template_id, photo_url } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     const conn = await pool.getConnection();
@@ -65,9 +65,10 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
         const [result] = await conn.query(
             `INSERT INTO employees
-             (company_id, emp_code, firebase_uid, name, designation, department, doj, salary, photo_url, biometric_template_id, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+             (company_id, emp_code, firebase_uid, name, designation, department, department_id, designation_id, doj, salary, photo_url, biometric_template_id, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, firebaseUser.uid, name, designation || null, department || null,
+                department_id || null, designation_id || null,
                 doj || null, salary || null, photo_url || null, biometric_template_id || null]
         );
 
@@ -88,7 +89,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['name', 'designation', 'department', 'doj', 'salary', 'status', 'photo_url'];
+    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'doj', 'salary', 'status', 'photo_url'];
     const updates = [];
     const values = [];
     fields.forEach(f => {

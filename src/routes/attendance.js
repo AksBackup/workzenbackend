@@ -43,16 +43,17 @@ router.get('/', asyncHandler(async (req, res) => {
 
 // Single punch write (e.g. an online-connected device posting directly)
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { employee_id, date, check_in, check_out, source, device_id } = req.body;
+    const { employee_id, date, check_in, check_out, source, device_id, verify_mode } = req.body;
     if (!employee_id || !date) return res.status(400).json({ error: 'employee_id and date required' });
 
     await pool.query(
-        `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, verify_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            check_in = COALESCE(VALUES(check_in), check_in),
-           check_out = COALESCE(VALUES(check_out), check_out)`,
-        [req.user.companyId, employee_id, date, check_in || null, check_out || null, source || 'manual', device_id || null]
+           check_out = COALESCE(VALUES(check_out), check_out),
+           verify_mode = COALESCE(VALUES(verify_mode), verify_mode)`,
+        [req.user.companyId, employee_id, date, check_in || null, check_out || null, source || 'manual', device_id || null, verify_mode || 'unknown']
     );
     return res.status(201).json({ message: 'Recorded' });
 }));
@@ -74,13 +75,14 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
         await conn.beginTransaction();
         for (const r of records) {
             await conn.query(
-                `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, synced_from_local)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, TRUE)
+                `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, verify_mode, synced_from_local)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
                  ON DUPLICATE KEY UPDATE
                    check_in = COALESCE(VALUES(check_in), check_in),
-                   check_out = COALESCE(VALUES(check_out), check_out)`,
+                   check_out = COALESCE(VALUES(check_out), check_out),
+                   verify_mode = COALESCE(VALUES(verify_mode), verify_mode)`,
                 [req.user.companyId, r.employee_id, r.date, r.check_in || null, r.check_out || null,
-                    r.source || 'scanner', r.device_id || null]
+                    r.source || 'scanner', r.device_id || null, r.verify_mode || 'unknown']
             );
         }
         await conn.commit();

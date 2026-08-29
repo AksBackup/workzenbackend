@@ -27,6 +27,11 @@ const attendanceRoutes = require('./routes/attendance');
 const leaveRoutes = require('./routes/leaves');
 const taskRoutes = require('./routes/tasks');
 const holidayRoutes = require('./routes/holidays');
+const departmentRoutes = require('./routes/departments');
+const designationRoutes = require('./routes/designations');
+const officeTimePolicyRoutes = require('./routes/officeTimePolicy');
+const weeklyOffRoutes = require('./routes/weeklyOff');
+const payrollRoutes = require('./routes/payroll');
 
 const app = express();
 app.use(cors());
@@ -42,6 +47,11 @@ app.use('/attendance', attendanceRoutes);
 app.use('/leave-applications', leaveRoutes);
 app.use('/tasks', taskRoutes);
 app.use('/holidays', holidayRoutes);
+app.use('/departments', departmentRoutes);
+app.use('/designations', designationRoutes);
+app.use('/office-time-policy', officeTimePolicyRoutes);
+app.use('/weekly-off', weeklyOffRoutes);
+app.use('/payroll', payrollRoutes);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
