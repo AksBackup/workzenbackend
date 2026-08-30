@@ -11,7 +11,7 @@ router.use(verifyFirebaseToken);
 // view) get a display name directly instead of having to cross-reference a
 // separate /employees call themselves.
 router.get('/', asyncHandler(async (req, res) => {
-    const { employee_id, month, year, date } = req.query;
+    const { employee_id, month, year, date, device_id, verify_mode, search, limit } = req.query;
     const params = [req.user.companyId];
     let sql = `SELECT a.*, e.name AS employee_name, e.emp_code AS employee_code
                FROM attendance a
@@ -35,7 +35,35 @@ router.get('/', asyncHandler(async (req, res) => {
         sql += ' AND MONTH(a.date) = ? AND YEAR(a.date) = ?';
         params.push(month, year);
     }
-    sql += ' ORDER BY a.date DESC, e.name ASC';
+
+    // Added for Real-Time Attendance Logs (4.1) / Real-time Event Monitor
+    // (9.1) - both are just this same GET with a tighter filter set and,
+    // for 9.1, a client-side poll loop rather than a push connection (per
+    // AGENT_B_ATTENDANCE_LEAVE_OPS.md: "a live-feeling ticker is fine as a
+    // polling list ... don't over-build this one").
+    if (device_id) {
+        sql += ' AND a.device_id = ?';
+        params.push(device_id);
+    }
+    if (verify_mode) {
+        sql += ' AND a.verify_mode = ?';
+        params.push(verify_mode);
+    }
+    // Matches the mockup's "Search Employee / Emp ID" box on 4.1.
+    if (search) {
+        sql += ' AND (e.name LIKE ? OR e.emp_code LIKE ?)';
+        params.push(`%${search}%`, `%${search}%`);
+    }
+
+    sql += ' ORDER BY a.date DESC, a.check_in DESC, e.name ASC';
+
+    if (limit) {
+        // Deliberately not parameterized as a placeholder (MySQL LIMIT
+        // can't take a bound param via mysql2 the same way) - parsed to a
+        // safe integer first so this can never become injectable.
+        const safeLimit = Math.max(1, Math.min(500, parseInt(limit, 10) || 100));
+        sql += ` LIMIT ${safeLimit}`;
+    }
 
     const [rows] = await pool.query(sql, params);
     return res.json(rows);
