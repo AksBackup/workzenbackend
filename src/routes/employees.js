@@ -28,7 +28,7 @@ router.get('/', asyncHandler(async (req, res) => {
  * and returns the credentials for the admin to hand to the employee.
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, designation, department, department_id, designation_id, doj, dob, salary, biometric_template_id, photo_url, emp_code } = req.body;
+    const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     // emp_code is normally auto-generated (see below) but can optionally be
@@ -87,10 +87,10 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
         const [result] = await conn.query(
             `INSERT INTO employees
-             (company_id, emp_code, firebase_uid, name, designation, department, department_id, designation_id, doj, dob, salary, photo_url, biometric_template_id, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+             (company_id, emp_code, firebase_uid, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, firebaseUser.uid, name, designation || null, department || null,
-                department_id || null, designation_id || null,
+                department_id || null, designation_id || null, shift_id || null,
                 doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null]
         );
 
@@ -126,7 +126,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
  * moment the screen is left and re-entered).
  */
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'doj', 'dob', 'salary', 'status', 'photo_url'];
+    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url'];
     const updates = [];
     const values = [];
     fields.forEach(f => {
@@ -261,11 +261,49 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         [req.user.companyId]
     );
     const offBitmask = weeklyOffRows.length > 0 ? weeklyOffRows[0].off_days_bitmask : 1; // default: Sunday off
-    const [policyRows] = await pool.query(
-        'SELECT monthly_leave_quota FROM office_time_policy WHERE company_id = ?',
+
+    // migration_010: unified per-leave-type monthly quota, replacing the
+    // old flat office_time_policy.monthly_leave_quota. Every leave type
+    // the company has defined gets its own quota/used/remaining line
+    // (see computeLeaveTypeBalances in routes/leaves.js for the same
+    // per-type counting logic used at apply-time) - the flat
+    // leave_quota/leave_used/leave_remaining fields below are kept as a
+    // SUM across all types for any caller still expecting one number,
+    // but the new leave_balances array is the source of truth going
+    // forward.
+    const [leaveTypeRows] = await pool.query(
+        'SELECT id, name, monthly_quota FROM leave_types WHERE company_id = ? ORDER BY name ASC',
         [req.user.companyId]
     );
-    const leaveQuota = policyRows.length > 0 ? parseFloat(policyRows[0].monthly_leave_quota) : 5.0;
+    const [usedByTypeRows] = await pool.query(
+        `SELECT leave_type_id, SUM(COALESCE(paid_days, days_count)) AS used
+         FROM leave_applications
+         WHERE employee_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?
+         GROUP BY leave_type_id`,
+        [employeeId, monthEnd, monthStart]
+    );
+    const usedByType = new Map(usedByTypeRows.map(r => [r.leave_type_id, parseFloat(r.used) || 0]));
+    const leaveBalances = leaveTypeRows.map(lt => {
+        const quota = parseFloat(lt.monthly_quota) || 0;
+        const used = usedByType.get(lt.id) || 0;
+        return {
+            leave_type_id: lt.id,
+            leave_type_name: lt.name,
+            quota,
+            used,
+            remaining: Math.max(0, Math.round((quota - used) * 10) / 10),
+        };
+    });
+    const leaveQuota = leaveBalances.reduce((acc, b) => acc + b.quota, 0);
+
+    const [policyRows] = await pool.query(
+        'SELECT check_in_window_end FROM office_time_policy WHERE company_id = ?',
+        [req.user.companyId]
+    );
+    // Grace window for an on-time check-in (migration_010) - a check-in
+    // after this is still recorded/counted as present, just flagged
+    // 'late' below rather than silently unrecorded.
+    const checkInWindowEnd = policyRows.length > 0 ? policyRows[0].check_in_window_end : '09:45:00';
     const [overtimeRows] = await pool.query(
         `SELECT id, date, checkout_time, overtime_hours, rate_per_hour, amount, status
          FROM overtime_records WHERE employee_id = ? AND date BETWEEN ? AND ? ORDER BY date ASC`,
@@ -289,6 +327,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         const isFuture = dateStr > today;
 
         let status;
+        let isLate = false;
         if (holidayName) {
             status = 'holiday';
             holidayDays++;
@@ -298,6 +337,9 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         } else if (att && att.check_in) {
             status = 'present';
             presentDays++;
+            if (timeOfDayStr(att.check_in) > checkInWindowEnd) {
+                isLate = true;
+            }
         } else if (isWeeklyOff) {
             status = 'weekly_off';
             weeklyOffDays++;
@@ -315,6 +357,10 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
             check_out: att?.check_out || null,
             verify_mode: att?.verify_mode || null,
             holiday_name: holidayName || null,
+            // migration_010: true only when status === 'present' and the
+            // check-in landed after check_in_window_end - never changes
+            // whether the day counts as present/absent, just flags it.
+            is_late: isLate,
         });
     }
 
@@ -322,7 +368,8 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     const attendancePercentage = workingDaysElapsed > 0
         ? Math.round((presentDays / workingDaysElapsed) * 1000) / 10
         : 0;
-    const leaveRemaining = Math.max(0, leaveQuota - leaveDays);
+    const leaveUsed = leaveBalances.reduce((acc, b) => acc + b.used, 0);
+    const leaveRemaining = leaveBalances.reduce((acc, b) => acc + b.remaining, 0);
 
     const overtimePending = overtimeRows.filter(o => o.status === 'pending');
     const overtimeApproved = overtimeRows.filter(o => o.status === 'approved');
@@ -341,9 +388,16 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         leave_days: leaveDays,
         holiday_days: holidayDays,
         weekly_off_days: weeklyOffDays,
+        // DEPRECATED (migration_010): flat sum across leave_balances
+        // below, kept only for any caller not yet updated to the
+        // per-type breakdown. leave_used here is paid-days-used summed
+        // across types (so it can legitimately be less than leave_days,
+        // which counts ALL on-leave calendar days regardless of type or
+        // paid/unpaid split).
         leave_quota: leaveQuota,
-        leave_used: leaveDays,
+        leave_used: leaveUsed,
         leave_remaining: leaveRemaining,
+        leave_balances: leaveBalances,
         overtime: {
             pending_hours: sum(overtimePending, 'overtime_hours'),
             pending_amount: sum(overtimePending, 'amount'),
@@ -364,6 +418,20 @@ function toDateStr(value) {
         return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
     }
     return String(value).split('T')[0];
+}
+
+// attendance.check_in is a DATETIME (mysql2 hands it back as a JS Date),
+// but office_time_policy.check_in_window_end is a TIME string
+// ('HH:MM:SS') - this pulls just the time-of-day out of the Date so the
+// two can be compared lexically (safe for zero-padded HH:MM:SS).
+function timeOfDayStr(value) {
+    if (value instanceof Date) {
+        return `${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}:${String(value.getSeconds()).padStart(2, '0')}`;
+    }
+    // Already a string (e.g. 'YYYY-MM-DD HH:MM:SS' or 'HH:MM:SS') -
+    // take whatever's after a space if present, else the whole thing.
+    const str = String(value);
+    return str.includes(' ') ? str.split(' ')[1] : str;
 }
 
 module.exports = router;

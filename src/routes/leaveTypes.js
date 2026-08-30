@@ -32,7 +32,7 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, yearly_quota, carry_forward } = req.body;
+    const { name, yearly_quota, monthly_quota, carry_forward } = req.body;
     if (!name) return res.status(400).json({ error: 'name required' });
 
     const [existing] = await pool.query(
@@ -43,15 +43,20 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         return res.status(409).json({ error: 'A leave type with this name already exists' });
     }
 
+    // migration_010: monthly_quota is the unified figure the paid/unpaid
+    // leave split (routes/leaves.js) is actually computed against -
+    // yearly_quota is kept alongside it for reference/carry-forward only.
     const [result] = await pool.query(
-        'INSERT INTO leave_types (company_id, name, yearly_quota, carry_forward) VALUES (?, ?, ?, ?)',
-        [req.user.companyId, name, yearly_quota || 0, !!carry_forward]
+        'INSERT INTO leave_types (company_id, name, yearly_quota, monthly_quota, carry_forward) VALUES (?, ?, ?, ?, ?)',
+        [req.user.companyId, name, yearly_quota || 0, monthly_quota || 0, !!carry_forward]
     );
-    return res.status(201).json({ id: result.insertId, name, yearly_quota: yearly_quota || 0, carry_forward: !!carry_forward });
+    return res.status(201).json({
+        id: result.insertId, name, yearly_quota: yearly_quota || 0, monthly_quota: monthly_quota || 0, carry_forward: !!carry_forward
+    });
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['name', 'yearly_quota', 'carry_forward'];
+    const fields = ['name', 'yearly_quota', 'monthly_quota', 'carry_forward'];
     const updates = [];
     const values = [];
     fields.forEach(f => {

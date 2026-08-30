@@ -21,24 +21,35 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 /**
- * GET /leave-applications/remaining?employee_id=&year=&month=
+ * GET /leave-applications/remaining?employee_id=&leave_type_id=&year=&month=
  *
  * Lightweight "how many paid leave days does this employee have left
- * this month" lookup for the Apply Leave screen's inline display -
- * added alongside the paid/unpaid split (migration_009) rather than
- * folding into GET /employees/:id/monthly-summary, so that endpoint's
- * existing day-grid logic (which counts *all* on-leave calendar days,
- * paid or not, and is already relied on elsewhere) doesn't need to
- * change. See computeMonthlyPaidUsage() below - both this route and
- * the POST / split below share the same counting logic.
+ * this month, for this specific leave type" lookup for the Apply Leave
+ * screen's inline display - added alongside the paid/unpaid split
+ * (migration_009) rather than folding into GET
+ * /employees/:id/monthly-summary, so that endpoint's existing day-grid
+ * logic (which counts *all* on-leave calendar days, paid or not, across
+ * every leave type, and is already relied on elsewhere) doesn't need to
+ * change.
+ *
+ * migration_010 (unified leave system): quota is now looked up per
+ * `leave_type_id` from `leave_types.monthly_quota`, not the old flat
+ * `office_time_policy.monthly_leave_quota` - each leave type (Casual,
+ * Sick, ...) is tracked and applied for independently, matching how
+ * real companies run separate leave "buckets". `leave_type_id` is
+ * required; a request without one is almost certainly a stale client
+ * still using the pre-migration_010 shape.
+ *
+ * See computeMonthlyPaidUsage() below - both this route and the POST /
+ * split share the same counting logic.
  *
  * Registered before any '/:id' routes would matter, but there are none
  * here that collide with the literal path 'remaining'.
  */
 router.get('/remaining', asyncHandler(async (req, res) => {
-    const { employee_id, year, month } = req.query;
-    if (!employee_id || !year || !month) {
-        return res.status(400).json({ error: 'employee_id, year, and month are required' });
+    const { employee_id, leave_type_id, year, month } = req.query;
+    if (!employee_id || !leave_type_id || !year || !month) {
+        return res.status(400).json({ error: 'employee_id, leave_type_id, year, and month are required' });
     }
 
     const [empRows] = await pool.query(
@@ -47,8 +58,11 @@ router.get('/remaining', asyncHandler(async (req, res) => {
     );
     if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
 
-    const { quota, used } = await computeMonthlyPaidUsage(req.user.companyId, employee_id, parseInt(year, 10), parseInt(month, 10));
+    const { quota, used } = await computeMonthlyPaidUsage(
+        req.user.companyId, employee_id, leave_type_id, parseInt(year, 10), parseInt(month, 10)
+    );
     return res.json({
+        leave_type_id: parseInt(leave_type_id, 10),
         leave_quota: quota,
         leave_used: used,
         leave_remaining: Math.max(0, Math.round((quota - used) * 10) / 10),
@@ -74,16 +88,22 @@ router.post('/', asyncHandler(async (req, res) => {
         if (!employeeId) return res.status(400).json({ error: 'employee_id required for admin-submitted leave' });
     }
 
-    // Paid/unpaid split (migration_009, Part 4 brief): decided once,
-    // now, against the quota month of from_date - not re-derived later.
-    // "already used 2 of a 5-day quota, applies for 10" -> first 3 paid
-    // (remaining quota), other 7 unpaid (counted as absence in payroll,
-    // see routes/payroll.js). Cross-month applications are evaluated
-    // against from_date's month only - a known simplification, flag
-    // back if a leave spanning a month boundary needs finer handling.
+    // Paid/unpaid split (migration_009, Part 4 brief; migration_010
+    // makes the quota per-leave-type instead of one flat company-wide
+    // number): decided once, now, against the quota month of from_date -
+    // not re-derived later, and against THIS application's own leave
+    // type only - "3 days/month Casual Leave, already used 2, applies
+    // for 3 more Casual Leave" -> first 1 paid (remaining Casual quota),
+    // other 2 unpaid (counted as absence in payroll, see
+    // routes/payroll.js). A Sick Leave application that same month is
+    // checked against Sick Leave's own quota/usage, entirely separately
+    // - leave types don't share or borrow from each other's quota.
+    // Cross-month applications are evaluated against from_date's month
+    // only - a known simplification, flag back if a leave spanning a
+    // month boundary needs finer handling.
     const fromMonthDate = new Date(from_date);
     const { quota, used } = await computeMonthlyPaidUsage(
-        req.user.companyId, employeeId, fromMonthDate.getFullYear(), fromMonthDate.getMonth() + 1
+        req.user.companyId, employeeId, leave_type_id, fromMonthDate.getFullYear(), fromMonthDate.getMonth() + 1
     );
     const remainingQuota = Math.max(0, quota - used);
     const paidDays = Math.min(Number(days_count), remainingQuota);
@@ -98,28 +118,34 @@ router.post('/', asyncHandler(async (req, res) => {
 }));
 
 /**
- * How many paid leave days has this employee already used in
- * (year, month), and what's their quota. "Used" counts *approved*
- * applications' paid_days (falling back to the full days_count for
- * pre-migration_009 rows, which had no split - i.e. were fully paid),
- * overlapping that month. Shared by GET /remaining above and the POST
- * / split so both agree on the same number.
+ * How many paid leave days has this employee already used THIS SPECIFIC
+ * LEAVE TYPE in (year, month), and what's that type's own quota.
+ *
+ * migration_010 (unified leave system): quota now comes from
+ * `leave_types.monthly_quota` for the given `leaveTypeId`, replacing the
+ * old flat `office_time_policy.monthly_leave_quota` that used to apply
+ * (confusingly) to every leave type combined. "Used" counts *approved*
+ * applications of THIS leave type only, using paid_days (falling back
+ * to the full days_count for pre-migration_009 rows, which had no split
+ * - i.e. were fully paid), overlapping that month. Shared by GET
+ * /remaining above and the POST / split so both agree on the same
+ * number.
  */
-async function computeMonthlyPaidUsage(companyId, employeeId, year, month) {
+async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year, month) {
     const daysInMonth = new Date(year, month, 0).getDate();
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
-    const [policyRows] = await pool.query(
-        'SELECT monthly_leave_quota FROM office_time_policy WHERE company_id = ?',
-        [companyId]
+    const [typeRows] = await pool.query(
+        'SELECT monthly_quota FROM leave_types WHERE id = ? AND company_id = ?',
+        [leaveTypeId, companyId]
     );
-    const quota = policyRows.length > 0 ? parseFloat(policyRows[0].monthly_leave_quota) : 5.0;
+    const quota = typeRows.length > 0 ? parseFloat(typeRows[0].monthly_quota) || 0 : 0;
 
     const [leaveRows] = await pool.query(
         `SELECT days_count, paid_days FROM leave_applications
-         WHERE employee_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
-        [employeeId, monthEnd, monthStart]
+         WHERE employee_id = ? AND leave_type_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
+        [employeeId, leaveTypeId, monthEnd, monthStart]
     );
     const used = leaveRows.reduce((sum, r) => sum + (r.paid_days !== null ? Number(r.paid_days) : Number(r.days_count)), 0);
 
