@@ -94,11 +94,34 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     return res.status(201).json({ message: 'Recorded' });
 }));
 
+// Only values the attendance.source ENUM in schema.sql actually accepts.
+// Anything else (e.g. a stale local-queue row still holding the old,
+// invalid 'biometric' default - see the Flutter app's
+// AttendanceSyncService _createTableSql) gets coerced rather than sent
+// straight into the INSERT, where MySQL would reject it outright.
+const VALID_ATTENDANCE_SOURCES = new Set(['scanner', 'manual', 'mobile']);
+
+// Only values the attendance.verify_mode ENUM accepts (schema.sql,
+// migration_011). Same defense-in-depth reasoning as sources above -
+// the Flutter client already sanitizes before sending, this is the
+// second line of defense so a malformed/unexpected value from any
+// future caller degrades to 'unknown' instead of failing the insert.
+const VALID_VERIFY_MODES = new Set(['password', 'fingerprint', 'card', 'face', 'manual', 'unknown']);
+
 /**
  * POST /attendance/sync
  * Batch endpoint for the Flutter app's local SQLite offline queue.
  * Idempotent against the (employee_id, date) unique constraint - safe
  * to retry/resend the same batch if a sync gets interrupted.
+ *
+ * Each record is written in its own transaction rather than one shared
+ * transaction for the whole batch. This used to be a single transaction -
+ * that meant one malformed/invalid row (e.g. an old queued row with a
+ * `source` value MySQL's ENUM rejects) would roll back every OTHER
+ * record in the same sync call too, silently blocking valid punches
+ * indefinitely on every retry. Per-record isolation means one bad row
+ * only fails itself; everything else still syncs, and the bad row(s)
+ * are reported back so the caller/app can see exactly what failed.
  */
 router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
     const { records } = req.body;
@@ -106,11 +129,14 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
         return res.status(400).json({ error: 'records array required' });
     }
 
-    const conn = await pool.getConnection();
-    try {
-        await conn.beginTransaction();
-        for (const r of records) {
-            await conn.query(
+    const succeeded = [];
+    const failed = [];
+
+    for (const r of records) {
+        const source = VALID_ATTENDANCE_SOURCES.has(r.source) ? r.source : 'scanner';
+        const verifyMode = VALID_VERIFY_MODES.has(r.verify_mode) ? r.verify_mode : 'unknown';
+        try {
+            await pool.query(
                 `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, verify_mode, synced_from_local)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
                  ON DUPLICATE KEY UPDATE
@@ -118,29 +144,31 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
                    check_out = COALESCE(VALUES(check_out), check_out),
                    verify_mode = COALESCE(VALUES(verify_mode), verify_mode)`,
                 [req.user.companyId, r.employee_id, r.date, r.check_in || null, r.check_out || null,
-                    r.source || 'scanner', r.device_id || null, r.verify_mode || 'unknown']
+                    source, r.device_id || null, verifyMode]
+            );
+            succeeded.push(r);
+        } catch (err) {
+            console.error('Sync failed for one record:', { employee_id: r.employee_id, date: r.date, error: err.message });
+            failed.push({ employee_id: r.employee_id, date: r.date, error: err.message });
+        }
+    }
+
+    // Overtime is best-effort and independent per row - a failure here
+    // shouldn't affect the attendance rows that already committed above.
+    for (const r of succeeded) {
+        if (r.check_out) {
+            await computeAndRecordOvertime(req.user.companyId, r.employee_id, r.date, r.check_out).catch(err =>
+                console.error('Overtime computation failed:', err)
             );
         }
-        await conn.commit();
-        // Overtime is computed after the transaction commits, outside it -
-        // each row is an independent best-effort calculation and a
-        // failure on one shouldn't roll back the whole (already-committed)
-        // attendance batch.
-        for (const r of records) {
-            if (r.check_out) {
-                await computeAndRecordOvertime(req.user.companyId, r.employee_id, r.date, r.check_out).catch(err =>
-                    console.error('Overtime computation failed:', err)
-                );
-            }
-        }
-        return res.json({ message: `Synced ${records.length} records` });
-    } catch (err) {
-        await conn.rollback();
-        console.error('Sync failed:', err);
-        return res.status(500).json({ error: 'Sync failed', detail: err.message });
-    } finally {
-        conn.release();
     }
+
+    const status = failed.length === 0 ? 200 : (succeeded.length === 0 ? 500 : 207);
+    return res.status(status).json({
+        message: `Synced ${succeeded.length} of ${records.length} record(s)`,
+        syncedCount: succeeded.length,
+        failed,
+    });
 }));
 
 module.exports = router;

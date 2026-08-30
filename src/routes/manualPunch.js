@@ -132,12 +132,18 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
         }
 
         // The real write: same upsert shape as attendance.js's /sync route.
+        // verify_mode='manual' (migration_011) - an admin typed this in,
+        // there's no device verification step, so it should read as
+        // "Manual" in the UI rather than falling back to the column's
+        // 'unknown' default, which used to look identical to a device
+        // punch whose verify method we simply failed to capture.
         await conn.query(
-            `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source)
-             VALUES (?, ?, ?, ?, ?, 'manual')
+            `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, verify_mode)
+             VALUES (?, ?, ?, ?, ?, 'manual', 'manual')
              ON DUPLICATE KEY UPDATE
                check_in = COALESCE(VALUES(check_in), check_in),
-               check_out = COALESCE(VALUES(check_out), check_out)`,
+               check_out = COALESCE(VALUES(check_out), check_out),
+               verify_mode = 'manual'`,
             [req.user.companyId, punch.employee_id, punch.date, punch.check_in, punch.check_out]
         );
 
