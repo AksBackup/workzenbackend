@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
+const { computeAndRecordOvertime } = require('../utils/overtime');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -148,6 +149,11 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
         );
 
         await conn.commit();
+        if (punch.check_out) {
+            await computeAndRecordOvertime(req.user.companyId, punch.employee_id, punch.date, punch.check_out).catch(err =>
+                console.error('Overtime computation failed:', err)
+            );
+        }
         return res.json({ message: 'Approved and written to attendance' });
     } catch (err) {
         await conn.rollback();

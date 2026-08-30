@@ -28,7 +28,7 @@ router.get('/', asyncHandler(async (req, res) => {
  * and returns the credentials for the admin to hand to the employee.
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, designation, department, department_id, designation_id, doj, salary, biometric_template_id, photo_url, emp_code } = req.body;
+    const { name, designation, department, department_id, designation_id, doj, dob, salary, biometric_template_id, photo_url, emp_code } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     // emp_code is normally auto-generated (see below) but can optionally be
@@ -87,11 +87,11 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
         const [result] = await conn.query(
             `INSERT INTO employees
-             (company_id, emp_code, firebase_uid, name, designation, department, department_id, designation_id, doj, salary, photo_url, biometric_template_id, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+             (company_id, emp_code, firebase_uid, name, designation, department, department_id, designation_id, doj, dob, salary, photo_url, biometric_template_id, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, firebaseUser.uid, name, designation || null, department || null,
                 department_id || null, designation_id || null,
-                doj || null, salary || null, photo_url || null, biometric_template_id || null]
+                doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null]
         );
 
         await conn.commit();
@@ -126,7 +126,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
  * moment the screen is left and re-entered).
  */
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'doj', 'salary', 'status', 'photo_url'];
+    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'doj', 'dob', 'salary', 'status', 'photo_url'];
     const updates = [];
     const values = [];
     fields.forEach(f => {
@@ -202,5 +202,168 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
     await pool.query('DELETE FROM employees WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
     return res.json({ message: 'Deleted' });
 }));
+
+/**
+ * GET /employees/:id/monthly-summary?year=YYYY&month=M
+ *
+ * Backs the new Employee Details "Attendance & Leave" table (a
+ * non-push-to-device view - nothing here touches the biometric device).
+ * Aggregates across attendance, holidays, approved leave_applications,
+ * weekly_off_config, and overtime_records into one day-by-day grid plus
+ * the month's headline numbers, so the Flutter side doesn't have to make
+ * 5 separate calls and stitch them together itself.
+ *
+ * Per-day status precedence (a day can only be one thing): holiday >
+ * approved leave > present (has a check-in) > weekly off > absent for
+ * any day up to and including today; days after today are 'upcoming'
+ * and excluded from every count below.
+ */
+router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
+    const employeeId = req.params.id;
+    const year = parseInt(req.query.year, 10) || new Date().getFullYear();
+    const month = parseInt(req.query.month, 10) || (new Date().getMonth() + 1); // 1-12
+
+    const [empRows] = await pool.query(
+        'SELECT id, name, emp_code, dob FROM employees WHERE id = ? AND company_id = ?',
+        [employeeId, req.user.companyId]
+    );
+    if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
+    if (req.user.role === 'employee') {
+        const [selfRows] = await pool.query(
+            'SELECT id FROM employees WHERE firebase_uid = ? AND company_id = ?',
+            [req.user.uid, req.user.companyId]
+        );
+        if (selfRows.length === 0 || String(selfRows[0].id) !== String(employeeId)) {
+            return res.status(403).json({ error: 'Not authorized to view this employee' });
+        }
+    }
+    const employee = empRows[0];
+
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
+    const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
+
+    const [attendanceRows] = await pool.query(
+        'SELECT date, check_in, check_out, verify_mode FROM attendance WHERE employee_id = ? AND date BETWEEN ? AND ?',
+        [employeeId, monthStart, monthEnd]
+    );
+    const [holidayRows] = await pool.query(
+        'SELECT date, name FROM holidays WHERE company_id = ? AND date BETWEEN ? AND ?',
+        [req.user.companyId, monthStart, monthEnd]
+    );
+    const [leaveRows] = await pool.query(
+        `SELECT from_date, to_date FROM leave_applications
+         WHERE employee_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
+        [employeeId, monthEnd, monthStart]
+    );
+    const [weeklyOffRows] = await pool.query(
+        'SELECT off_days_bitmask FROM weekly_off_config WHERE company_id = ? AND department IS NULL LIMIT 1',
+        [req.user.companyId]
+    );
+    const offBitmask = weeklyOffRows.length > 0 ? weeklyOffRows[0].off_days_bitmask : 1; // default: Sunday off
+    const [policyRows] = await pool.query(
+        'SELECT monthly_leave_quota FROM office_time_policy WHERE company_id = ?',
+        [req.user.companyId]
+    );
+    const leaveQuota = policyRows.length > 0 ? parseFloat(policyRows[0].monthly_leave_quota) : 5.0;
+    const [overtimeRows] = await pool.query(
+        `SELECT id, date, checkout_time, overtime_hours, rate_per_hour, amount, status
+         FROM overtime_records WHERE employee_id = ? AND date BETWEEN ? AND ? ORDER BY date ASC`,
+        [employeeId, monthStart, monthEnd]
+    );
+
+    const attendanceByDate = new Map(attendanceRows.map(r => [toDateStr(r.date), r]));
+    const holidayByDate = new Map(holidayRows.map(r => [toDateStr(r.date), r.name]));
+    const today = toDateStr(new Date());
+
+    const days = [];
+    let presentDays = 0, absentDays = 0, leaveDays = 0, holidayDays = 0, weeklyOffDays = 0;
+
+    for (let d = 1; d <= daysInMonth; d++) {
+        const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+        const dow = new Date(year, month - 1, d).getDay(); // 0=Sun..6=Sat
+        const isWeeklyOff = ((offBitmask >> dow) & 1) === 1;
+        const holidayName = holidayByDate.get(dateStr);
+        const onLeave = leaveRows.some(l => toDateStr(l.from_date) <= dateStr && toDateStr(l.to_date) >= dateStr);
+        const att = attendanceByDate.get(dateStr);
+        const isFuture = dateStr > today;
+
+        let status;
+        if (holidayName) {
+            status = 'holiday';
+            holidayDays++;
+        } else if (onLeave) {
+            status = 'leave';
+            leaveDays++;
+        } else if (att && att.check_in) {
+            status = 'present';
+            presentDays++;
+        } else if (isWeeklyOff) {
+            status = 'weekly_off';
+            weeklyOffDays++;
+        } else if (isFuture) {
+            status = 'upcoming';
+        } else {
+            status = 'absent';
+            absentDays++;
+        }
+
+        days.push({
+            date: dateStr,
+            status,
+            check_in: att?.check_in || null,
+            check_out: att?.check_out || null,
+            verify_mode: att?.verify_mode || null,
+            holiday_name: holidayName || null,
+        });
+    }
+
+    const workingDaysElapsed = presentDays + absentDays;
+    const attendancePercentage = workingDaysElapsed > 0
+        ? Math.round((presentDays / workingDaysElapsed) * 1000) / 10
+        : 0;
+    const leaveRemaining = Math.max(0, leaveQuota - leaveDays);
+
+    const overtimePending = overtimeRows.filter(o => o.status === 'pending');
+    const overtimeApproved = overtimeRows.filter(o => o.status === 'approved');
+    const sum = (rows, field) => rows.reduce((acc, r) => acc + parseFloat(r[field] || 0), 0);
+
+    return res.json({
+        employee_id: employee.id,
+        name: employee.name,
+        emp_code: employee.emp_code,
+        dob: employee.dob,
+        year,
+        month,
+        attendance_percentage: attendancePercentage,
+        present_days: presentDays,
+        absent_days: absentDays,
+        leave_days: leaveDays,
+        holiday_days: holidayDays,
+        weekly_off_days: weeklyOffDays,
+        leave_quota: leaveQuota,
+        leave_used: leaveDays,
+        leave_remaining: leaveRemaining,
+        overtime: {
+            pending_hours: sum(overtimePending, 'overtime_hours'),
+            pending_amount: sum(overtimePending, 'amount'),
+            approved_hours: sum(overtimeApproved, 'overtime_hours'),
+            approved_amount: sum(overtimeApproved, 'amount'),
+            records: overtimeRows.map(o => ({ ...o, date: toDateStr(o.date) })),
+        },
+        days,
+    });
+}));
+
+// mysql2 can return DATE columns as JS Date objects (driver-dependent on
+// timezone config) or as plain 'YYYY-MM-DD' strings - normalizing here
+// once means every comparison above can just do plain string equality
+// instead of every call site guessing which shape it got.
+function toDateStr(value) {
+    if (value instanceof Date) {
+        return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+    }
+    return String(value).split('T')[0];
+}
 
 module.exports = router;

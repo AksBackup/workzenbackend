@@ -26,19 +26,22 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { device_name, serial_no, location, ip_address, status } = req.body;
+    const { device_name, serial_no, location, ip_address, port, comm_password, status } = req.body;
     if (!device_name) return res.status(400).json({ error: 'device_name required' });
 
     const [result] = await pool.query(
-        `INSERT INTO devices (company_id, device_name, serial_no, location, ip_address, status)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, device_name, serial_no || null, location || null, ip_address || null, status || 'offline']
+        `INSERT INTO devices (company_id, device_name, serial_no, location, ip_address, port, comm_password, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, device_name, serial_no || null, location || null, ip_address || null, port || 4370, comm_password || null, status || 'offline']
     );
-    return res.status(201).json({ id: result.insertId, device_name, serial_no, location, ip_address, status: status || 'offline' });
+    return res.status(201).json({
+        id: result.insertId, device_name, serial_no, location, ip_address,
+        port: port || 4370, comm_password: comm_password || null, status: status || 'offline',
+    });
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['device_name', 'serial_no', 'location', 'ip_address', 'status'];
+    const fields = ['device_name', 'serial_no', 'location', 'ip_address', 'port', 'comm_password', 'status'];
     const updates = [];
     const values = [];
     fields.forEach(f => {

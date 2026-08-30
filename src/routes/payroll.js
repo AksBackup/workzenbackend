@@ -13,7 +13,10 @@ router.use(verifyFirebaseToken);
  *
  * Per employee per day in the target month:
  *   - Holiday or weekly-off day -> excluded entirely, paid automatically
- *   - Day falls inside an APPROVED leave application -> full day pay
+ *   - Day falls inside an APPROVED leave application -> full day pay for
+ *     that day's *paid* portion, no pay for its *unpaid* portion
+ *     (migration_009 paid/unpaid split, Part 4 - see leavePayStatusFor()
+ *     below and routes/leaves.js POST / for how the split is decided)
  *   - Otherwise, check attendance for that day:
  *       hours >= full_day_hours          -> full day pay
  *       hours >= half_day_min_hours
@@ -24,7 +27,12 @@ router.use(verifyFirebaseToken);
  *
  * per-day rate = employee.salary (or designation default_salary if
  * employee.salary is null) / (calendar days in that month)
- * total_pay = SUM(per-day amounts across the month) + bonus
+ * total_pay = SUM(per-day amounts across the month) + bonus + approved overtime pay
+ *
+ * Overtime (migration_008): SUM(overtime_records.amount) for that
+ * employee/month, APPROVED records only - pending/rejected overtime
+ * never affects pay. See utils/overtime.js for how those records get
+ * created in the first place.
  */
 
 router.get('/', requireAdmin, asyncHandler(async (req, res) => {
@@ -66,8 +74,15 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
         attendanceByEmpDate.set(`${row.employee_id}|${dateKey}`, row);
     }
 
+    // days_count/paid_days (migration_009, Part 4): paid_days is how
+    // many of this application's days count as paid leave, decided once
+    // at apply-time (see routes/leaves.js POST /) against that month's
+    // quota - the remainder is unpaid, i.e. no pay for those days,
+    // exactly like an unapproved absence. A NULL paid_days means this
+    // row predates the split (created before migration_009) and is
+    // treated as fully paid, matching the old behavior exactly.
     const [leaveRows] = await pool.query(
-        `SELECT employee_id, from_date, to_date
+        `SELECT employee_id, from_date, to_date, days_count, paid_days
          FROM leave_applications
          WHERE company_id = ? AND status = 'approved'
            AND from_date <= ? AND to_date >= ?`,
@@ -94,17 +109,43 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
     );
     const payrollByEmp = new Map(existingPayroll.map(p => [p.employee_id, p]));
 
+    // Overtime (migration_008) - only APPROVED records count toward pay;
+    // pending ones are still awaiting admin sign-off and rejected ones
+    // never did, so neither should show up in what someone is actually
+    // paid.
+    const [overtimeRows] = await pool.query(
+        `SELECT employee_id, SUM(amount) AS overtime_pay, SUM(overtime_hours) AS overtime_hours
+         FROM overtime_records
+         WHERE company_id = ? AND status = 'approved' AND date BETWEEN ? AND ?
+         GROUP BY employee_id`,
+        [companyId, monthStart, monthEnd]
+    );
+    const overtimeByEmp = new Map(overtimeRows.map(r => [r.employee_id, r]));
+
     const result = employees.map(emp => {
         const monthlySalary = Number(emp.salary ?? emp.default_salary ?? 0);
         const perDayRate = monthlySalary / daysInMonth;
 
-        const isOnApprovedLeave = (dateStr) =>
-            leaveRows.some(l => {
-                if (l.employee_id !== emp.id) return false;
+        // Returns 'paid', 'unpaid', or null (not on leave that day). The
+        // split's paid_days count from the front of the application (day
+        // 0, 1, 2... from from_date) - matches how routes/leaves.js POST
+        // / decided it: "first N days paid" where N is whatever quota
+        // was left when the employee applied.
+        const leavePayStatusFor = (dateStr) => {
+            for (const l of leaveRows) {
+                if (l.employee_id !== emp.id) continue;
                 const from = l.from_date instanceof Date ? l.from_date.toISOString().slice(0, 10) : String(l.from_date);
                 const to = l.to_date instanceof Date ? l.to_date.toISOString().slice(0, 10) : String(l.to_date);
-                return dateStr >= from && dateStr <= to;
-            });
+                if (dateStr < from || dateStr > to) continue;
+
+                const paidDays = l.paid_days !== null && l.paid_days !== undefined
+                    ? Number(l.paid_days)
+                    : Number(l.days_count); // pre-migration_009 row: fully paid, unchanged from old behavior
+                const dayIndex = Math.round((new Date(dateStr) - new Date(from)) / (1000 * 60 * 60 * 24));
+                return dayIndex < paidDays ? 'paid' : 'unpaid';
+            }
+            return null;
+        };
 
         let basePay = 0;
         for (let day = 1; day <= daysInMonth; day++) {
@@ -114,9 +155,13 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
             if (holidayDates.has(dateStr)) { basePay += perDayRate; continue; } // paid automatically
             if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) { basePay += perDayRate; continue; } // weekly off, paid automatically
 
-            if (isOnApprovedLeave(dateStr)) {
+            const leaveStatus = leavePayStatusFor(dateStr);
+            if (leaveStatus === 'paid') {
                 basePay += perDayRate;
                 continue;
+            }
+            if (leaveStatus === 'unpaid') {
+                continue; // unpaid leave day - no pay, counted as absence
             }
 
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
@@ -139,6 +184,9 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
 
         const existing = payrollByEmp.get(emp.id);
         const bonus = existing ? Number(existing.bonus) : 0;
+        const overtime = overtimeByEmp.get(emp.id);
+        const overtimePay = overtime ? Math.round(Number(overtime.overtime_pay) * 100) / 100 : 0;
+        const overtimeHours = overtime ? Number(overtime.overtime_hours) : 0;
 
         return {
             employee_id: emp.id,
@@ -146,7 +194,9 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
             emp_code: emp.emp_code,
             base_pay: Math.round(basePay * 100) / 100,
             bonus,
-            total_pay: Math.round((basePay + bonus) * 100) / 100,
+            overtime_pay: overtimePay,
+            overtime_hours: overtimeHours,
+            total_pay: Math.round((basePay + bonus + overtimePay) * 100) / 100,
             is_paid: existing ? !!existing.is_paid : false,
             paid_on: existing ? existing.paid_on : null
         };

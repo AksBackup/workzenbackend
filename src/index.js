@@ -30,6 +30,7 @@ const holidayRoutes = require('./routes/holidays');
 const departmentRoutes = require('./routes/departments');
 const designationRoutes = require('./routes/designations');
 const officeTimePolicyRoutes = require('./routes/officeTimePolicy');
+const overtimeRoutes = require('./routes/overtime');
 const weeklyOffRoutes = require('./routes/weeklyOff');
 const payrollRoutes = require('./routes/payroll');
 
@@ -63,6 +64,12 @@ const reportRoutes = require('./routes/reports');
 const errorLogRoutes = require('./routes/errorLogs');
 const backupRoutes = require('./routes/backup');
 const adminRoutes = require('./routes/admins');
+
+// Dashboard redesign scope - calendar widget + notes widget, both new
+// (see migration_006_dashboard_widgets.sql).
+const calendarEventRoutes = require('./routes/calendarEvents');
+const dashboardNotesRoutes = require('./routes/dashboardNotes');
+
 const pool = require('./db');
 
 const app = express();
@@ -82,6 +89,7 @@ app.use('/holidays', holidayRoutes);
 app.use('/departments', departmentRoutes);
 app.use('/designations', designationRoutes);
 app.use('/office-time-policy', officeTimePolicyRoutes);
+app.use('/overtime', overtimeRoutes);
 app.use('/weekly-off', weeklyOffRoutes);
 app.use('/payroll', payrollRoutes);
 
@@ -111,6 +119,10 @@ app.use('/reports', reportRoutes);
 app.use('/error-logs', errorLogRoutes);
 app.use('/backup', backupRoutes);
 app.use('/admins', adminRoutes);
+
+// Dashboard redesign scope.
+app.use('/calendar-events', calendarEventRoutes);
+app.use('/dashboard-notes', dashboardNotesRoutes);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 

@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
+const { computeAndRecordOvertime } = require('../utils/overtime');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -83,6 +84,13 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
            verify_mode = COALESCE(VALUES(verify_mode), verify_mode)`,
         [req.user.companyId, employee_id, date, check_in || null, check_out || null, source || 'manual', device_id || null, verify_mode || 'unknown']
     );
+    if (check_out) {
+        // Best-effort - a failure here shouldn't fail the punch write
+        // itself, which is the actual attendance record of record.
+        await computeAndRecordOvertime(req.user.companyId, employee_id, date, check_out).catch(err =>
+            console.error('Overtime computation failed:', err)
+        );
+    }
     return res.status(201).json({ message: 'Recorded' });
 }));
 
@@ -114,6 +122,17 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
             );
         }
         await conn.commit();
+        // Overtime is computed after the transaction commits, outside it -
+        // each row is an independent best-effort calculation and a
+        // failure on one shouldn't roll back the whole (already-committed)
+        // attendance batch.
+        for (const r of records) {
+            if (r.check_out) {
+                await computeAndRecordOvertime(req.user.companyId, r.employee_id, r.date, r.check_out).catch(err =>
+                    console.error('Overtime computation failed:', err)
+                );
+            }
+        }
         return res.json({ message: `Synced ${records.length} records` });
     } catch (err) {
         await conn.rollback();

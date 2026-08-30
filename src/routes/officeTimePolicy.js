@@ -10,12 +10,19 @@ const DEFAULTS = {
     check_in_time: '09:00:00',
     check_out_time: '18:00:00',
     full_day_hours: 8.0,
-    half_day_min_hours: 4.0
+    half_day_min_hours: 4.0,
+    // overtime_rate_per_hour intentionally has no default - null means
+    // "admin hasn't set a rate yet", which utils/overtime.js treats as
+    // "don't auto-compute overtime" rather than pricing it at ₹0/hour.
+    overtime_rate_per_hour: null,
+    monthly_leave_quota: 5.0
 };
 
 router.get('/', asyncHandler(async (req, res) => {
     const [rows] = await pool.query(
-        'SELECT check_in_time, check_out_time, full_day_hours, half_day_min_hours FROM office_time_policy WHERE company_id = ?',
+        `SELECT check_in_time, check_out_time, full_day_hours, half_day_min_hours,
+                overtime_rate_per_hour, monthly_leave_quota
+         FROM office_time_policy WHERE company_id = ?`,
         [req.user.companyId]
     );
     if (rows.length === 0) {
@@ -32,18 +39,23 @@ router.put('/', requireAdmin, asyncHandler(async (req, res) => {
         check_in_time = DEFAULTS.check_in_time,
         check_out_time = DEFAULTS.check_out_time,
         full_day_hours = DEFAULTS.full_day_hours,
-        half_day_min_hours = DEFAULTS.half_day_min_hours
+        half_day_min_hours = DEFAULTS.half_day_min_hours,
+        overtime_rate_per_hour = null,
+        monthly_leave_quota = DEFAULTS.monthly_leave_quota
     } = req.body;
 
     await pool.query(
-        `INSERT INTO office_time_policy (company_id, check_in_time, check_out_time, full_day_hours, half_day_min_hours)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO office_time_policy
+           (company_id, check_in_time, check_out_time, full_day_hours, half_day_min_hours, overtime_rate_per_hour, monthly_leave_quota)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            check_in_time = VALUES(check_in_time),
            check_out_time = VALUES(check_out_time),
            full_day_hours = VALUES(full_day_hours),
-           half_day_min_hours = VALUES(half_day_min_hours)`,
-        [req.user.companyId, check_in_time, check_out_time, full_day_hours, half_day_min_hours]
+           half_day_min_hours = VALUES(half_day_min_hours),
+           overtime_rate_per_hour = VALUES(overtime_rate_per_hour),
+           monthly_leave_quota = VALUES(monthly_leave_quota)`,
+        [req.user.companyId, check_in_time, check_out_time, full_day_hours, half_day_min_hours, overtime_rate_per_hour, monthly_leave_quota]
     );
     return res.json({ message: 'Updated' });
 }));
