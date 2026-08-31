@@ -1,8 +1,6 @@
 const express = require('express');
-const admin = require('firebase-admin');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
-const { generateTempPassword } = require('../utils/employeeCodes');
 const asyncHandler = require('../utils/asyncHandler');
 
 const router = express.Router();
@@ -24,8 +22,17 @@ router.get('/', asyncHandler(async (req, res) => {
 /**
  * POST /employees
  * Called after a successful biometric enrollment (or manual add).
- * Auto-generates emp_code + a temp password + a Firebase Auth account,
- * and returns the credentials for the admin to hand to the employee.
+ * Auto-generates emp_code and stores the employee record.
+ *
+ * NOTE: employees do NOT get a login of any kind - this app is admin-only.
+ * Employees are a data record for attendance/payroll/biometric purposes;
+ * they're identified to the device by emp_code, not by signing into this
+ * app. (Previously this created a Firebase Auth account per employee so
+ * they could log in and see their own records - that's been removed.
+ * firebase_uid stays in the schema/queries below for now since some
+ * older role==='employee' branches elsewhere still reference it, but it
+ * is never populated for new employees and nothing will ever hit those
+ * branches going forward since no token will carry role:'employee'.)
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code } = req.body;
@@ -68,28 +75,12 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
             );
             empCode = String(countRows[0].cnt + 1);
         }
-        const tempPassword = generateTempPassword();
-        // Synthetic login email - never shown to the employee (they only
-        // ever see emp_code + tempPassword), so it doesn't need to be
-        // pretty, just unique. Company ID keeps it unique across tenants
-        // without needing a separate slug function.
-        const syntheticEmail = `emp${empCode}@company${req.user.companyId}.local`;
-
-        const firebaseUser = await admin.auth().createUser({
-            email: syntheticEmail,
-            password: tempPassword,
-            displayName: name
-        });
-        await admin.auth().setCustomUserClaims(firebaseUser.uid, {
-            company_id: req.user.companyId,
-            role: 'employee'
-        });
 
         const [result] = await conn.query(
             `INSERT INTO employees
-             (company_id, emp_code, firebase_uid, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
-            [req.user.companyId, empCode, firebaseUser.uid, name, designation || null, department || null,
+             (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+            [req.user.companyId, empCode, name, designation || null, department || null,
                 department_id || null, designation_id || null, shift_id || null,
                 doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null]
         );
@@ -97,9 +88,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         await conn.commit();
         return res.status(201).json({
             id: result.insertId,
-            emp_code: empCode,
-            login_email: syntheticEmail,
-            temp_password: tempPassword
+            emp_code: empCode
         });
     } catch (err) {
         await conn.rollback();

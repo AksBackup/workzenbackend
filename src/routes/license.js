@@ -18,6 +18,14 @@ router.post('/activate', asyncHandler(async (req, res) => {
     if (!license_key || !company_name || !admin_name || !admin_email || !admin_password) {
         return res.status(400).json({ error: 'Missing required fields' });
     }
+    // device_fingerprint is now mandatory, not optional - this is the value
+    // that "one license key, one device" is enforced against on every
+    // /license/verify call from here on. Without it there's nothing to
+    // bind the license to, and any future client build enforcing the
+    // one-device rule would incorrectly reject its own activation.
+    if (!device_fingerprint) {
+        return res.status(400).json({ error: 'device_fingerprint required' });
+    }
 
     const conn = await pool.getConnection();
     try {
@@ -35,6 +43,23 @@ router.post('/activate', asyncHandler(async (req, res) => {
         if (license.status !== 'unused') {
             await conn.rollback();
             return res.status(409).json({ error: `License is already ${license.status}` });
+        }
+
+        // Company names aren't used for anything security-sensitive
+        // (every company is identified internally by its numeric id, never
+        // by name - see companies.id / company_id everywhere else in this
+        // schema), so a duplicate name was never able to cause an actual
+        // account/data collision. Still worth rejecting outright: two
+        // customers named identically is confusing in the internal
+        // license admin panel and support conversations, so catch it here
+        // rather than let it happen silently.
+        const [nameRows] = await conn.query(
+            'SELECT id FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))',
+            [company_name]
+        );
+        if (nameRows.length > 0) {
+            await conn.rollback();
+            return res.status(409).json({ error: `A company named "${company_name}" is already registered. Please use a more specific name (e.g. add a city or branch).` });
         }
 
         const [companyResult] = await conn.query(
@@ -63,7 +88,7 @@ router.post('/activate', asyncHandler(async (req, res) => {
             `UPDATE licenses
              SET status = 'active', company_id = ?, activated_at = NOW(), device_fingerprint = ?
              WHERE id = ?`,
-            [companyId, device_fingerprint || null, license.id]
+            [companyId, device_fingerprint, license.id]
         );
 
         await conn.commit();
@@ -84,22 +109,53 @@ router.post('/activate', asyncHandler(async (req, res) => {
  * POST /license/verify
  * Called on app startup when online. The Flutter app caches the last
  * good result and tolerates ~7 days offline before requiring a fresh check.
+ *
+ * Also enforces "one license key, one device": device_fingerprint must
+ * match what's on file for this license (set at /activate). This is the
+ * check that catches an installed copy of the app being moved to another
+ * PC - the copied license key still verifies fine, but the fingerprint
+ * computed on the new machine won't match, so this returns
+ * valid:false, reason:'device_mismatch' instead of letting it through.
  */
 router.post('/verify', asyncHandler(async (req, res) => {
-    const { license_key } = req.body;
+    const { license_key, device_fingerprint } = req.body;
     if (!license_key) return res.status(400).json({ error: 'license_key required' });
 
     const [rows] = await pool.query(
-        'SELECT status, expires_at FROM licenses WHERE license_key = ?',
+        'SELECT status, expires_at, device_fingerprint FROM licenses WHERE license_key = ?',
         [license_key]
     );
     if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
 
     const license = rows[0];
     const expired = license.expires_at && new Date(license.expires_at) < new Date();
-    const valid = license.status === 'active' && !expired;
 
-    return res.json({ valid, status: expired ? 'expired' : license.status });
+    if (license.status !== 'active') {
+        return res.json({ valid: false, reason: license.status }); // e.g. 'revoked'
+    }
+    if (expired) {
+        return res.json({ valid: false, reason: 'expired' });
+    }
+
+    if (!license.device_fingerprint) {
+        // Legacy row activated before device binding existed (or activated
+        // with no fingerprint sent, pre-enforcement) - bind it to whichever
+        // device asks first, rather than retroactively locking out an
+        // already-live install with no fingerprint on file at all.
+        if (device_fingerprint) {
+            await pool.query(
+                'UPDATE licenses SET device_fingerprint = ? WHERE license_key = ?',
+                [device_fingerprint, license_key]
+            );
+        }
+        return res.json({ valid: true });
+    }
+
+    if (device_fingerprint && device_fingerprint !== license.device_fingerprint) {
+        return res.json({ valid: false, reason: 'device_mismatch' });
+    }
+
+    return res.json({ valid: true });
 }));
 
 /* ------------------------------------------------------------------
