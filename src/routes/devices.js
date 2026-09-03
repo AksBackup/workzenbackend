@@ -10,6 +10,12 @@ router.use(verifyFirebaseToken);
 // company_id, device_name, serial_no, location, ip_address, status,
 // last_heartbeat) - this route is just CRUD over it, no migration needed.
 //
+// `model` (migration_012_device_model.sql) was added later, when Flutter
+// side support grew from F22-only to eight terminal models (K90, K30,
+// K30 WiFi, MB160, MB20, F22, X990, uFace302). It's metadata only - every
+// model talks over the identical protocol, so it doesn't change how this
+// route works, just what gets stored/returned alongside a device.
+//
 // "Check Now" (2.3 Device Health Monitoring) is implemented client-side
 // in Flutter (ZkDeviceService.testConnection() re-run against the
 // device's own ip_address) rather than as a backend round-trip - see
@@ -26,22 +32,23 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { device_name, serial_no, location, ip_address, port, comm_password, status } = req.body;
+    const { device_name, serial_no, location, ip_address, port, comm_password, status, model } = req.body;
     if (!device_name) return res.status(400).json({ error: 'device_name required' });
 
     const [result] = await pool.query(
-        `INSERT INTO devices (company_id, device_name, serial_no, location, ip_address, port, comm_password, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, device_name, serial_no || null, location || null, ip_address || null, port || 4370, comm_password || null, status || 'offline']
+        `INSERT INTO devices (company_id, device_name, serial_no, location, ip_address, port, comm_password, status, model)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, device_name, serial_no || null, location || null, ip_address || null, port || 4370, comm_password || null, status || 'offline', model || 'f22']
     );
     return res.status(201).json({
         id: result.insertId, device_name, serial_no, location, ip_address,
         port: port || 4370, comm_password: comm_password || null, status: status || 'offline',
+        model: model || 'f22',
     });
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['device_name', 'serial_no', 'location', 'ip_address', 'port', 'comm_password', 'status'];
+    const fields = ['device_name', 'serial_no', 'location', 'ip_address', 'port', 'comm_password', 'status', 'model'];
     const updates = [];
     const values = [];
     fields.forEach(f => {
