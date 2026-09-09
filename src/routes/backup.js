@@ -68,6 +68,10 @@ const TABLES = [
     // Added at merge time - depend on employees (and, for the last one,
     // shifts/work_codes above), so must come after those.
     { name: 'manual_punches', scope: 'company_id' },
+    // migration_013_mobile_punches.sql - same reasoning as manual_punches
+    // above: it's operational queue data scoped to this company, not an
+    // account-identity record, so it belongs in backup/restore.
+    { name: 'mobile_punches', scope: 'company_id' },
     { name: 'visitors', scope: 'company_id' },
     { name: 'canteen_usage', scope: 'company_id' },
     { name: 'shift_assignments', scope: 'company_id' },

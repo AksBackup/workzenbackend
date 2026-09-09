@@ -53,6 +53,12 @@ const leaveTypeRoutes = require('./routes/leaveTypes');
 const leaveOpeningRoutes = require('./routes/leaveOpening');
 const shiftAssignmentRoutes = require('./routes/shiftAssignments');
 const manualPunchRoutes = require('./routes/manualPunch');
+// GPS/mobile-submitted punch approval (CONTEXT.md section 7/8 item 1,
+// migration_013_mobile_punches.sql). Same queue-table pattern as
+// manualPunchRoutes above, kept as its own route module/table rather
+// than folded into manual_punches - see migration_013's header comment
+// for why.
+const mobilePunchRoutes = require('./routes/mobilePunch');
 const visitorRoutes = require('./routes/visitors');
 const canteenRoutes = require('./routes/canteen');
 
@@ -108,6 +114,7 @@ app.use('/companies', companyRoutes);
 app.use('/leave-balances', leaveOpeningRoutes);
 app.use('/shift-assignments', shiftAssignmentRoutes);
 app.use('/manual-punches', manualPunchRoutes);
+app.use('/mobile-punches', mobilePunchRoutes);
 app.use('/visitors', visitorRoutes);
 app.use('/canteen', canteenRoutes);
 

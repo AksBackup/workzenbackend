@@ -106,7 +106,10 @@ const VALID_ATTENDANCE_SOURCES = new Set(['scanner', 'manual', 'mobile']);
 // the Flutter client already sanitizes before sending, this is the
 // second line of defense so a malformed/unexpected value from any
 // future caller degrades to 'unknown' instead of failing the insert.
-const VALID_VERIFY_MODES = new Set(['password', 'fingerprint', 'card', 'face', 'manual', 'unknown']);
+// 'mobile' added by migration_013_mobile_punches.sql, mirroring how
+// 'manual' got added here when manual_punches' approve route started
+// writing verify_mode='manual'.
+const VALID_VERIFY_MODES = new Set(['password', 'fingerprint', 'card', 'face', 'manual', 'mobile', 'unknown']);
 
 /**
  * POST /attendance/sync
