@@ -334,72 +334,7 @@ test suite in this repo to run instead. Same posture as section 10 below
   `accuracy_meters` is stored now specifically so that pass doesn't need
   its own migration later, but no radius-check logic exists yet.
 
-## 10b. Built THIS pass — Flutter Approval Mobile Punch screen
-
-Second half of section 8 item 1, now that the backend (10a) exists.
-Reviewed against the real `lib_final_merged.zip` source (not guessed)
-and mirrors `ApprovalManualPunchScreen` deliberately, line-for-line
-where the shape matches:
-
-- **`lib/models/mobile_punch.dart`** — new model, parallels
-  `ManualPunch` and adds `latitude`/`longitude`/`accuracyMeters` plus a
-  `hasLocation` getter (a mobile punch can legitimately arrive with no
-  GPS reading - phone location denied - migration_013's own comment
-  covers why that's still allowed to submit; the screen has to render
-  that case, not assume every row has a coordinate).
-- **`lib/services/api_client.dart`** — added `listMobilePunches`,
-  `approveMobilePunch`, `rejectMobilePunch` (same shape as their
-  Manual Punch counterparts, hitting `/mobile-punches...`), plus
-  `createMobilePunch` for parity with the backend's admin-submitted-
-  correction path (`mobilePunch.js`'s `POST /` branch for a non-employee
-  caller) - **not wired to any screen**, included only so the client
-  method exists if a future agent builds that correction UI.
-- **`lib/screens/attendance_ops/approval_mobile_punch_screen.dart`** —
-  new screen, same list/approve/reject flow and `SectionCard`/
-  `DataTable` layout as `ApprovalManualPunchScreen`. The one real
-  addition: a **Location** column showing `lat, lng (±accuracy m)` or a
-  red "No location" label when `hasLocation` is false, since a mobile
-  punch has no device to trust the way a scanner punch does - the point
-  of showing it is so an admin has something to actually judge the
-  request against. Nothing here validates the coordinate automatically;
-  that's still the open geofencing pass (section 8 item 2), not this
-  screen.
-- **`lib/screens/home_shell.dart`** — new nav leaf
-  `_NavLeaf('approval_mobile_punch', 'Approval Mobile Punch', ...)`
-  added to the existing `Transaction` group, right after
-  `approval_manual_punch`, plus the matching title-lookup `case` and
-  screen-builder `case` (both existing switch statements, not new
-  ones) and the new screen's import. Four wiring points total, all
-  updated - the same class of easy-to-miss spot that `backup.js`'s
-  `TABLES` list already burned this project once (see the merge-time
-  note in section 9/backup.js) - flagging so nobody re-derives the "did
-  I touch every switch statement" check from scratch.
-
-**Verified only by**: a manual brace/paren/bracket balance check on
-every touched/new `.dart` file (no `dart`/`flutter` toolchain is
-available in this sandbox - no network access to pub.dev either, so
-`flutter analyze`/`flutter build` could not be run here). **Not
-verified**: never compiled, never run against the real backend from
-10a (which itself has never been run against a real MySQL instance -
-see 10a), no visual check that the DataTable layout looks right at
-real window widths. Same posture as sections 10/10a: flag plainly,
-don't imply a build or test passed that didn't happen.
-
-**Still open after this pass** (per section 8):
-- The actual phone-side submission screen (`POST /mobile-punches` from
-  the employee's own device) - out of scope for this Windows desktop
-  client, per 10a's note; likely a separate mobile codebase not
-  included in any zip seen so far.
-- Geofencing (section 8 item 2) - `accuracy_meters` is captured and
-  now also *displayed* here, but no radius-check/auto-approve logic
-  exists anywhere yet.
-- This screen and 10a's backend have never been run against each other
-  even locally, let alone on the human operator's real environment -
-  next concrete step for whoever has hands-on access is exactly that:
-  run migration_013, start the server, build the Flutter client, and
-  see what actually happens end to end.
-
-## 10b. Built THIS pass — Mobile Punch Approval screen (Flutter, section 8 item 1)
+## 10b. Built — Mobile Punch Approval screen (Flutter, section 8 item 1)
 
 Second half of item 1 (section 10a was the backend). New desktop-side
 approval screen, mirroring `ApprovalManualPunchScreen` exactly per
@@ -450,6 +385,241 @@ geofencing (section 8 item 2) — `accuracy_meters` is captured and shown
 now specifically so that pass doesn't need another migration or another
 column added to this screen later, just a decision rule built on top of
 what's already here.
+
+## 10d. Built THIS pass — Flutter UI for the migration_015 batch, plus two corrections to the record
+
+Finishes what 10c left open. Reviewed against the real `lib_final_merged.zip` source throughout, not guessed - and this pass turned up two things worth flagging plainly rather than quietly working around.
+
+**Correction #1 — "Device Health Report" was already built, contrary to
+an earlier gap report.** The client asked for it to be removed based on
+a prior pass's gap analysis that said it wasn't built. That analysis
+only checked the backend Node routes (which is genuinely true - there's
+no server-side health endpoint) and missed that
+`screens/devices/device_health_screen.dart` / nav leaf `device_health`
+("Device Health Monitoring") already exists and is already wired up -
+it does client-side connectivity checks via
+`ZkDeviceService.testConnection()` and persists results through
+`PATCH /devices/:id/heartbeat` so the Dashboard's Online/Offline stat
+cards reflect real data. **Nothing has been deleted.** This needs the
+client's explicit confirmation before anyone removes a working, already
+-shipped screen based on a corrected misunderstanding - flagged back to
+them, not acted on unilaterally.
+
+**Correction #2 — two device-log-pull code paths now overlap.** The
+existing `screens/devices/download_logs_screen.dart` ("Download Logs
+from Device") already pulled device logs - via the `flutter_zkteco`
+package (`ZkDeviceService.pullAttendanceLogsFrom`), straight into the
+processed `attendance` table via `AttendanceSyncService`/
+`POST /attendance/sync`. This pass's new Raw Punch Log screen pulls via
+a *different* path - the new C# `zk_bridge` process's `GET /device/logs`
+- into the separate, unprocessed `raw_punches` table (migration_015).
+These are NOT simple duplicates (one is deduplicated+processed, the
+other is the raw un-deduplicated buffer, specifically what "Show Device
+Raw Punch"/"All Raw Punch Report" need), but they are two different
+device-communication libraries now doing overlapping jobs. Renamed this
+pass's nav leaf to "Raw Punch Log" (distinct from "Download Logs from
+Device") specifically so a user doesn't see two same-sounding buttons
+and assume a bug. **Worth a reconciliation pass**: `flutter_zkteco`'s
+`getAttendanceLogs()`/`pullAttendanceLogsFrom()` may already expose
+everything `raw_punches` needs, which would let a future pass drop the
+zk_bridge C# `GetLogs`/`PullAttendanceLogs` addition entirely and route
+Raw Punch Log through the existing Dart-native path instead - not done
+here because it would mean inspecting `flutter_zkteco`'s own
+`AttendanceLog` class fields, which aren't visible in this project's
+own source (it's an external package) and this sandbox has no pub.dev
+access to check them.
+
+**Everything else built, mirroring existing screens' conventions
+throughout:**
+- **`models/shift.dart`** - six new fields (`weeklyOffBitmask`,
+  `otAllowed`, `lateGraceMinutes`, `earlyGraceMinutes`,
+  `singlePunchPolicy`, `isHalfDayShift`), all with defaults matching
+  the migration's DB defaults so nothing that already constructs a
+  `Shift()` (Shift Change/Generate Shift/Shift Roaster) needed to
+  change. `screens/settings/shifts_screen.dart`'s form extended with
+  matching UI for all six (weekday `FilterChip`s for the weekly-off
+  override, two switches, two grace-minute fields, a policy dropdown).
+- **New models**: `holiday_group.dart`, `employee_category.dart`,
+  `geofence_zone.dart`, `raw_punch.dart`, `field_location_ping.dart`,
+  plus `WeeklyReportRow`/`NaShiftReportRow`/`LateEarlyReportRow`/
+  `OvertimeReportRow`+`OvertimeReportResult`/`PerformanceReportRow`
+  appended to the existing `report_row.dart`.
+- **`models/mobile_punch.dart`** - added `remoteLocationEnabled` and a
+  new `MobileGeofenceCheck` class reading the `geofence` object
+  `GET /mobile-punches` now attaches per row (four distinct states:
+  exempt, no reading, no zones configured, inside/outside - see that
+  class's comment). `mobile_punch_approval_screen.dart` renders it as a
+  colored badge in a new Geofence column; never blocks approve/reject
+  automatically - judgement support only, matching
+  `geofenceZones.js`'s own "don't hard-block on a bad GPS reading"
+  reasoning.
+- **`services/api_client.dart`** - full CRUD/list methods added for
+  Holiday Groups, Employee Categories, Geofence Zones, Field Tracking
+  (trail/latest - deliberately no POST, phones submit pings, not this
+  desktop app), Raw Punches (list + bulk upload), and all five new
+  report endpoints.
+- **`services/zk_bridge_client.dart`** - `deleteUser`,
+  `getUserFingerprint`/`setUserFingerprint` (fingerIndex required on
+  both, unlike `/face` which never takes one), `getDeviceLogs` -
+  matching the three C# bridge routes from 10c.
+- **Three new Settings CRUD screens** (`holiday_groups_screen.dart`,
+  `employee_categories_screen.dart`, `geofence_zones_screen.dart`) -
+  the first two mirror `DepartmentsScreen` line-for-line in structure;
+  Geofence Zones has no map picker (no maps package available in this
+  project) - lat/lng are plain number fields, same honesty-over-polish
+  choice as Field Tracking's trail view below.
+- **`field_tracking_screen.dart`** - a "where is everyone right now"
+  live panel plus a per-employee/per-date trail, rendered as an ordered
+  list of coordinates/times rather than a fake map.
+- **`raw_punches_screen.dart`** - browsable raw-log table + the
+  "Download Logs" button described in Correction #2 above.
+- **Five new report screens** (`weekly_report_screen.dart`,
+  `na_shift_report_screen.dart`, `late_early_report_screen.dart`,
+  `overtime_report_screen.dart`, `performance_report_screen.dart`) -
+  mirror `MonthlyReportScreen`'s `AppCard`+month-navigator structure
+  (the Reports-group visual convention, distinct from the
+  `SectionCard` convention Settings/Transaction-group screens use -
+  both conventions already coexisted in this codebase before this
+  pass, per that group's own established split).
+- **`home_shell.dart`** - all 8 new leaves wired into all three
+  existing switch statements (nav leaf list, title lookup,
+  screen-builder) at their natural group (Transaction, Reports,
+  Settings) - cross-checked after wiring that every new key appears
+  exactly 3 times (leaf + title-case + builder-case), confirming no
+  orphaned case with a missing leaf or vice versa.
+
+**Verified only by**: manual brace/paren balance checks on every
+touched/new `.dart` file (all pass) plus the 3-occurrence cross-check
+above for `home_shell.dart` specifically. No `dart`/`flutter` toolchain
+available in this sandbox - never compiled, never run, never checked
+against `pubspec.yaml` (still not present in this export). Same
+posture as every other Flutter section here: a well-reasoned first
+draft, not tested code.
+
+## 10c. Built — migration_015 batch backend (Node routes/schema + zk_bridge C#; Flutter UI is section 10d below)
+
+Client explicitly confirmed **"Device Health Report" is REMOVED from
+scope** — not built, won't be, per direct instruction. Everything else
+below was requested together as one batch; this pass built the backend
+(Node routes + schema + the `zk_bridge` C# additions), Flutter UI for
+all of it is the next pass, not yet started.
+
+**`migrations/migration_015_shift_rules_geofence_categories.sql`** —
+one big additive migration (every change is a new column with a
+backward-compatible default, or a brand-new table — nothing existing
+renamed/removed, respecting `shifts.js`'s own "don't rename, other
+passes rely on this shape" warning):
+- **Shift rules**: `weekly_off_bitmask` (NULL = inherit the company-wide
+  config, same bit layout), `ot_allowed` (default TRUE), `late_grace_minutes`/
+  `early_grace_minutes` (default 0 = strict), `single_punch_policy`
+  (`none`/`absent`/`half_day`/`leave`, default `none` = today's actual
+  behaviour), `is_half_day_shift` (a descriptive tag only, no computed
+  hours-threshold logic attached — the PDF lists it as its own bullet
+  separate from any auto-detection rule, so none was invented).
+- **Holiday Groups**: new `holiday_groups` table; `holidays.holiday_group_id`
+  and `branches.holiday_group_id` both NULL-able and both default NULL
+  = "company-wide/ungrouped", i.e. today's exact behaviour for anyone
+  who never touches groups.
+- **Employee Categories**: new `employee_categories` table (same
+  admin-editable-list pattern as departments/designations), `employees.category_id`.
+- **Geofencing + Remote Location** — this resolves the ambiguity
+  section 6 flagged and deliberately left unbuilt. Researched how other
+  HRMS products define these two terms before building (web search,
+  this session): a **geofence** is a named circular zone (center +
+  radius, ~50-200m is the commonly recommended range) checked against a
+  punch's coordinate; **"remote location enabled"** on an employee is
+  what *exempts* that employee from the geofence check entirely (a
+  WFH/travelling-permitted employee), as opposed to a field employee
+  who's still expected to be inside *some* approved zone, just not
+  always the same one. New `geofence_zones` table (company- or
+  branch-scoped), `employees.remote_location_enabled` (default FALSE).
+  Geofencing is opt-in by *configuring a zone* — a company with zero
+  zones blocks nothing.
+- **Field Employee Tracking** — deliberately distinct from geofencing
+  per that same research: geofencing is a single point-in-time gate at
+  punch time; field tracking is a continuous trail of periodic
+  background-location pings logged while someone's on duty. New
+  `field_location_pings` table.
+- **Raw Punches** — backs "Show Device Raw Punch" / "Download Logs from
+  Device/USB" / "All Raw Punch Report" together, all three read from
+  the same table. New `raw_punches` table: deliberately **no unique
+  key** forcing one-row-per-device/user/second — a device can log a
+  genuinely repeated real punch, so that's not a duplicate to prevent
+  at the schema layer; app-layer dedup instead (`routes/rawPunches.js`
+  checks for an identical existing row before inserting, to survive an
+  admin clicking "Download Logs" twice before the device buffer clears).
+
+**`zk_bridge` (C#)** — `DeviceOperations.cs`/`Program.cs`:
+- `DELETE /device/users/{id}` → `SSR_DeleteEnrollData(..., backupNumber=12)` ("delete everything for this user").
+- `GET|POST /device/users/{id}/fingerprint?fingerIndex=N` → `GetUserTmpStr`/`SetUserTmpStr`, mirroring the existing face-template calls' shape. `fingerIndex` (0-9) is required on both verbs, unlike `/face` which never takes an index — a fingerprint template is meaningless without knowing which of ten fingers it's for.
+- `GET /device/logs` → `ReadGeneralLogData` + repeated `GetGeneralLogData` (standard ZK AttLog demo pattern) — pulls the device's own raw log buffer over the network. **This is the network-pull path only.** A separate offline workflow exists on some ZK devices (export to USB as a `.dat` file from the device's own menu, then import that file via a local-file-based SDK call) — **not implemented**, would need the actual SDK manual's USB-import section and real hardware to get right rather than guessed at.
+- **All three of the above are flagged in-code as NOT cross-checked against an actual demo project source file** — unlike `SetAdmin`/`SetFace`/`SetCard` (built in an earlier pass, verified against real demo files per `PASS_NOTES.md`), this pass had no such file for delete-user/fingerprint/logs. The calls used are the standard, widely-documented zkemkeeper signatures and match this file's existing `SSR_`-prefix convention, but "widely documented" is not the same bar as "checked against this project's own demo source" — flagged explicitly rather than silently presented as equally solid.
+
+**Node routes** — new: `holidayGroups.js`, `employeeCategories.js`,
+`geofenceZones.js` (haversine distance check, exports `checkAgainstZones`
+for reuse), `fieldTracking.js`, `rawPunches.js`. Extended: `shifts.js`
+(new fields on POST/PUT), `holidays.js`/`branches.js` (group filtering/
+assignment), `employees.js` (`category_id`/`remote_location_enabled`
+on POST/PUT), `mobilePunch.js` (`GET /` now attaches a computed
+`geofence: {...}` object per row — computed at *read* time against
+current zones, not frozen at submission time, so an admin editing a
+zone immediately affects still-pending rows), `overtime.js`
+(`computeAndRecordOvertime` now looks up the employee's shift and skips
+entirely if `ot_allowed` is FALSE — an employee with no shift keeps the
+original "OT for everyone" behaviour).
+
+**`reports.js` additions**:
+- `GET /reports/weekly?date=` — Sun-Sat window (matches `offDaysBitmask`'s
+  own bit layout), reuses `classifyDay` directly rather than
+  `computeMonthlySummary` so a week crossing a month boundary isn't a
+  special case.
+- `GET /reports/na-shift?date=` — active employees with no resolvable
+  shift at all (`resolveEffectiveShift` — checks `shift_assignments`
+  roster, then `employees.shift_id`, then the company's default shift;
+  returns null only if a company somehow has none of the three).
+- `GET /reports/late-early?date=` — a genuinely NEW dedicated report,
+  distinct from the existing per-day `isLate` flag buried in
+  `GET /employees/:id/monthly-summary` (which compares against one
+  company-wide `office_time_policy.check_in_window_end` and has no
+  "early" concept). This one uses each employee's own resolved shift
+  and that shift's `late_grace_minutes`/`early_grace_minutes` — a shift
+  created before this migration has 0/0 grace, i.e. strict-by-default
+  until an admin configures real windows.
+- `GET /reports/overtime?from=&to=&status=` — list/summary view over
+  the already-existing `overtime_records` table; the table was already
+  populated, this was purely the missing report view.
+- `GET /reports/performance?year=&month=` — built as a **month-level
+  scorecard** (attendance %, late/early counts, absent days, OT hours)
+  rather than a single-day metric, since the PDF lists it under "Daily"
+  alongside Present/Absent/etc. but a single day's late-count isn't a
+  meaningful performance signal on its own. Every number in it is
+  exactly what its own dedicated report already computes (late-early's
+  logic, monthly summary's attendance math, overtime's sum), gathered
+  into one row per employee rather than a new invented scoring formula.
+- "All Raw Punch Report" needed no new endpoint — `GET /raw-punches`
+  (with `from`/`to` filters) already serves both the live browsable
+  list and the report/export use case.
+
+**Verified only by**: `node --check` on every touched/new `.js` file
+(all pass) and manual brace-balance checks on `DeviceOperations.cs`/
+`Program.cs` (no C# compiler available in this sandbox — no
+`csc`/`mono`/`dotnet`). **Not verified**: migration_015 has never run
+against a real database, none of these routes have been hit with a
+real HTTP request, `zk_bridge`'s three new operations have never run
+against real hardware or even compiled. Same posture as every other
+section here — treat as a well-reasoned first draft, not tested code.
+
+**Explicitly deferred, not forgotten**:
+- **Flutter UI for this entire batch** — none of it has a screen yet
+  (Shift's new fields on the Shift Change form, Holiday Groups CRUD
+  screen, Employee Categories CRUD screen, Geofence Zones CRUD screen +
+  the new geofence/remote-location columns on Mobile Punch Approval,
+  Field Tracking map/trail view, Raw Punches browsable list, and the
+  five new report screens). This is the explicit next step.
+- Pure offline USB `.dat`-file log import (see zk_bridge note above).
+- Whether "earn/adjust leave" (section 10) should ever feed the live
+  monthly-quota calculation is still an open question from that
+  section — unrelated to this batch, just noting it's still open.
 
 ## 10. Ground rule for whoever picks this up next
 

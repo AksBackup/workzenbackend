@@ -274,4 +274,349 @@ router.get('/yearly', requireAdmin, asyncHandler(async (req, res) => {
     return res.json(result);
 }));
 
+/**
+ * GET /reports/weekly?date=YYYY-MM-DD (any date inside the target week)
+ * Same shape as /reports/monthly's per-employee tally, just windowed to
+ * one Sun-Sat week instead of a calendar month - reuses classifyDay
+ * directly (not computeMonthlySummary, which is month-bounded) so the
+ * week can cross a month boundary without special-casing that split.
+ * Sun-Sat matches offDaysBitmask's own bit layout (bit 0 = Sunday),
+ * not an arbitrary choice.
+ */
+router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ error: 'date (YYYY-MM-DD, any day in the target week) query param required' });
+
+    const companyId = req.user.companyId;
+    const anchor = new Date(`${date}T00:00:00`);
+    const weekStartDate = new Date(anchor);
+    weekStartDate.setDate(anchor.getDate() - anchor.getDay()); // back up to Sunday
+    const weekEndDate = new Date(weekStartDate);
+    weekEndDate.setDate(weekStartDate.getDate() + 6);
+    const weekStart = toDateStr(weekStartDate);
+    const weekEnd = toDateStr(weekEndDate);
+
+    const { fullDayHours, halfDayMinHours, offDaysBitmask } = await loadCompanyContext(companyId);
+
+    const [employees] = await pool.query(
+        "SELECT id, name, emp_code FROM employees WHERE company_id = ? AND status = 'active'",
+        [companyId]
+    );
+    const [attendanceRows] = await pool.query(
+        'SELECT employee_id, date, check_in, check_out FROM attendance WHERE company_id = ? AND date BETWEEN ? AND ?',
+        [companyId, weekStart, weekEnd]
+    );
+    const attendanceByEmpDate = new Map();
+    for (const row of attendanceRows) {
+        attendanceByEmpDate.set(`${row.employee_id}|${toDateStr(row.date)}`, row);
+    }
+    const [leaveRows] = await pool.query(
+        `SELECT employee_id, from_date, to_date FROM leave_applications
+         WHERE company_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
+        [companyId, weekEnd, weekStart]
+    );
+    const [holidayRows] = await pool.query(
+        'SELECT date FROM holidays WHERE company_id = ? AND date BETWEEN ? AND ?',
+        [companyId, weekStart, weekEnd]
+    );
+    const holidayDates = new Set(holidayRows.map(h => toDateStr(h.date)));
+
+    const result = employees.map(emp => {
+        let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
+        const isOnApprovedLeave = (dateStr) => leaveRows.some(l => {
+            if (l.employee_id !== emp.id) return false;
+            return dateStr >= toDateStr(l.from_date) && dateStr <= toDateStr(l.to_date);
+        });
+
+        const cursor = new Date(weekStartDate);
+        for (let i = 0; i < 7; i++) {
+            const dateStr = toDateStr(cursor);
+            const dayOfWeek = cursor.getDay();
+            const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
+            const status = classifyDay({
+                dateStr, dayOfWeek, holidayDates, offDaysBitmask,
+                isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
+            });
+            if (status === 'present') { presentDays++; workingDays++; }
+            else if (status === 'half_day') { halfDays++; workingDays++; }
+            else if (status === 'absent') { absentDays++; workingDays++; }
+            else if (status === 'leave') { leaveDays++; }
+            cursor.setDate(cursor.getDate() + 1);
+        }
+
+        return {
+            employee_id: emp.id, employee_name: emp.name, emp_code: emp.emp_code,
+            week_start: weekStart, week_end: weekEnd,
+            present_days: presentDays, half_days: halfDays, absent_days: absentDays,
+            leave_days: leaveDays, working_days: workingDays,
+        };
+    });
+    return res.json(result);
+}));
+
+/**
+ * Resolves which shift applies to one employee on one date: the most
+ * specific shift_assignments row covering that date (roster override),
+ * falling back to the employee's plain employees.shift_id, falling
+ * back to the company's default shift (shifts.is_default) if the
+ * employee has no shift_id at all. Returns null only if the company
+ * somehow has no shifts whatsoever (shouldn't happen - shifts.js lazily
+ * seeds a default shift on first GET /shifts, but a company that has
+ * never once opened that screen could still be shift-less here).
+ */
+async function resolveEffectiveShift(companyId, employeeId, dateStr) {
+    const [assignmentRows] = await pool.query(
+        `SELECT s.* FROM shift_assignments sa
+         JOIN shifts s ON s.id = sa.shift_id
+         WHERE sa.company_id = ? AND sa.employee_id = ?
+           AND sa.effective_from <= ? AND (sa.effective_to IS NULL OR sa.effective_to >= ?)
+         ORDER BY sa.effective_from DESC LIMIT 1`,
+        [companyId, employeeId, dateStr, dateStr]
+    );
+    if (assignmentRows.length > 0) return assignmentRows[0];
+
+    const [empShiftRows] = await pool.query(
+        `SELECT s.* FROM employees e JOIN shifts s ON s.id = e.shift_id
+         WHERE e.id = ? AND e.company_id = ?`,
+        [employeeId, companyId]
+    );
+    if (empShiftRows.length > 0) return empShiftRows[0];
+
+    const [defaultRows] = await pool.query(
+        'SELECT * FROM shifts WHERE company_id = ? AND is_default = TRUE LIMIT 1',
+        [companyId]
+    );
+    return defaultRows.length > 0 ? defaultRows[0] : null;
+}
+
+/**
+ * GET /reports/na-shift?date=YYYY-MM-DD
+ * "NA Shift Report" - active employees with NO resolvable shift at all
+ * on the given date (no roster override, no employees.shift_id, and
+ * the company itself has no default shift - see
+ * resolveEffectiveShift's comment on when that last case can happen).
+ * In practice this should almost always be an empty list once a
+ * company has opened Shifts once (shifts.js auto-seeds a default), but
+ * an empty list is the whole point of this report existing - "nothing
+ * to flag" is a valid, useful answer, not a sign the query is broken.
+ */
+router.get('/na-shift', requireAdmin, asyncHandler(async (req, res) => {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ error: 'date (YYYY-MM-DD) query param required' });
+
+    const [employees] = await pool.query(
+        "SELECT id, name, emp_code FROM employees WHERE company_id = ? AND status = 'active'",
+        [req.user.companyId]
+    );
+    const naList = [];
+    for (const emp of employees) {
+        const shift = await resolveEffectiveShift(req.user.companyId, emp.id, date);
+        if (!shift) naList.push({ employee_id: emp.id, employee_name: emp.name, emp_code: emp.emp_code, date });
+    }
+    return res.json(naList);
+}));
+
+/**
+ * GET /reports/late-early?date=YYYY-MM-DD
+ * "Daily: Late/Early Report" - a DEDICATED report, distinct from the
+ * per-day 'isLate' flag already embedded in GET
+ * /employees/:id/monthly-summary (which compares against the single
+ * company-wide office_time_policy.check_in_window_end and has no
+ * "early" concept at all). This report instead uses each employee's
+ * OWN resolved shift (resolveEffectiveShift above) and that shift's
+ * late_grace_minutes/early_grace_minutes (migration_015) - a shift
+ * with 0/0 grace (the default for every shift created before this
+ * migration) means "late" is anything after start_time exactly and
+ * "early" is anything before end_time exactly, i.e. strict by default
+ * until an admin configures real grace windows per shift.
+ */
+router.get('/late-early', requireAdmin, asyncHandler(async (req, res) => {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ error: 'date (YYYY-MM-DD) query param required' });
+
+    const [employees] = await pool.query(
+        "SELECT id, name, emp_code FROM employees WHERE company_id = ? AND status = 'active'",
+        [req.user.companyId]
+    );
+    const [attendanceRows] = await pool.query(
+        'SELECT employee_id, check_in, check_out FROM attendance WHERE company_id = ? AND date = ?',
+        [req.user.companyId, date]
+    );
+    const attendanceByEmp = new Map(attendanceRows.map(r => [r.employee_id, r]));
+
+    const result = [];
+    for (const emp of employees) {
+        const attendance = attendanceByEmp.get(emp.id);
+        if (!attendance) continue; // absent entirely - not this report's concern, /reports/daily covers absence
+        const shift = await resolveEffectiveShift(req.user.companyId, emp.id, date);
+        if (!shift) continue; // covered instead by /reports/na-shift
+
+        let isLate = false, lateByMinutes = 0, isEarly = false, earlyByMinutes = 0;
+
+        if (attendance.check_in) {
+            const scheduledStart = new Date(`${date}T${shift.start_time}`);
+            scheduledStart.setMinutes(scheduledStart.getMinutes() + shift.late_grace_minutes);
+            const actualIn = new Date(attendance.check_in);
+            if (actualIn > scheduledStart) {
+                isLate = true;
+                lateByMinutes = Math.round((actualIn - scheduledStart) / 60000);
+            }
+        }
+        if (attendance.check_out) {
+            const scheduledEnd = new Date(`${date}T${shift.end_time}`);
+            scheduledEnd.setMinutes(scheduledEnd.getMinutes() - shift.early_grace_minutes);
+            const actualOut = new Date(attendance.check_out);
+            if (actualOut < scheduledEnd) {
+                isEarly = true;
+                earlyByMinutes = Math.round((scheduledEnd - actualOut) / 60000);
+            }
+        }
+
+        if (isLate || isEarly) {
+            result.push({
+                employee_id: emp.id, employee_name: emp.name, emp_code: emp.emp_code, date,
+                shift_name: shift.name, check_in: attendance.check_in, check_out: attendance.check_out,
+                is_late: isLate, late_by_minutes: lateByMinutes,
+                is_early: isEarly, early_by_minutes: earlyByMinutes,
+            });
+        }
+    }
+    return res.json(result);
+}));
+
+/**
+ * GET /reports/overtime?from=&to=&status=
+ * "Daily: Overtime Report" - overtime_records already exists and is
+ * already populated (utils/overtime.js, now also gated by
+ * shifts.ot_allowed per migration_015) - this is simply the missing
+ * list/report view over that existing table, with a summary total so
+ * the report doesn't require the client to sum rows itself.
+ */
+router.get('/overtime', requireAdmin, asyncHandler(async (req, res) => {
+    const { from, to, status } = req.query;
+    const params = [req.user.companyId];
+    let sql = `SELECT o.*, e.name AS employee_name, e.emp_code AS employee_code
+               FROM overtime_records o
+               JOIN employees e ON e.id = o.employee_id
+               WHERE o.company_id = ?`;
+    if (from) { sql += ' AND o.date >= ?'; params.push(from); }
+    if (to) { sql += ' AND o.date <= ?'; params.push(to); }
+    if (status) { sql += ' AND o.status = ?'; params.push(status); }
+    sql += ' ORDER BY o.date DESC, e.name ASC';
+
+    const [rows] = await pool.query(sql, params);
+    const totalHours = rows.reduce((sum, r) => sum + parseFloat(r.overtime_hours || 0), 0);
+    const totalAmount = rows.reduce((sum, r) => sum + parseFloat(r.amount || 0), 0);
+    return res.json({ records: rows, summary: { total_hours: Math.round(totalHours * 100) / 100, total_amount: Math.round(totalAmount * 100) / 100 } });
+}));
+
+/**
+ * GET /reports/performance?year=&month=
+ * "Daily: Performance Report" - the PDF lists this under "Daily" along
+ * with Present/Absent/Late/etc, but a single day's worth of "late
+ * count" or "attendance %" isn't a meaningful performance signal on
+ * its own, so this is built as a month-level scorecard per employee
+ * instead (attendance %, late count, early count, absent days, OT
+ * hours) - the same monthly window every other non-daily report here
+ * already uses. Composed from computeMonthlySummary (attendance/leave)
+ * plus a per-day late/early scan (same grace-window logic as
+ * /reports/late-early above) plus a sum over overtime_records, rather
+ * than inventing a new scoring formula - each number here is exactly
+ * what its own dedicated report already computes, just gathered into
+ * one row per employee.
+ */
+router.get('/performance', requireAdmin, asyncHandler(async (req, res) => {
+    const year = parseInt(req.query.year, 10);
+    const month = parseInt(req.query.month, 10);
+    if (!year || !month || month < 1 || month > 12) {
+        return res.status(400).json({ error: 'year and month (1-12) query params required' });
+    }
+    const companyId = req.user.companyId;
+    const context = await loadCompanyContext(companyId);
+    const monthlySummary = await computeMonthlySummary(companyId, year, month, context);
+
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
+    const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
+
+    const [otRows] = await pool.query(
+        'SELECT employee_id, SUM(overtime_hours) AS total_hours FROM overtime_records WHERE company_id = ? AND date BETWEEN ? AND ? GROUP BY employee_id',
+        [companyId, monthStart, monthEnd]
+    );
+    const otByEmp = new Map(otRows.map(r => [r.employee_id, parseFloat(r.total_hours) || 0]));
+
+    const lateEarlyCounts = new Map(); // employee_id -> { late, early }
+    for (let day = 1; day <= daysInMonth; day++) {
+        const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        // Reuses the exact same per-day logic /reports/late-early runs
+        // for a single date, just looped across the month here.
+        const dayResp = await computeLateEarlyForDate(companyId, dateStr);
+        for (const row of dayResp) {
+            const counts = lateEarlyCounts.get(row.employee_id) || { late: 0, early: 0 };
+            if (row.is_late) counts.late++;
+            if (row.is_early) counts.early++;
+            lateEarlyCounts.set(row.employee_id, counts);
+        }
+    }
+
+    const result = monthlySummary.map(row => {
+        const counts = lateEarlyCounts.get(row.employee_id) || { late: 0, early: 0 };
+        const attendancePct = row.working_days > 0
+            ? Math.round(((row.present_days + row.half_days * 0.5) / row.working_days) * 1000) / 10
+            : null;
+        return {
+            employee_id: row.employee_id,
+            employee_name: row.employee_name,
+            emp_code: row.emp_code,
+            attendance_percent: attendancePct,
+            present_days: row.present_days,
+            half_days: row.half_days,
+            absent_days: row.absent_days,
+            leave_days: row.leave_days,
+            late_count: counts.late,
+            early_count: counts.early,
+            overtime_hours: Math.round((otByEmp.get(row.employee_id) || 0) * 100) / 100,
+        };
+    });
+    return res.json(result);
+}));
+
+// Shared by both GET /late-early and GET /performance above, so the
+// month-long scorecard's late/early counts use the literal same
+// per-day rule as the dedicated daily report rather than a
+// re-implementation that could quietly drift from it.
+async function computeLateEarlyForDate(companyId, date) {
+    const [employees] = await pool.query(
+        "SELECT id FROM employees WHERE company_id = ? AND status = 'active'",
+        [companyId]
+    );
+    const [attendanceRows] = await pool.query(
+        'SELECT employee_id, check_in, check_out FROM attendance WHERE company_id = ? AND date = ?',
+        [companyId, date]
+    );
+    const attendanceByEmp = new Map(attendanceRows.map(r => [r.employee_id, r]));
+
+    const result = [];
+    for (const emp of employees) {
+        const attendance = attendanceByEmp.get(emp.id);
+        if (!attendance) continue;
+        const shift = await resolveEffectiveShift(companyId, emp.id, date);
+        if (!shift) continue;
+
+        let isLate = false, isEarly = false;
+        if (attendance.check_in) {
+            const scheduledStart = new Date(`${date}T${shift.start_time}`);
+            scheduledStart.setMinutes(scheduledStart.getMinutes() + shift.late_grace_minutes);
+            if (new Date(attendance.check_in) > scheduledStart) isLate = true;
+        }
+        if (attendance.check_out) {
+            const scheduledEnd = new Date(`${date}T${shift.end_time}`);
+            scheduledEnd.setMinutes(scheduledEnd.getMinutes() - shift.early_grace_minutes);
+            if (new Date(attendance.check_out) < scheduledEnd) isEarly = true;
+        }
+        if (isLate || isEarly) result.push({ employee_id: emp.id, is_late: isLate, is_early: isEarly });
+    }
+    return result;
+}
+
 module.exports = router;

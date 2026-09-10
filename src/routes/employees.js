@@ -35,7 +35,7 @@ router.get('/', asyncHandler(async (req, res) => {
  * branches going forward since no token will carry role:'employee'.)
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code } = req.body;
+    const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     // emp_code is normally auto-generated (see below) but can optionally be
@@ -78,11 +78,12 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
         const [result] = await conn.query(
             `INSERT INTO employees
-             (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+             (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, category_id, remote_location_enabled, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, name, designation || null, department || null,
                 department_id || null, designation_id || null, shift_id || null,
-                doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null]
+                doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null,
+                category_id || null, !!remote_location_enabled]
         );
 
         await conn.commit();
@@ -115,7 +116,8 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
  * moment the screen is left and re-entered).
  */
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url'];
+    // category_id, remote_location_enabled added by migration_015.
+    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled'];
     const updates = [];
     const values = [];
     fields.forEach(f => {

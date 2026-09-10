@@ -51,6 +51,13 @@ const companyRoutes = require('./routes/companies');
 // guard on POST) and is required/mounted exactly once, here.
 const leaveTypeRoutes = require('./routes/leaveTypes');
 const leaveOpeningRoutes = require('./routes/leaveOpening');
+// Earn/Adjust Leave (CONTEXT.md section 8 item 3,
+// migration_014_leave_adjustments.sql) - deliberately separate from
+// leaveOpeningRoutes above: same underlying leave_balances.allocated
+// column, but this applies a delta with an audit trail instead of an
+// absolute overwrite. See that migration's header comment for the full
+// scope note.
+const leaveAdjustmentRoutes = require('./routes/leaveAdjustments');
 const shiftAssignmentRoutes = require('./routes/shiftAssignments');
 const manualPunchRoutes = require('./routes/manualPunch');
 // GPS/mobile-submitted punch approval (CONTEXT.md section 7/8 item 1,
@@ -75,6 +82,15 @@ const adminRoutes = require('./routes/admins');
 // (see migration_006_dashboard_widgets.sql).
 const calendarEventRoutes = require('./routes/calendarEvents');
 const dashboardNotesRoutes = require('./routes/dashboardNotes');
+// This build batch (migration_015): Shift's remaining rule fields ship
+// as new columns on the existing shiftRoutes/shiftAssignmentRoutes
+// above, not a new route file. These five are the genuinely new
+// resources from that same migration.
+const holidayGroupRoutes = require('./routes/holidayGroups');
+const employeeCategoryRoutes = require('./routes/employeeCategories');
+const { router: geofenceZoneRoutes } = require('./routes/geofenceZones');
+const fieldTrackingRoutes = require('./routes/fieldTracking');
+const rawPunchRoutes = require('./routes/rawPunches');
 
 const pool = require('./db');
 
@@ -112,6 +128,7 @@ app.use('/companies', companyRoutes);
 // merged leaveTypeRoutes require above) - mounting the same path twice
 // would silently shadow one implementation with the other.
 app.use('/leave-balances', leaveOpeningRoutes);
+app.use('/leave-adjustments', leaveAdjustmentRoutes);
 app.use('/shift-assignments', shiftAssignmentRoutes);
 app.use('/manual-punches', manualPunchRoutes);
 app.use('/mobile-punches', mobilePunchRoutes);
@@ -130,6 +147,11 @@ app.use('/admins', adminRoutes);
 // Dashboard redesign scope.
 app.use('/calendar-events', calendarEventRoutes);
 app.use('/dashboard-notes', dashboardNotesRoutes);
+app.use('/holiday-groups', holidayGroupRoutes);
+app.use('/employee-categories', employeeCategoryRoutes);
+app.use('/geofence-zones', geofenceZoneRoutes);
+app.use('/field-tracking', fieldTrackingRoutes);
+app.use('/raw-punches', rawPunchRoutes);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 

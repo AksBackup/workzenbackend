@@ -15,18 +15,19 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, address, phone, is_head_office } = req.body;
+    const { name, address, phone, is_head_office, holiday_group_id } = req.body;
     if (!name) return res.status(400).json({ error: 'name required' });
 
     const [result] = await pool.query(
-        'INSERT INTO branches (company_id, name, address, phone, is_head_office) VALUES (?, ?, ?, ?, ?)',
-        [req.user.companyId, name, address || null, phone || null, !!is_head_office]
+        'INSERT INTO branches (company_id, name, address, phone, is_head_office, holiday_group_id) VALUES (?, ?, ?, ?, ?, ?)',
+        [req.user.companyId, name, address || null, phone || null, !!is_head_office, holiday_group_id || null]
     );
     return res.status(201).json({ id: result.insertId, name, address: address || null, phone: phone || null, is_head_office: !!is_head_office });
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['name', 'address', 'phone', 'is_head_office'];
+    // holiday_group_id added by migration_015 - see holidayGroups.js.
+    const fields = ['name', 'address', 'phone', 'is_head_office', 'holiday_group_id'];
     const updates = [];
     const values = [];
     fields.forEach(f => {

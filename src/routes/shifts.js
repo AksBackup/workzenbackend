@@ -47,10 +47,27 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     if (!name || !start_time || !end_time) {
         return res.status(400).json({ error: 'name, start_time and end_time are required' });
     }
+    // migration_015: optional per-shift rule fields (see that
+    // migration's header comment for exactly what each one means and
+    // what it does/doesn't affect). All are optional and default to
+    // "inherit/off" at the DB level if omitted here.
+    const {
+        weekly_off_bitmask = null,
+        ot_allowed = true,
+        late_grace_minutes = 0,
+        early_grace_minutes = 0,
+        single_punch_policy = 'none',
+        is_half_day_shift = false,
+    } = req.body;
+    if (!['none', 'absent', 'half_day', 'leave'].includes(single_punch_policy)) {
+        return res.status(400).json({ error: "single_punch_policy must be one of 'none','absent','half_day','leave'" });
+    }
 
     const [result] = await pool.query(
-        'INSERT INTO shifts (company_id, name, start_time, end_time) VALUES (?, ?, ?, ?)',
-        [req.user.companyId, name, start_time, end_time]
+        `INSERT INTO shifts
+            (company_id, name, start_time, end_time, weekly_off_bitmask, ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, is_half_day_shift)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, name, start_time, end_time, weekly_off_bitmask, !!ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, !!is_half_day_shift]
     );
     return res.status(201).json({ id: result.insertId, name, start_time, end_time, is_default: false });
 }));
@@ -60,7 +77,17 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     // only DELETE is blocked for it. `is_default` itself is never
     // accepted here, so a client can't promote/demote a shift's
     // protected status through this route.
-    const fields = ['name', 'start_time', 'end_time'];
+    const fields = [
+        'name', 'start_time', 'end_time',
+        // migration_015 additions - see POST above / that migration's
+        // header comment.
+        'weekly_off_bitmask', 'ot_allowed', 'late_grace_minutes',
+        'early_grace_minutes', 'single_punch_policy', 'is_half_day_shift',
+    ];
+    if (req.body.single_punch_policy !== undefined &&
+        !['none', 'absent', 'half_day', 'leave'].includes(req.body.single_punch_policy)) {
+        return res.status(400).json({ error: "single_punch_policy must be one of 'none','absent','half_day','leave'" });
+    }
     const updates = [];
     const values = [];
     fields.forEach(f => {

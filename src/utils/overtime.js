@@ -27,6 +27,27 @@ const pool = require('../db');
 async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOutValue) {
     if (!checkOutValue) return;
 
+    // migration_015: per-shift OT eligibility gate. An employee with no
+    // shift assigned (shift_id NULL) keeps today's original behaviour
+    // (OT computed for everyone) - the join below only excludes someone
+    // when their *specific* assigned shift has ot_allowed = FALSE.
+    const [shiftRows] = await pool.query(
+        `SELECT s.ot_allowed FROM employees e
+         JOIN shifts s ON s.id = e.shift_id
+         WHERE e.id = ? AND e.company_id = ?`,
+        [employeeId, companyId]
+    );
+    if (shiftRows.length > 0 && !shiftRows[0].ot_allowed) {
+        // This employee's shift explicitly disallows OT - clear any
+        // stale pending record for consistency (e.g. their shift was
+        // just changed to an OT-disallowed one) and stop.
+        await pool.query(
+            "DELETE FROM overtime_records WHERE employee_id = ? AND date = ? AND status = 'pending'",
+            [employeeId, dateStr]
+        );
+        return;
+    }
+
     const [policyRows] = await pool.query(
         'SELECT check_out_time, overtime_rate_per_hour FROM office_time_policy WHERE company_id = ?',
         [companyId]

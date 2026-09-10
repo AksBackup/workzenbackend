@@ -3,6 +3,7 @@ const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
 const { computeAndRecordOvertime } = require('../utils/overtime');
+const { checkAgainstZones } = require('./geofenceZones');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -53,7 +54,7 @@ async function _currentEmployeeId(req) {
 router.get('/', asyncHandler(async (req, res) => {
     const { status, employee_id } = req.query;
     const params = [req.user.companyId];
-    let sql = `SELECT mp.*, e.name AS employee_name, e.emp_code AS employee_code
+    let sql = `SELECT mp.*, e.name AS employee_name, e.emp_code AS employee_code, e.remote_location_enabled
                FROM mobile_punches mp
                JOIN employees e ON e.id = mp.employee_id
                WHERE mp.company_id = ?`;
@@ -73,7 +74,28 @@ router.get('/', asyncHandler(async (req, res) => {
     sql += ' ORDER BY mp.date DESC, mp.created_at DESC';
 
     const [rows] = await pool.query(sql, params);
-    return res.json(rows);
+
+    // migration_015: attach a geofence check to each row rather than
+    // storing it at submission time - see geofenceZones.js's
+    // checkAgainstZones comment for why a bad/no reading shouldn't hard
+    // -block submission. remote_location_enabled employees skip the
+    // check entirely (geofence is meaningless for them by definition -
+    // see migration_015's header comment on what that flag means).
+    // Computed here, at read time, so a zone added/edited/removed after
+    // submission is always reflected against still-pending rows rather
+    // than freezing a stale judgement from submission time.
+    const rowsWithGeofence = await Promise.all(rows.map(async (row) => {
+        if (row.remote_location_enabled) {
+            return { ...row, geofence: { exempt: true } };
+        }
+        if (row.latitude == null || row.longitude == null) {
+            return { ...row, geofence: { exempt: false, hasLocation: false } };
+        }
+        const check = await checkAgainstZones(req.user.companyId, parseFloat(row.latitude), parseFloat(row.longitude));
+        return { ...row, geofence: { exempt: false, hasLocation: true, ...check } };
+    }));
+
+    return res.json(rowsWithGeofence);
 }));
 
 // POST /mobile-punches - the phone submits HERE, never straight to

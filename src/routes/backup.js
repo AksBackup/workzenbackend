@@ -72,6 +72,19 @@ const TABLES = [
     // above: it's operational queue data scoped to this company, not an
     // account-identity record, so it belongs in backup/restore.
     { name: 'mobile_punches', scope: 'company_id' },
+    // migration_014_leave_adjustments.sql - has its own company_id
+    // column directly (unlike leave_balances above, which is scoped via
+    // 'via_employees'), so this is a plain company_id-scoped table.
+    { name: 'leave_adjustments', scope: 'company_id' },
+    // migration_015 additions - all plain company_id-scoped tables,
+    // same reasoning as leave_adjustments/mobile_punches above (this is
+    // operational/config data the company owns, not account-identity
+    // data, so it belongs in backup/restore).
+    { name: 'holiday_groups', scope: 'company_id' },
+    { name: 'employee_categories', scope: 'company_id' },
+    { name: 'geofence_zones', scope: 'company_id' },
+    { name: 'field_location_pings', scope: 'company_id' },
+    { name: 'raw_punches', scope: 'company_id' },
     { name: 'visitors', scope: 'company_id' },
     { name: 'canteen_usage', scope: 'company_id' },
     { name: 'shift_assignments', scope: 'company_id' },
