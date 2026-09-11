@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
+const { loadWeeklyOffIndex, effectiveOffDaysBitmask } = require('../utils/attendanceRules');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -35,7 +36,7 @@ router.get('/', asyncHandler(async (req, res) => {
  * branches going forward since no token will carry role:'employee'.)
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled } = req.body;
+    const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled, branch_id } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     // emp_code is normally auto-generated (see below) but can optionally be
@@ -78,12 +79,12 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
         const [result] = await conn.query(
             `INSERT INTO employees
-             (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, category_id, remote_location_enabled, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+             (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, category_id, remote_location_enabled, branch_id, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, name, designation || null, department || null,
                 department_id || null, designation_id || null, shift_id || null,
                 doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null,
-                category_id || null, !!remote_location_enabled]
+                category_id || null, !!remote_location_enabled, branch_id || null]
         );
 
         await conn.commit();
@@ -117,7 +118,9 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
  */
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     // category_id, remote_location_enabled added by migration_015.
-    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled'];
+    // branch_id added by migration_016 (Holiday Group resolution needs
+    // to know which branch an employee belongs to).
+    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled', 'branch_id'];
     const updates = [];
     const values = [];
     fields.forEach(f => {
@@ -215,7 +218,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     const month = parseInt(req.query.month, 10) || (new Date().getMonth() + 1); // 1-12
 
     const [empRows] = await pool.query(
-        'SELECT id, name, emp_code, dob FROM employees WHERE id = ? AND company_id = ?',
+        'SELECT id, name, emp_code, dob, department, branch_id FROM employees WHERE id = ? AND company_id = ?',
         [employeeId, req.user.companyId]
     );
     if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
@@ -238,20 +241,40 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         'SELECT date, check_in, check_out, verify_mode FROM attendance WHERE employee_id = ? AND date BETWEEN ? AND ?',
         [employeeId, monthStart, monthEnd]
     );
+    // This employee's own holiday group (via their branch, migration_016)
+    // - NULL group means "only company-wide (ungrouped) holidays", same
+    // as before this employee has a branch assigned.
+    let employeeHolidayGroupId = null;
+    if (employee.branch_id) {
+        const [branchRows] = await pool.query('SELECT holiday_group_id FROM branches WHERE id = ? AND company_id = ?', [employee.branch_id, req.user.companyId]);
+        employeeHolidayGroupId = branchRows.length > 0 ? branchRows[0].holiday_group_id : null;
+    }
     const [holidayRows] = await pool.query(
-        'SELECT date, name FROM holidays WHERE company_id = ? AND date BETWEEN ? AND ?',
+        'SELECT date, name, holiday_group_id FROM holidays WHERE company_id = ? AND date BETWEEN ? AND ?',
         [req.user.companyId, monthStart, monthEnd]
     );
+    // Only keep holidays that actually apply to this employee - either
+    // ungrouped (company-wide) or in their own branch's group. A
+    // group-specific holiday for a DIFFERENT group must not show up
+    // here, which the old unfiltered query didn't distinguish at all.
+    const holidayByDate = new Map();
+    for (const row of holidayRows) {
+        if (row.holiday_group_id != null && row.holiday_group_id !== employeeHolidayGroupId) continue;
+        holidayByDate.set(toDateStr(row.date), row.name);
+    }
+    const weeklyOffIndex = await loadWeeklyOffIndex(req.user.companyId);
+    // Shift-level weekly-off override (migration_015) isn't resolved
+    // here - this endpoint doesn't otherwise look up the employee's
+    // shift at all, and adding that is a larger change (see
+    // reports.js's resolveEffectiveShift for what that actually
+    // involves). Department-level override and the company default are
+    // both respected via effectiveOffDaysBitmask.
+    const offBitmask = effectiveOffDaysBitmask(null, employee.department, weeklyOffIndex);
     const [leaveRows] = await pool.query(
         `SELECT from_date, to_date FROM leave_applications
          WHERE employee_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
         [employeeId, monthEnd, monthStart]
     );
-    const [weeklyOffRows] = await pool.query(
-        'SELECT off_days_bitmask FROM weekly_off_config WHERE company_id = ? AND department IS NULL LIMIT 1',
-        [req.user.companyId]
-    );
-    const offBitmask = weeklyOffRows.length > 0 ? weeklyOffRows[0].off_days_bitmask : 1; // default: Sunday off
 
     // migration_010: unified per-leave-type monthly quota, replacing the
     // old flat office_time_policy.monthly_leave_quota. Every leave type
@@ -302,7 +325,6 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     );
 
     const attendanceByDate = new Map(attendanceRows.map(r => [toDateStr(r.date), r]));
-    const holidayByDate = new Map(holidayRows.map(r => [toDateStr(r.date), r.name]));
     const today = toDateStr(new Date());
 
     const days = [];

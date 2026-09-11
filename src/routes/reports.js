@@ -2,6 +2,12 @@ const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
+const {
+    loadHolidayIndex,
+    loadEmployeeHolidayGroups,
+    loadWeeklyOffIndex,
+    effectiveOffDaysBitmask,
+} = require('../utils/attendanceRules');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -41,29 +47,38 @@ async function loadCompanyContext(companyId) {
     const fullDayHours = policyRows.length ? Number(policyRows[0].full_day_hours) : 8.0;
     const halfDayMinHours = policyRows.length ? Number(policyRows[0].half_day_min_hours) : 4.0;
 
-    const [weeklyOffRows] = await pool.query(
-        'SELECT off_days_bitmask FROM weekly_off_config WHERE company_id = ? AND department IS NULL LIMIT 1',
-        [companyId]
-    );
-    const offDaysBitmask = weeklyOffRows.length ? weeklyOffRows[0].off_days_bitmask : 1; // default: Sunday only
-
-    return { fullDayHours, halfDayMinHours, offDaysBitmask };
+    // offDaysBitmask used to be resolved once here, company-wide, and
+    // reused for every employee - which meant department-specific
+    // weekly_off_config rows and Holiday Groups were silently ignored
+    // (every employee got the same single bitmask and the same
+    // unfiltered holiday list, regardless of their own department or
+    // branch). Both are now resolved per-employee - see
+    // utils/attendanceRules.js - so this only still loads what's
+    // genuinely company-wide: the hours policy.
+    return { fullDayHours, halfDayMinHours };
 }
 
 /**
  * Classifies one employee-day. Returns one of:
  * 'holiday' | 'weekly_off' | 'leave' | 'present' | 'half_day' | 'absent'
  */
-function classifyDay({ dateStr, dayOfWeek, holidayDates, offDaysBitmask, isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours }) {
-    if (holidayDates.has(dateStr)) return 'holiday';
+function classifyDay({ dateStr, dayOfWeek, isHoliday, offDaysBitmask, isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours }) {
+    if (isHoliday(dateStr)) return 'holiday';
     if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) return 'weekly_off';
     if (isOnApprovedLeave(dateStr)) return 'leave';
     if (!attendance || !attendance.check_in) return 'absent';
 
-    let hours = 0;
-    if (attendance.check_out) {
-        hours = (new Date(attendance.check_out) - new Date(attendance.check_in)) / (1000 * 60 * 60);
-    }
+    // No checkout recorded yet (missed punch, single-punch device policy,
+    // or - for today - simply hasn't left yet) - GET
+    // /employees/:id/monthly-summary counts this as 'present' on a bare
+    // check-in with no hours check at all, so this needs to agree rather
+    // than falling through to 'absent' for lack of a checkout to measure
+    // hours against. That mismatch was exactly why an employee could show
+    // present on the Attendance card and 0%/absent on the Monthly and
+    // Performance reports for the same day.
+    if (!attendance.check_out) return 'present';
+
+    const hours = (new Date(attendance.check_out) - new Date(attendance.check_in)) / (1000 * 60 * 60);
     if (hours >= fullDayHours) return 'present';
     if (hours >= halfDayMinHours) return 'half_day';
     return 'absent';
@@ -81,10 +96,10 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
     if (!date) return res.status(400).json({ error: 'date (YYYY-MM-DD) query param required' });
 
     const companyId = req.user.companyId;
-    const { fullDayHours, halfDayMinHours, offDaysBitmask } = await loadCompanyContext(companyId);
+    const { fullDayHours, halfDayMinHours } = await loadCompanyContext(companyId);
 
     const [employees] = await pool.query(
-        "SELECT id, name, emp_code FROM employees WHERE company_id = ? AND status = 'active'",
+        "SELECT id, name, emp_code, department FROM employees WHERE company_id = ? AND status = 'active'",
         [companyId]
     );
     const [attendanceRows] = await pool.query(
@@ -100,17 +115,23 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
     );
     const onLeaveEmpIds = new Set(leaveRows.map(r => r.employee_id));
 
-    const [holidayRows] = await pool.query('SELECT date FROM holidays WHERE company_id = ? AND date = ?', [companyId, date]);
-    const holidayDates = new Set(holidayRows.map(h => toDateStr(h.date)));
+    // Per-employee holiday-group + weekly-off resolution (see
+    // utils/attendanceRules.js) instead of one shared company-wide
+    // holiday list / bitmask for every employee.
+    const holidayIndex = await loadHolidayIndex(companyId, date, date);
+    const employeeGroups = await loadEmployeeHolidayGroups(companyId);
+    const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
 
     const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
 
     const result = employees.map(emp => {
         const attendance = attendanceByEmp.get(emp.id);
+        const employeeGroupId = employeeGroups.get(emp.id) ?? null;
+        const offDaysBitmask = effectiveOffDaysBitmask(null, emp.department, weeklyOffIndex);
         const status = classifyDay({
             dateStr: date,
             dayOfWeek,
-            holidayDates,
+            isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
             offDaysBitmask,
             isOnApprovedLeave: () => onLeaveEmpIds.has(emp.id),
             attendance,
@@ -157,13 +178,13 @@ router.get('/missed-punch', requireAdmin, asyncHandler(async (req, res) => {
  * /reports/yearly (one month at a time for yearly, called 12 times).
  */
 async function computeMonthlySummary(companyId, year, month, context) {
-    const { fullDayHours, halfDayMinHours, offDaysBitmask } = context;
+    const { fullDayHours, halfDayMinHours } = context;
     const daysInMonth = new Date(year, month, 0).getDate();
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
     const [employees] = await pool.query(
-        "SELECT id, name, emp_code FROM employees WHERE company_id = ? AND status = 'active'",
+        "SELECT id, name, emp_code, department FROM employees WHERE company_id = ? AND status = 'active'",
         [companyId]
     );
     const [attendanceRows] = await pool.query(
@@ -179,11 +200,13 @@ async function computeMonthlySummary(companyId, year, month, context) {
          WHERE company_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
         [companyId, monthEnd, monthStart]
     );
-    const [holidayRows] = await pool.query(
-        'SELECT date FROM holidays WHERE company_id = ? AND date BETWEEN ? AND ?',
-        [companyId, monthStart, monthEnd]
-    );
-    const holidayDates = new Set(holidayRows.map(h => toDateStr(h.date)));
+    // Per-employee holiday-group + weekly-off resolution (see
+    // utils/attendanceRules.js) - replaces the single company-wide
+    // holiday Set + bitmask this used to compute once and apply to
+    // every employee regardless of their branch/department.
+    const holidayIndex = await loadHolidayIndex(companyId, monthStart, monthEnd);
+    const employeeGroups = await loadEmployeeHolidayGroups(companyId);
+    const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
 
     return employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -194,13 +217,17 @@ async function computeMonthlySummary(companyId, year, month, context) {
             const to = toDateStr(l.to_date);
             return dateStr >= from && dateStr <= to;
         });
+        const employeeGroupId = employeeGroups.get(emp.id) ?? null;
+        const offDaysBitmask = effectiveOffDaysBitmask(null, emp.department, weeklyOffIndex);
 
         for (let day = 1; day <= daysInMonth; day++) {
             const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
             const dayOfWeek = new Date(year, month - 1, day).getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
             const status = classifyDay({
-                dateStr, dayOfWeek, holidayDates, offDaysBitmask,
+                dateStr, dayOfWeek,
+                isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
+                offDaysBitmask,
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
             });
             if (status === 'present') { presentDays++; workingDays++; }
@@ -296,10 +323,10 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
     const weekStart = toDateStr(weekStartDate);
     const weekEnd = toDateStr(weekEndDate);
 
-    const { fullDayHours, halfDayMinHours, offDaysBitmask } = await loadCompanyContext(companyId);
+    const { fullDayHours, halfDayMinHours } = await loadCompanyContext(companyId);
 
     const [employees] = await pool.query(
-        "SELECT id, name, emp_code FROM employees WHERE company_id = ? AND status = 'active'",
+        "SELECT id, name, emp_code, department FROM employees WHERE company_id = ? AND status = 'active'",
         [companyId]
     );
     const [attendanceRows] = await pool.query(
@@ -315,11 +342,9 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
          WHERE company_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
         [companyId, weekEnd, weekStart]
     );
-    const [holidayRows] = await pool.query(
-        'SELECT date FROM holidays WHERE company_id = ? AND date BETWEEN ? AND ?',
-        [companyId, weekStart, weekEnd]
-    );
-    const holidayDates = new Set(holidayRows.map(h => toDateStr(h.date)));
+    const holidayIndex = await loadHolidayIndex(companyId, weekStart, weekEnd);
+    const employeeGroups = await loadEmployeeHolidayGroups(companyId);
+    const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
 
     const result = employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -327,6 +352,8 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             if (l.employee_id !== emp.id) return false;
             return dateStr >= toDateStr(l.from_date) && dateStr <= toDateStr(l.to_date);
         });
+        const employeeGroupId = employeeGroups.get(emp.id) ?? null;
+        const offDaysBitmask = effectiveOffDaysBitmask(null, emp.department, weeklyOffIndex);
 
         const cursor = new Date(weekStartDate);
         for (let i = 0; i < 7; i++) {
@@ -334,7 +361,9 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             const dayOfWeek = cursor.getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
             const status = classifyDay({
-                dateStr, dayOfWeek, holidayDates, offDaysBitmask,
+                dateStr, dayOfWeek,
+                isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
+                offDaysBitmask,
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
             });
             if (status === 'present') { presentDays++; workingDays++; }

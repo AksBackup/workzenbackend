@@ -98,7 +98,11 @@ router.post('/bulk', requireAdmin, asyncHandler(async (req, res) => {
 router.get('/', asyncHandler(async (req, res) => {
     const { device_id, employee_id, from, to } = req.query;
     const params = [req.user.companyId];
-    let sql = `SELECT rp.*, e.name AS employee_name, e.emp_code AS employee_code, d.name AS device_name
+    // devices' name column is called device_name, not name - this was
+    // selecting a column that doesn't exist (d.name), which threw a SQL
+    // error and surfaced to the Flutter screen as a bare "HTTP 500:
+    // Internal server error".
+    let sql = `SELECT rp.*, e.name AS employee_name, e.emp_code AS employee_code, d.device_name AS device_name
                FROM raw_punches rp
                LEFT JOIN employees e ON e.id = rp.employee_id
                LEFT JOIN devices d ON d.id = rp.device_id
