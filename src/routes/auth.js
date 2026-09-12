@@ -8,13 +8,32 @@ const router = express.Router();
 // yet at this point, that's the entire reason this route exists. Same
 // "public by omission" pattern as routes/license.js's POST /activate.
 //
-// This is a public-facing web API key (safe to embed - see
-// firebase_auth_service.dart's doc comment on the Flutter side, which
-// already ships the same value), not the service-account secret used
-// everywhere else in this backend via firebase-admin. Overridable via
-// env for a project migration; defaults to the one already live in
-// production and already embedded in the desktop app.
-const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyBUbKzENsxnaJmReFz7W24DDa71xzDiyus';
+// This is a Firebase Web API Key (not the service-account secret used
+// everywhere else in this backend via firebase-admin) - per Google's
+// own docs it doesn't grant access by itself, so it isn't a secret in
+// the way a database password or the service-account key is; it's
+// already shipped inside the compiled desktop app's binary
+// (env.dart), same value.
+//
+// It is deliberately NOT hardcoded here even so - hardcoding it as a
+// literal string is exactly what triggered a GitHub secret-scanning
+// alert on this repo (Google API Key patterns are flagged regardless
+// of that context, since a plain string match can't tell "safe Firebase
+// key" apart from "unrestricted key with access to billable APIs").
+// Set FIREBASE_WEB_API_KEY in your deployment platform's environment
+// variables (e.g. Render's dashboard) - Firebase Console -> Project
+// Settings -> General -> Web API Key.
+//
+// Read lazily inside the route (not thrown here at module-load time) -
+// a missing env var should only break employee mobile login, not crash
+// the entire server on startup and take payroll/attendance/everything
+// else down with it.
+function getFirebaseWebApiKey() {
+    if (!process.env.FIREBASE_WEB_API_KEY) {
+        throw new Error('FIREBASE_WEB_API_KEY is not set in this server\'s environment.');
+    }
+    return process.env.FIREBASE_WEB_API_KEY;
+}
 
 /**
  * POST /auth/employee-login
@@ -76,10 +95,17 @@ router.post('/employee-login', asyncHandler(async (req, res) => {
     }
     const employee = empRows[0];
 
+    let webApiKey;
+    try {
+        webApiKey = getFirebaseWebApiKey();
+    } catch (err) {
+        return res.status(500).json({ error: 'Mobile login is not fully configured on the server yet - contact your admin.' });
+    }
+
     let firebaseResult;
     try {
         const resp = await fetch(
-            `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`,
+            `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${webApiKey}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
