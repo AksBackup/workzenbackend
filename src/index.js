@@ -22,6 +22,8 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const licenseRoutes = require('./routes/license');
+const authRoutes = require('./routes/auth');
+const communicationsEmailRoutes = require('./routes/communicationsEmail');
 const employeeRoutes = require('./routes/employees');
 const attendanceRoutes = require('./routes/attendance');
 const leaveRoutes = require('./routes/leaves');
@@ -103,6 +105,8 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use('/license', licenseRoutes);
+app.use('/auth', authRoutes);
+app.use('/communications/email', communicationsEmailRoutes);
 app.use('/employees', employeeRoutes);
 app.use('/attendance', attendanceRoutes);
 app.use('/leave-applications', leaveRoutes);

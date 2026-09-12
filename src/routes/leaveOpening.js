@@ -19,9 +19,29 @@ router.use(verifyFirebaseToken);
 // GET /leave-balances?year=2026[&employee_id=5]
 // Joined with employees + leave_types so the client gets display names
 // directly, same pattern /attendance already established.
+//
+// Bug fix found while wiring up the Android app's "My Leave" screen:
+// this had NO role==='employee' restriction at all - unlike every other
+// self-service-capable route in this backend (attendance, leaves,
+// mobile-punches, field-tracking), an employee-role caller could pass
+// any employee_id (or omit it) and read every employee's leave
+// balances company-wide. Restricted the same way those routes already
+// are: an employee-role token always forces employee_id to their own,
+// ignoring/overriding whatever was in the query string.
 router.get('/', asyncHandler(async (req, res) => {
-    const { year, employee_id } = req.query;
+    const { year } = req.query;
+    let { employee_id } = req.query;
     const params = [req.user.companyId];
+
+    if (req.user.role === 'employee') {
+        const [rows] = await pool.query(
+            'SELECT id FROM employees WHERE firebase_uid = ? AND company_id = ?',
+            [req.user.uid, req.user.companyId]
+        );
+        if (rows.length === 0) return res.status(404).json({ error: 'Employee record not found' });
+        employee_id = rows[0].id;
+    }
+
     let sql = `SELECT lb.*, e.name AS employee_name, e.emp_code AS employee_code,
                       e.department AS department_name, e.designation AS designation_name,
                       lt.name AS leave_type_name

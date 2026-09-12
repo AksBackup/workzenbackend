@@ -35,14 +35,13 @@ router.use(verifyFirebaseToken);
  * created in the first place.
  */
 
-router.get('/', requireAdmin, asyncHandler(async (req, res) => {
-    const year = parseInt(req.query.year, 10);
-    const month = parseInt(req.query.month, 10); // 1-12
-    if (!year || !month || month < 1 || month > 12) {
-        return res.status(400).json({ error: 'year and month (1-12) query params required' });
-    }
-
-    const companyId = req.user.companyId;
+/**
+ * Shared computation behind GET / (all employees, admin) and GET /me
+ * (the caller's own row, any employee). Pulled out so both routes stay
+ * byte-for-byte identical in how a payslip is computed - the only
+ * difference between them is which row(s) of `result` get returned.
+ */
+async function computeMonthlyPayroll(companyId, year, month) {
     const daysInMonth = new Date(year, month, 0).getDate();
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
@@ -202,7 +201,56 @@ router.get('/', requireAdmin, asyncHandler(async (req, res) => {
         };
     });
 
+    return result;
+}
+
+router.get('/', requireAdmin, asyncHandler(async (req, res) => {
+    const year = parseInt(req.query.year, 10);
+    const month = parseInt(req.query.month, 10); // 1-12
+    if (!year || !month || month < 1 || month > 12) {
+        return res.status(400).json({ error: 'year and month (1-12) query params required' });
+    }
+    const result = await computeMonthlyPayroll(req.user.companyId, year, month);
     return res.json(result);
+}));
+
+/**
+ * GET /payroll/me?year=&month= - the Android app's Salary Details
+ * screen (see ANDROID_APP_SPEC.md). Deliberately no employee-facing
+ * payroll endpoint existed before this - every other route in this
+ * file is requireAdmin. Computes the exact same way as GET / (same
+ * shared function above) and just returns the caller's own row, so a
+ * payslip figure here can never drift from what the admin's Payroll
+ * screen shows for the same employee/month.
+ */
+router.get('/me', asyncHandler(async (req, res) => {
+    const year = parseInt(req.query.year, 10);
+    const month = parseInt(req.query.month, 10);
+    if (!year || !month || month < 1 || month > 12) {
+        return res.status(400).json({ error: 'year and month (1-12) query params required' });
+    }
+
+    const [empRows] = await pool.query(
+        'SELECT id FROM employees WHERE firebase_uid = ? AND company_id = ?',
+        [req.user.uid, req.user.companyId]
+    );
+    if (empRows.length === 0) return res.status(404).json({ error: 'Employee record not found' });
+    const employeeId = empRows[0].id;
+
+    const result = await computeMonthlyPayroll(req.user.companyId, year, month);
+    const own = result.find(r => r.employee_id === employeeId);
+    if (!own) {
+        // Genuinely no computable row for this employee this month -
+        // e.g. they were marked inactive after the month in question
+        // (computeMonthlyPayroll only includes status='active'
+        // employees). Distinct from a 404 on the employee lookup above
+        // (account exists, this specific month just has nothing).
+        return res.json({
+            employee_id: employeeId, base_pay: 0, bonus: 0, overtime_pay: 0,
+            overtime_hours: 0, total_pay: 0, is_paid: false, paid_on: null,
+        });
+    }
+    return res.json(own);
 }));
 
 router.post('/:employeeId/bonus', requireAdmin, asyncHandler(async (req, res) => {

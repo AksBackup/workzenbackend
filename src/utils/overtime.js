@@ -93,6 +93,12 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
            amount = VALUES(amount),
            -- Recalculating shouldn't silently undo a real approval - only
            -- downgrade back to 'pending' if it wasn't already approved.
+           -- This also happens to protect migration_017's manual entries
+           -- (always inserted 'approved') from being knocked back to
+           -- 'pending' if a real late check-out also lands on the same
+           -- day - hours/amount still get refreshed to match the actual
+           -- punch, but the approval and 'manual' source (untouched
+           -- above) survive.
            status = IF(status = 'approved', status, 'pending')`,
         [companyId, employeeId, dateStr, checkOutValue, overtimeHours.toFixed(2), rate.toFixed(2), amount.toFixed(2)]
     );

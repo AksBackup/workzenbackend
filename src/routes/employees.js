@@ -1,4 +1,5 @@
 const express = require('express');
+const admin = require('firebase-admin');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
@@ -25,15 +26,16 @@ router.get('/', asyncHandler(async (req, res) => {
  * Called after a successful biometric enrollment (or manual add).
  * Auto-generates emp_code and stores the employee record.
  *
- * NOTE: employees do NOT get a login of any kind - this app is admin-only.
- * Employees are a data record for attendance/payroll/biometric purposes;
- * they're identified to the device by emp_code, not by signing into this
- * app. (Previously this created a Firebase Auth account per employee so
- * they could log in and see their own records - that's been removed.
- * firebase_uid stays in the schema/queries below for now since some
- * older role==='employee' branches elsewhere still reference it, but it
- * is never populated for new employees and nothing will ever hit those
- * branches going forward since no token will carry role:'employee'.)
+ * Login is opt-in, per employee, provisioned separately via
+ * POST /employees/:id/login below - creating an employee here does
+ * NOT create a login. (An earlier pass removed automatic per-employee
+ * Firebase account creation on the theory that this app was
+ * admin-only; that theory didn't hold - routes/mobilePunch.js and
+ * routes/fieldTracking.js both require an employee's own
+ * role:'employee' login to let them self-submit their own punches/
+ * pings from a phone, which is the entire mechanism a mobile app needs.
+ * migration_018 restores it as an explicit admin action instead of an
+ * automatic one, since not every employee needs mobile access.)
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled, branch_id } = req.body;
@@ -99,6 +101,107 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     } finally {
         conn.release();
     }
+}));
+
+/**
+ * POST /employees/:id/login
+ * Provisions (or re-provisions) this employee's mobile login: creates
+ * a Firebase Auth account with { company_id, role: 'employee' } custom
+ * claims - the exact shape verifyFirebaseToken.js requires - and links
+ * it via employees.firebase_uid, the same column mobilePunch.js's
+ * _currentEmployeeId() and fieldTracking.js already key off. See
+ * migration_018's header comment for why this exists.
+ *
+ * Deliberately admin-initiated and explicit rather than automatic on
+ * every employee create: not every employee needs a phone-facing
+ * login (e.g. someone who only ever punches at a fixed biometric
+ * terminal), so this is a separate opt-in action, closer in spirit to
+ * Device Admin/Device User privilege grants elsewhere in this app than
+ * to a mandatory step of onboarding.
+ */
+/**
+ * POST /employees/:id/login
+ * body: { password }
+ *
+ * Sets (or resets) the password an employee uses to sign into the
+ * Android app - see routes/auth.js's POST /employee-login for the
+ * matching sign-in side. There is deliberately no `email` field here
+ * anymore: employees sign in with Organization + Employee ID (emp_code)
+ * + Password, never an email address. Firebase Auth still requires an
+ * email-shaped identifier internally, so one is auto-generated
+ * (`e{id}@mobile.internal`, using the globally-unique employees.id, not
+ * emp_code which repeats across companies) and stored in
+ * employees.email purely as that hidden identifier - it's never shown
+ * to the employee and the app never asks for or displays it.
+ */
+router.post('/:id/login', requireAdmin, asyncHandler(async (req, res) => {
+    const { password } = req.body;
+    if (!password) {
+        return res.status(400).json({ error: 'password is required' });
+    }
+    if (String(password).length < 6) {
+        return res.status(400).json({ error: 'password must be at least 6 characters (Firebase Auth minimum)' });
+    }
+
+    const [empRows] = await pool.query(
+        'SELECT id, firebase_uid, name, email FROM employees WHERE id = ? AND company_id = ?',
+        [req.params.id, req.user.companyId]
+    );
+    if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
+    const employee = empRows[0];
+
+    if (employee.firebase_uid) {
+        // Resetting a password (e.g. employee forgot it) reuses the
+        // existing Firebase account and its already-generated hidden
+        // email rather than creating a second account and orphaning
+        // the first.
+        try {
+            await admin.auth().updateUser(employee.firebase_uid, { password });
+            await admin.auth().setCustomUserClaims(employee.firebase_uid, {
+                company_id: req.user.companyId,
+                role: 'employee',
+            });
+            return res.json({ message: `Mobile password reset for ${employee.name}` });
+        } catch (err) {
+            return res.status(500).json({ error: 'Failed to update existing login', detail: err.message });
+        }
+    }
+
+    const generatedEmail = `e${employee.id}@mobile.internal`;
+    try {
+        const firebaseUser = await admin.auth().createUser({ email: generatedEmail, password, displayName: employee.name });
+        await admin.auth().setCustomUserClaims(firebaseUser.uid, {
+            company_id: req.user.companyId,
+            role: 'employee',
+        });
+        await pool.query(
+            'UPDATE employees SET firebase_uid = ?, email = ? WHERE id = ? AND company_id = ?',
+            [firebaseUser.uid, generatedEmail, employee.id, req.user.companyId]
+        );
+        return res.status(201).json({ message: `Mobile login created for ${employee.name} (Employee ID: sign in with their emp_code + this password)` });
+    } catch (err) {
+        return res.status(409).json({ error: 'Failed to create login', detail: err.message });
+    }
+}));
+
+// DELETE /employees/:id/login - revoke mobile access without deleting
+// the employee record itself (same "sync both sides deliberately"
+// spirit as Device Users' delete-time employee-sync prompt). Disables
+// the Firebase account (rather than deleting it outright) so
+// re-enabling later doesn't require creating a brand new account and
+// losing the firebase_uid linkage the employees row already has.
+router.delete('/:id/login', requireAdmin, asyncHandler(async (req, res) => {
+    const [empRows] = await pool.query(
+        'SELECT id, firebase_uid, name FROM employees WHERE id = ? AND company_id = ?',
+        [req.params.id, req.user.companyId]
+    );
+    if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
+    const employee = empRows[0];
+    if (!employee.firebase_uid) {
+        return res.status(400).json({ error: 'This employee has no mobile login to revoke' });
+    }
+    await admin.auth().updateUser(employee.firebase_uid, { disabled: true });
+    return res.json({ message: `Mobile login revoked for ${employee.name}` });
 }));
 
 /**
