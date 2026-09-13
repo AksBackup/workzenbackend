@@ -154,7 +154,20 @@ router.post('/:id/login', requireAdmin, asyncHandler(async (req, res) => {
         // Resetting a password (e.g. employee forgot it) reuses the
         // existing Firebase account and its already-generated hidden
         // email rather than creating a second account and orphaning
-        // the first.
+        // the first - UNLESS that account no longer actually exists.
+        //
+        // Real bug hit in testing: some employees carry a firebase_uid
+        // left over from an OLDER version of this app (see this file's
+        // POST /'s doc comment - it used to auto-create a Firebase
+        // account per employee before that was removed and later
+        // reintroduced as this explicit opt-in flow). That old
+        // Firebase user may since have been deleted/never fully
+        // existed, leaving a firebase_uid that points at nothing.
+        // updateUser() on a nonexistent uid fails with
+        // 'auth/user-not-found' - when that specific error happens,
+        // self-heal by falling through to the same "create fresh"
+        // path used for an employee who never had a login at all,
+        // rather than permanently hard-failing the button.
         try {
             await admin.auth().updateUser(employee.firebase_uid, { password });
             await admin.auth().setCustomUserClaims(employee.firebase_uid, {
@@ -163,7 +176,11 @@ router.post('/:id/login', requireAdmin, asyncHandler(async (req, res) => {
             });
             return res.json({ message: `Mobile password reset for ${employee.name}` });
         } catch (err) {
-            return res.status(500).json({ error: 'Failed to update existing login', detail: err.message });
+            if (err.code !== 'auth/user-not-found') {
+                return res.status(500).json({ error: 'Failed to update existing login', detail: err.message });
+            }
+            // Fall through - stale firebase_uid, treat as if this
+            // employee never had a login and create a fresh one below.
         }
     }
 
@@ -200,7 +217,19 @@ router.delete('/:id/login', requireAdmin, asyncHandler(async (req, res) => {
     if (!employee.firebase_uid) {
         return res.status(400).json({ error: 'This employee has no mobile login to revoke' });
     }
-    await admin.auth().updateUser(employee.firebase_uid, { disabled: true });
+    try {
+        await admin.auth().updateUser(employee.firebase_uid, { disabled: true });
+    } catch (err) {
+        if (err.code !== 'auth/user-not-found') throw err;
+        // Same stale-firebase_uid situation POST /:id/login self-heals
+        // from (see its comment) - nothing to disable, so clear the
+        // dangling reference here instead of reporting a false success
+        // ("revoked" implies there was something to revoke) or a
+        // confusing 500 for a login that, functionally, already
+        // doesn't work.
+        await pool.query('UPDATE employees SET firebase_uid = NULL, email = NULL WHERE id = ?', [employee.id]);
+        return res.json({ message: `${employee.name} had no working mobile login (stale record) - cleared. They can be set up again from scratch.` });
+    }
     return res.json({ message: `Mobile login revoked for ${employee.name}` });
 }));
 
