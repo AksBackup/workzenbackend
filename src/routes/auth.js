@@ -38,7 +38,7 @@ function getFirebaseWebApiKey() {
 /**
  * POST /auth/employee-login
  *
- * The Android app's login screen only ever asks for Organization,
+ * The Android app's login screen only ever asks for Company Code,
  * Employee ID (emp_code), and Password - it never sees or handles an
  * email address. Firebase Auth requires an email-shaped identifier
  * internally, so employees.email (migration_018) holds an
@@ -54,7 +54,16 @@ function getFirebaseWebApiKey() {
  * a real email the admin already knows - there's nothing to hide there,
  * so it keeps calling Firebase directly.
  *
- * body: { organization, emp_code, password }
+ * migration_020: this used to look employees up by matching the
+ * COMPANY NAME. Real bug - see that migration's header comment - two
+ * companies with the same (or differently-cased/spaced) name made an
+ * employee's login ambiguous, and the name was never actually
+ * guaranteed unique at the database level. Now uses `company_code`, a
+ * short value with a real UNIQUE constraint, shown to the admin on the
+ * desktop's Company Details screen specifically so they can hand it to
+ * employees.
+ *
+ * body: { company_code, emp_code, password }
  * response: { idToken, refreshToken, employee: {...}, company_name }
  * - idToken/refreshToken are real Firebase tokens, used exactly like
  *   the desktop app uses its own (Authorization: Bearer <idToken> on
@@ -64,21 +73,20 @@ function getFirebaseWebApiKey() {
  *   see ANDROID_APP_SPEC.md).
  */
 router.post('/employee-login', asyncHandler(async (req, res) => {
-    const { organization, emp_code, password } = req.body;
-    if (!organization || !emp_code || !password) {
-        return res.status(400).json({ error: 'organization, emp_code, and password are required' });
+    const { company_code, emp_code, password } = req.body;
+    if (!company_code || !emp_code || !password) {
+        return res.status(400).json({ error: 'company_code, emp_code, and password are required' });
     }
 
-    // Case/whitespace-insensitive match - same convention routes/license.js
-    // already uses to treat company names as effectively unique. Not a
-    // new uniqueness rule, just reusing the existing one for lookup
-    // instead of only for duplicate-prevention at signup time.
+    // Uppercased/trimmed - company_code is always stored normalized
+    // this same way (see routes/companies.js's PUT), so "acme2026"
+    // typed on a phone still matches "ACME2026" as saved/displayed.
     const [companyRows] = await pool.query(
-        'SELECT id, name FROM companies WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))',
-        [organization]
+        'SELECT id, name FROM companies WHERE company_code = ?',
+        [String(company_code).trim().toUpperCase()]
     );
     if (companyRows.length === 0) {
-        return res.status(404).json({ error: 'Organization not found. Check the name with your admin.' });
+        return res.status(404).json({ error: 'Company code not found. Check it with your admin.' });
     }
     const company = companyRows[0];
 

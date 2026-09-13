@@ -68,6 +68,16 @@ router.post('/activate', asyncHandler(async (req, res) => {
         );
         const companyId = companyResult.insertId;
 
+        // Same deterministic scheme migration_020 backfilled existing
+        // companies with (CO + zero-padded id) - done as a follow-up
+        // UPDATE rather than in the INSERT itself since the
+        // auto-increment id isn't known until after the row exists.
+        // Guaranteed collision-free since it's derived from the id,
+        // which is already unique by definition - no retry-on-conflict
+        // loop needed the way a name-derived code would require.
+        const companyCode = `CO${String(companyId).padStart(4, '0')}`;
+        await conn.query('UPDATE companies SET company_code = ? WHERE id = ?', [companyCode, companyId]);
+
         const firebaseUser = await admin.auth().createUser({
             email: admin_email,
             password: admin_password,
