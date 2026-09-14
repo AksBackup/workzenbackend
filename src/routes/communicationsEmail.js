@@ -21,6 +21,23 @@ router.use(verifyFirebaseToken);
  *     providers show up in one unified "Sent Mail" history.
  */
 
+/**
+ * BUG FIX (pass 3, "that email screen error about SMTP" - continued):
+ * pass 2 only hardened the SEND path (sendViaStoredSmtp/logSend). But
+ * GET /settings, PUT /settings, and GET /log below had the exact same
+ * unguarded-query problem - if migration_019 hasn't run, just opening
+ * the Communications > Email > Settings tab (not even sending
+ * anything) would 500 the same bare way. Centralizing the missing-
+ * table detection here so every route below returns the same
+ * actionable message instead of a generic crash.
+ */
+function isMissingEmailTables(err) {
+    return err && err.code === 'ER_NO_SUCH_TABLE';
+}
+const MISSING_EMAIL_TABLES_MESSAGE =
+    'Email tables are missing from the database - migration_019_communications_email.sql ' +
+    'has not been run against this database yet. Run it, then try again.';
+
 // GET /communications/email/settings - current config, SMTP password
 // never returned (not even encrypted) - the Settings screen shows
 // "•••• (set)" instead of round-tripping it back for editing. To
@@ -28,7 +45,13 @@ router.use(verifyFirebaseToken);
 // smtp_password_encrypted when a new plaintext password is actually
 // included in the request body.
 router.get('/settings', requireAdmin, asyncHandler(async (req, res) => {
-    const [rows] = await pool.query('SELECT * FROM email_settings WHERE company_id = ?', [req.user.companyId]);
+    let rows;
+    try {
+        [rows] = await pool.query('SELECT * FROM email_settings WHERE company_id = ?', [req.user.companyId]);
+    } catch (err) {
+        if (isMissingEmailTables(err)) return res.status(503).json({ error: MISSING_EMAIL_TABLES_MESSAGE });
+        throw err;
+    }
     if (rows.length === 0) {
         return res.json({
             provider: 'smtp',
@@ -66,7 +89,13 @@ router.put('/settings', requireAdmin, asyncHandler(async (req, res) => {
         return res.status(400).json({ error: "provider must be 'smtp' or 'emailjs'" });
     }
 
-    const [existing] = await pool.query('SELECT smtp_password_encrypted FROM email_settings WHERE company_id = ?', [req.user.companyId]);
+    let existing;
+    try {
+        [existing] = await pool.query('SELECT smtp_password_encrypted FROM email_settings WHERE company_id = ?', [req.user.companyId]);
+    } catch (err) {
+        if (isMissingEmailTables(err)) return res.status(503).json({ error: MISSING_EMAIL_TABLES_MESSAGE });
+        throw err;
+    }
     // Only re-encrypt and overwrite if a new password was actually sent
     // this call - omitting it (e.g. editing only the from-name) keeps
     // whatever's already stored, matching GET's "•••• (set)" convention
@@ -76,29 +105,34 @@ router.put('/settings', requireAdmin, asyncHandler(async (req, res) => {
         ? encrypt(smtp_password)
         : (existing.length ? existing[0].smtp_password_encrypted : null);
 
-    await pool.query(
-        `INSERT INTO email_settings
-           (company_id, provider, smtp_host, smtp_port, smtp_secure, smtp_username, smtp_password_encrypted,
-            smtp_from_email, smtp_from_name, emailjs_service_id, emailjs_template_id, emailjs_public_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-           provider = VALUES(provider),
-           smtp_host = VALUES(smtp_host),
-           smtp_port = VALUES(smtp_port),
-           smtp_secure = VALUES(smtp_secure),
-           smtp_username = VALUES(smtp_username),
-           smtp_password_encrypted = VALUES(smtp_password_encrypted),
-           smtp_from_email = VALUES(smtp_from_email),
-           smtp_from_name = VALUES(smtp_from_name),
-           emailjs_service_id = VALUES(emailjs_service_id),
-           emailjs_template_id = VALUES(emailjs_template_id),
-           emailjs_public_key = VALUES(emailjs_public_key)`,
-        [
-            req.user.companyId, provider, smtp_host || null, smtp_port || null, smtp_secure ? 1 : 0,
-            smtp_username || null, passwordBlob, smtp_from_email || null, smtp_from_name || null,
-            emailjs_service_id || null, emailjs_template_id || null, emailjs_public_key || null,
-        ]
-    );
+    try {
+        await pool.query(
+            `INSERT INTO email_settings
+               (company_id, provider, smtp_host, smtp_port, smtp_secure, smtp_username, smtp_password_encrypted,
+                smtp_from_email, smtp_from_name, emailjs_service_id, emailjs_template_id, emailjs_public_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE
+               provider = VALUES(provider),
+               smtp_host = VALUES(smtp_host),
+               smtp_port = VALUES(smtp_port),
+               smtp_secure = VALUES(smtp_secure),
+               smtp_username = VALUES(smtp_username),
+               smtp_password_encrypted = VALUES(smtp_password_encrypted),
+               smtp_from_email = VALUES(smtp_from_email),
+               smtp_from_name = VALUES(smtp_from_name),
+               emailjs_service_id = VALUES(emailjs_service_id),
+               emailjs_template_id = VALUES(emailjs_template_id),
+               emailjs_public_key = VALUES(emailjs_public_key)`,
+            [
+                req.user.companyId, provider, smtp_host || null, smtp_port || null, smtp_secure ? 1 : 0,
+                smtp_username || null, passwordBlob, smtp_from_email || null, smtp_from_name || null,
+                emailjs_service_id || null, emailjs_template_id || null, emailjs_public_key || null,
+            ]
+        );
+    } catch (err) {
+        if (isMissingEmailTables(err)) return res.status(503).json({ error: MISSING_EMAIL_TABLES_MESSAGE });
+        throw err;
+    }
     return res.json({ message: 'Email settings saved' });
 }));
 
@@ -167,16 +201,21 @@ router.post('/log', requireAdmin, asyncHandler(async (req, res) => {
 // providers together, newest first.
 router.get('/log', requireAdmin, asyncHandler(async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
-    const [rows] = await pool.query(
-        `SELECT l.*, a.name AS sent_by_name
-         FROM email_log l
-         LEFT JOIN admins a ON a.id = l.sent_by_admin_id
-         WHERE l.company_id = ?
-         ORDER BY l.sent_at DESC
-         LIMIT ?`,
-        [req.user.companyId, limit]
-    );
-    return res.json(rows);
+    try {
+        const [rows] = await pool.query(
+            `SELECT l.*, a.name AS sent_by_name
+             FROM email_log l
+             LEFT JOIN admins a ON a.id = l.sent_by_admin_id
+             WHERE l.company_id = ?
+             ORDER BY l.sent_at DESC
+             LIMIT ?`,
+            [req.user.companyId, limit]
+        );
+        return res.json(rows);
+    } catch (err) {
+        if (isMissingEmailTables(err)) return res.status(503).json({ error: MISSING_EMAIL_TABLES_MESSAGE });
+        throw err;
+    }
 }));
 
 /**
@@ -189,7 +228,30 @@ router.get('/log', requireAdmin, asyncHandler(async (req, res) => {
  * (not high-volume/transactional) send flow like this one.
  */
 async function sendViaStoredSmtp(companyId, { to, cc, bcc, subject, html }) {
-    const [rows] = await pool.query('SELECT * FROM email_settings WHERE company_id = ? AND provider = "smtp"', [companyId]);
+    // BUG FIX (pass 2): this whole function used to assume the very
+    // first query below could never fail. In practice it throws - with
+    // no try/catch around it - whenever migration_019 hasn't actually
+    // been applied against this company's database yet (email_settings/
+    // email_log don't exist: MySQL error code ER_NO_SUCH_TABLE, errno
+    // 1146), or on any other unexpected DB hiccup. That uncaught
+    // rejection propagated straight past this route's asyncHandler to
+    // Express's global error handler, which only ever returns a bare
+    // "HTTP 500: Internal server error" - exactly the unhelpful message
+    // reported from the Compose Email screen. Wrapping it here turns
+    // that into an actionable message instead, and (just as
+    // importantly) stops it from masquerading as a generic crash - the
+    // real detail is now also visible in Settings > View Error Logs
+    // either way, since the outer handler still logs the original error
+    // regardless of which branch below returns.
+    let rows;
+    try {
+        [rows] = await pool.query('SELECT * FROM email_settings WHERE company_id = ? AND provider = "smtp"', [companyId]);
+    } catch (err) {
+        if (isMissingEmailTables(err)) {
+            return { ok: false, error: MISSING_EMAIL_TABLES_MESSAGE };
+        }
+        return { ok: false, error: `Could not read email settings: ${err.message}` };
+    }
     if (rows.length === 0 || !rows[0].smtp_host || !rows[0].smtp_password_encrypted) {
         return { ok: false, error: 'SMTP is not configured yet - set it up in Communications > Email > Settings first.' };
     }
@@ -201,14 +263,15 @@ async function sendViaStoredSmtp(companyId, { to, cc, bcc, subject, html }) {
         return { ok: false, error: 'Stored SMTP password could not be decrypted - re-enter it in Settings (this usually means EMAIL_ENCRYPTION_KEY changed since it was saved).' };
     }
 
-    const transporter = nodemailer.createTransport({
-        host: settings.smtp_host,
-        port: settings.smtp_port || (settings.smtp_secure ? 465 : 587),
-        secure: !!settings.smtp_secure,
-        auth: { user: settings.smtp_username, pass: password },
-    });
-
+    let transporter;
     try {
+        transporter = nodemailer.createTransport({
+            host: settings.smtp_host,
+            port: settings.smtp_port || (settings.smtp_secure ? 465 : 587),
+            secure: !!settings.smtp_secure,
+            auth: { user: settings.smtp_username, pass: password },
+        });
+
         await transporter.sendMail({
             from: settings.smtp_from_name
                 ? `"${settings.smtp_from_name}" <${settings.smtp_from_email || settings.smtp_username}>`
@@ -217,17 +280,37 @@ async function sendViaStoredSmtp(companyId, { to, cc, bcc, subject, html }) {
         });
         return { ok: true };
     } catch (err) {
+        // Was previously assumed to only ever be an SMTP-provider
+        // rejection (bad creds, unreachable host, etc, all legitimately
+        // 502s) - now also catches a bad host/port/config throwing
+        // synchronously from createTransport itself, for the same
+        // "never let this become an unhandled 500" reason as above.
         return { ok: false, error: err.message };
     }
 }
 
+// BUG FIX (pass 2): logging the send is secondary to actually telling
+// the admin whether their email went out. Previously an un-caught
+// failure here (most commonly the same missing-migration_019 case as
+// sendViaStoredSmtp above, but could be any transient DB error) threw
+// past the route handler and overwrote a perfectly good, already-
+// computed result (including sendViaStoredSmtp's own actionable error
+// message) with a bare "Internal server error" - the send may have
+// actually SUCCEEDED and the admin would never know, only ever seeing
+// a failure. Logging is now best-effort: a logging failure is printed
+// server-side but never prevents the real send result from reaching
+// the response.
 async function logSend(user, provider, toEmail, subject, result) {
-    const [adminRows] = await pool.query('SELECT id FROM admins WHERE firebase_uid = ?', [user.uid]);
-    await pool.query(
-        `INSERT INTO email_log (company_id, sent_by_admin_id, provider, to_email, subject, status, error_message)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [user.companyId, adminRows[0] ? adminRows[0].id : null, provider, toEmail, subject, result.ok ? 'sent' : 'failed', result.ok ? null : result.error]
-    );
+    try {
+        const [adminRows] = await pool.query('SELECT id FROM admins WHERE firebase_uid = ?', [user.uid]);
+        await pool.query(
+            `INSERT INTO email_log (company_id, sent_by_admin_id, provider, to_email, subject, status, error_message)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [user.companyId, adminRows[0] ? adminRows[0].id : null, provider, toEmail, subject, result.ok ? 'sent' : 'failed', result.ok ? null : result.error]
+        );
+    } catch (err) {
+        console.error('[email] logSend failed (send result itself is unaffected):', err.message);
+    }
 }
 
 module.exports = router;

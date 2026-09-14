@@ -46,6 +46,26 @@ async function computeMonthlyPayroll(companyId, year, month) {
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
+    // BUG FIX (pass 2 - "mid-month payroll" complaint): the day loop
+    // below used to always run through daysInMonth regardless of
+    // today's actual date. For the CURRENT, still-in-progress month,
+    // every day after today has no attendance row yet (it hasn't
+    // happened) and no leave application either, and fell straight
+    // into the "no pay - no punch, no leave" branch - i.e. every
+    // remaining day of the month was silently treated as an unpaid
+    // ABSENCE. Checking payroll on, say, the 13th showed pay as if the
+    // employee were going to be absent for the other 17-18 days, which
+    // is exactly the "mid of the month" complaint. Now: for the
+    // current month only, the loop stops at today (inclusive - today's
+    // own attendance may already be in) and anything after that is
+    // simply not evaluated at all (not paid, not deducted) - the
+    // response reports how many days were actually counted so the UI
+    // can show "earned so far" instead of implying a final total.
+    const now = new Date();
+    const isCurrentMonth = year === now.getFullYear() && month === now.getMonth() + 1;
+    const isFutureMonth = year > now.getFullYear() || (year === now.getFullYear() && month > now.getMonth() + 1);
+    const daysToCount = isFutureMonth ? 0 : (isCurrentMonth ? now.getDate() : daysInMonth);
+
     const [employees] = await pool.query(
         `SELECT e.id, e.name, e.emp_code, e.salary, d.default_salary
          FROM employees e
@@ -121,6 +141,28 @@ async function computeMonthlyPayroll(companyId, year, month) {
     );
     const overtimeByEmp = new Map(overtimeRows.map(r => [r.employee_id, r]));
 
+    // PF/ESI/PT (migration_021 / routes/statutorySettings.js). Fetched
+    // once here, not per-employee, then applied inside the map below by
+    // computeStatutoryDeductions(). Defensive on purpose: if
+    // migration_021 hasn't been run yet, this falls back to "nothing
+    // enabled" rather than throwing and breaking payroll entirely for
+    // every employee over a feature they may not even be using yet -
+    // same reasoning as the email-settings hardening in pass 2.
+    let statutorySettings = { pf_enabled: false, esi_enabled: false, pt_enabled: false };
+    let ptSlabs = [];
+    try {
+        const [settingsRows] = await pool.query('SELECT * FROM statutory_settings WHERE company_id = ?', [companyId]);
+        if (settingsRows.length) statutorySettings = settingsRows[0];
+        const [slabRows] = await pool.query(
+            'SELECT min_wage, max_wage, pt_amount FROM pt_slabs WHERE company_id = ? ORDER BY min_wage ASC',
+            [companyId]
+        );
+        ptSlabs = slabRows;
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+        // migration_021 not applied yet - proceed with PF/ESI/PT all off.
+    }
+
     const result = employees.map(emp => {
         const monthlySalary = Number(emp.salary ?? emp.default_salary ?? 0);
         const perDayRate = monthlySalary / daysInMonth;
@@ -147,7 +189,7 @@ async function computeMonthlyPayroll(companyId, year, month) {
         };
 
         let basePay = 0;
-        for (let day = 1; day <= daysInMonth; day++) {
+        for (let day = 1; day <= daysToCount; day++) {
             const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
             const dayOfWeek = new Date(year, month - 1, day).getDay(); // 0=Sun..6=Sat, matches off_days_bitmask bit layout
 
@@ -186,22 +228,84 @@ async function computeMonthlyPayroll(companyId, year, month) {
         const overtime = overtimeByEmp.get(emp.id);
         const overtimePay = overtime ? Math.round(Number(overtime.overtime_pay) * 100) / 100 : 0;
         const overtimeHours = overtime ? Number(overtime.overtime_hours) : 0;
+        const roundedBasePay = Math.round(basePay * 100) / 100;
+        const totalPay = Math.round((basePay + bonus + overtimePay) * 100) / 100;
+
+        // PF wages = the earned base pay for this period (already
+        // prorated for absences/LOP above) - PF is a wage-linked
+        // deduction, not charged on bonus/overtime. ESI and PT are
+        // conventionally checked against gross pay instead (basic +
+        // allowances + bonus + overtime), so they use totalPay.
+        const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, roundedBasePay, totalPay);
 
         return {
             employee_id: emp.id,
             employee_name: emp.name,
             emp_code: emp.emp_code,
-            base_pay: Math.round(basePay * 100) / 100,
+            base_pay: roundedBasePay,
             bonus,
             overtime_pay: overtimePay,
             overtime_hours: overtimeHours,
-            total_pay: Math.round((basePay + bonus + overtimePay) * 100) / 100,
+            total_pay: totalPay,
+            pf_employee: statutory.pfEmployee,
+            pf_employer: statutory.pfEmployer,
+            esi_employee: statutory.esiEmployee,
+            esi_employer: statutory.esiEmployer,
+            pt_amount: statutory.ptAmount,
+            net_pay: Math.round((totalPay - statutory.pfEmployee - statutory.esiEmployee - statutory.ptAmount) * 100) / 100,
             is_paid: existing ? !!existing.is_paid : false,
-            paid_on: existing ? existing.paid_on : null
+            paid_on: existing ? existing.paid_on : null,
+            // New (pass 2, see daysToCount comment above): lets the UI
+            // show "earned through day X of Y" instead of a number that
+            // silently looks final when the month isn't over yet.
+            days_counted: daysToCount,
+            days_in_month: daysInMonth,
+            month_in_progress: isCurrentMonth,
         };
     });
 
     return result;
+}
+
+/**
+ * PF/ESI/PT for one employee's pay run. Pure function of already-
+ * computed numbers (no DB access) so it's trivially testable and can't
+ * accidentally issue a query per employee. See migration_021's header
+ * comment for what each setting means; employer-side figures
+ * (pf_employer/esi_employer) are informational company-cost numbers
+ * only - they're never subtracted from what the employee is paid.
+ */
+function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, grossPay) {
+    const round2 = n => Math.round(n * 100) / 100;
+
+    let pfEmployee = 0, pfEmployer = 0;
+    if (settings.pf_enabled) {
+        let pfWage = basePayForPf;
+        if (settings.pf_apply_ceiling) pfWage = Math.min(pfWage, Number(settings.pf_wage_ceiling));
+        pfEmployee = round2(pfWage * Number(settings.pf_employee_rate) / 100);
+        pfEmployer = round2(pfWage * Number(settings.pf_employer_rate) / 100);
+    }
+
+    let esiEmployee = 0, esiEmployer = 0;
+    // ESI is all-or-nothing on eligibility, not prorated at the
+    // ceiling like PF: an employee over the wage ceiling simply isn't
+    // covered by ESI that month at all.
+    if (settings.esi_enabled && grossPay <= Number(settings.esi_wage_ceiling)) {
+        esiEmployee = round2(grossPay * Number(settings.esi_employee_rate) / 100);
+        esiEmployer = round2(grossPay * Number(settings.esi_employer_rate) / 100);
+    }
+
+    let ptAmount = 0;
+    if (settings.pt_enabled) {
+        const slab = ptSlabs.find(s => {
+            const min = Number(s.min_wage);
+            const max = s.max_wage === null ? null : Number(s.max_wage);
+            return grossPay >= min && (max === null || grossPay <= max);
+        });
+        if (slab) ptAmount = round2(Number(slab.pt_amount));
+    }
+
+    return { pfEmployee, pfEmployer, esiEmployee, esiEmployer, ptAmount };
 }
 
 router.get('/', requireAdmin, asyncHandler(async (req, res) => {

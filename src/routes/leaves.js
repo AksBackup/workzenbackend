@@ -21,10 +21,10 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 /**
- * GET /leave-applications/remaining?employee_id=&leave_type_id=&year=&month=
+ * GET /leave-applications/remaining?employee_id=&leave_type_id=&year=
  *
  * Lightweight "how many paid leave days does this employee have left
- * this month, for this specific leave type" lookup for the Apply Leave
+ * this YEAR, for this specific leave type" lookup for the Apply Leave
  * screen's inline display - added alongside the paid/unpaid split
  * (migration_009) rather than folding into GET
  * /employees/:id/monthly-summary, so that endpoint's existing day-grid
@@ -32,24 +32,23 @@ router.get('/', asyncHandler(async (req, res) => {
  * every leave type, and is already relied on elsewhere) doesn't need to
  * change.
  *
- * migration_010 (unified leave system): quota is now looked up per
- * `leave_type_id` from `leave_types.monthly_quota`, not the old flat
- * `office_time_policy.monthly_leave_quota` - each leave type (Casual,
- * Sick, ...) is tracked and applied for independently, matching how
- * real companies run separate leave "buckets". `leave_type_id` is
- * required; a request without one is almost certainly a stale client
- * still using the pre-migration_010 shape.
+ * Was a monthly figure through migration_010; pass 3 rewired this to an
+ * ANNUAL bank (see computeAnnualPaidUsage's doc comment below for the
+ * full history/reasoning and the fallback priority across
+ * leave_balances / leave_types.yearly_quota / monthly_quota). A `month`
+ * query param is still silently accepted for old callers but no longer
+ * has any effect - the fallback below only reads `year`.
  *
- * See computeMonthlyPaidUsage() below - both this route and the POST /
+ * See computeAnnualPaidUsage() below - both this route and the POST /
  * split share the same counting logic.
  *
  * Registered before any '/:id' routes would matter, but there are none
  * here that collide with the literal path 'remaining'.
  */
 router.get('/remaining', asyncHandler(async (req, res) => {
-    const { employee_id, leave_type_id, year, month } = req.query;
-    if (!employee_id || !leave_type_id || !year || !month) {
-        return res.status(400).json({ error: 'employee_id, leave_type_id, year, and month are required' });
+    const { employee_id, leave_type_id, year } = req.query;
+    if (!employee_id || !leave_type_id || !year) {
+        return res.status(400).json({ error: 'employee_id, leave_type_id, and year are required' });
     }
 
     const [empRows] = await pool.query(
@@ -58,8 +57,12 @@ router.get('/remaining', asyncHandler(async (req, res) => {
     );
     if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
 
-    const { quota, used } = await computeMonthlyPaidUsage(
-        req.user.companyId, employee_id, leave_type_id, parseInt(year, 10), parseInt(month, 10)
+    // month is no longer used in the calculation (see
+    // computeAnnualPaidUsage's header comment - quota/usage is now
+    // tracked per YEAR, not per month) but stays an accepted, optional
+    // query param so existing callers that still send it don't break.
+    const { quota, used } = await computeAnnualPaidUsage(
+        req.user.companyId, employee_id, leave_type_id, parseInt(year, 10)
     );
     return res.json({
         leave_type_id: parseInt(leave_type_id, 10),
@@ -102,8 +105,8 @@ router.post('/', asyncHandler(async (req, res) => {
     // only - a known simplification, flag back if a leave spanning a
     // month boundary needs finer handling.
     const fromMonthDate = new Date(from_date);
-    const { quota, used } = await computeMonthlyPaidUsage(
-        req.user.companyId, employeeId, leave_type_id, fromMonthDate.getFullYear(), fromMonthDate.getMonth() + 1
+    const { quota, used } = await computeAnnualPaidUsage(
+        req.user.companyId, employeeId, leave_type_id, fromMonthDate.getFullYear()
     );
     const remainingQuota = Math.max(0, quota - used);
     const paidDays = Math.min(Number(days_count), remainingQuota);
@@ -119,33 +122,79 @@ router.post('/', asyncHandler(async (req, res) => {
 
 /**
  * How many paid leave days has this employee already used THIS SPECIFIC
- * LEAVE TYPE in (year, month), and what's that type's own quota.
+ * LEAVE TYPE this YEAR, and what's that type's total available balance.
  *
- * migration_010 (unified leave system): quota now comes from
- * `leave_types.monthly_quota` for the given `leaveTypeId`, replacing the
- * old flat `office_time_policy.monthly_leave_quota` that used to apply
- * (confusingly) to every leave type combined. "Used" counts *approved*
- * applications of THIS leave type only, using paid_days (falling back
- * to the full days_count for pre-migration_009 rows, which had no split
- * - i.e. were fully paid), overlapping that month. Shared by GET
- * /remaining above and the POST / split so both agree on the same
- * number.
+ * BUG FIX (pass 2 - "leave bank" wiring): migration_010's model reset
+ * leave_types.monthly_quota every month and never looked at
+ * leave_balances at all - meanwhile Leave Opening Entry and Earn/Adjust
+ * Leave (leaveOpening.js / leaveAdjustments.js) were writing to
+ * leave_balances the entire time, so crediting an employee "+1 earned
+ * leave" had literally zero effect on what they could actually apply
+ * for or get paid. Two disconnected ledgers, only one of which was
+ * ever read.
+ *
+ * ASSUMPTION MADE HERE (flag back if this isn't the model you want):
+ * this now treats leave as an ANNUAL bank, not a monthly reset -
+ * matching what Opening Entry ("set the year's balance") and
+ * Earn/Adjust ("credit/debit that balance") actually imply:
+ *   - quota = leave_balances.allocated for (employee, leave_type, year)
+ *     if an opening entry / earn / adjust has ever been recorded for
+ *     that employee+type+year
+ *   - OTHERWISE, falls back to the old behavior scaled to a year
+ *     (leave_types.monthly_quota x 12), so a leave type nobody has
+ *     ever run Opening Entry for still works exactly as before instead
+ *     of silently becoming a 0-day bank
+ *   - "used" now sums paid_days across the WHOLE YEAR for this leave
+ *     type (not just the one month) - a bank that isn't topped up
+ *     monthly can't be checked against only one month of usage
+ *
+ * This is a real behavior change from the old flat monthly reset - if
+ * you actually want each leave type to also refill every month
+ * regardless of the annual bank, say so and this can be layered back
+ * in (e.g. bank PLUS a monthly cap) rather than replacing it outright.
+ *
+ * FOLLOW-UP FIX (found while checking for other bugs, same pass):
+ * `leave_types.yearly_quota` already existed in the schema before any
+ * of this - routes/leaveTypes.js's own comment says it flat-out
+ * "is kept alongside it for reference/carry-forward only" and nothing
+ * ever read it. That's a THIRD disconnected leave number, sitting
+ * right next to the two this function was written to reconcile. Since
+ * it's clearly meant to represent an annual figure (the Leave Types
+ * settings screen even has a "Yearly quota (optional)" field for it),
+ * using it - when set - beats inferring an annual number by multiplying
+ * monthly_quota by 12: an admin who explicitly typed "24 days/year"
+ * obviously meant 24, not necessarily whatever monthly_quota x 12
+ * happens to compute to. Fallback order is now: leave_balances.allocated
+ * (an actual Opening Entry/Earn-Adjust has been recorded) > yearly_quota
+ * (if the admin set one > 0) > monthly_quota x 12 (last resort, for a
+ * leave type nobody's touched either newer field for yet).
  */
-async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year, month) {
-    const daysInMonth = new Date(year, month, 0).getDate();
-    const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
-    const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
+async function computeAnnualPaidUsage(companyId, employeeId, leaveTypeId, year) {
+    const yearStart = `${year}-01-01`;
+    const yearEnd = `${year}-12-31`;
 
-    const [typeRows] = await pool.query(
-        'SELECT monthly_quota FROM leave_types WHERE id = ? AND company_id = ?',
-        [leaveTypeId, companyId]
+    const [balanceRows] = await pool.query(
+        'SELECT allocated FROM leave_balances WHERE employee_id = ? AND leave_type_id = ? AND year = ?',
+        [employeeId, leaveTypeId, year]
     );
-    const quota = typeRows.length > 0 ? parseFloat(typeRows[0].monthly_quota) || 0 : 0;
+
+    let quota;
+    if (balanceRows.length > 0) {
+        quota = Number(balanceRows[0].allocated) || 0;
+    } else {
+        const [typeRows] = await pool.query(
+            'SELECT yearly_quota, monthly_quota FROM leave_types WHERE id = ? AND company_id = ?',
+            [leaveTypeId, companyId]
+        );
+        const yearlyQuota = typeRows.length > 0 ? parseFloat(typeRows[0].yearly_quota) || 0 : 0;
+        const monthlyQuota = typeRows.length > 0 ? parseFloat(typeRows[0].monthly_quota) || 0 : 0;
+        quota = yearlyQuota > 0 ? yearlyQuota : monthlyQuota * 12;
+    }
 
     const [leaveRows] = await pool.query(
         `SELECT days_count, paid_days FROM leave_applications
          WHERE employee_id = ? AND leave_type_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
-        [employeeId, leaveTypeId, monthEnd, monthStart]
+        [employeeId, leaveTypeId, yearEnd, yearStart]
     );
     const used = leaveRows.reduce((sum, r) => sum + (r.paid_days !== null ? Number(r.paid_days) : Number(r.days_count)), 0);
 

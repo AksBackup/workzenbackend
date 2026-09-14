@@ -43,9 +43,13 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         return res.status(409).json({ error: 'A leave type with this name already exists' });
     }
 
-    // migration_010: monthly_quota is the unified figure the paid/unpaid
-    // leave split (routes/leaves.js) is actually computed against -
-    // yearly_quota is kept alongside it for reference/carry-forward only.
+    // migration_010: monthly_quota was the unified figure the paid/
+    // unpaid leave split (routes/leaves.js) was computed against, with
+    // yearly_quota kept alongside for reference/carry-forward only.
+    // Pass 3 changed this: routes/leaves.js's computeAnnualPaidUsage
+    // now actually reads yearly_quota (when set) as the preferred
+    // fallback annual figure, ahead of monthly_quota x 12 - see that
+    // function's comment for the full reasoning.
     const [result] = await pool.query(
         'INSERT INTO leave_types (company_id, name, yearly_quota, monthly_quota, carry_forward) VALUES (?, ?, ?, ?, ?)',
         [req.user.companyId, name, yearly_quota || 0, monthly_quota || 0, !!carry_forward]

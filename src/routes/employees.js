@@ -330,6 +330,99 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 /**
+ * Employee > Assets Allotted (migration_023). "Flexible field" as
+ * requested: asset_type/asset_details are free text the admin types
+ * themselves (laptop, router, ID card, whatever a given company
+ * issues) rather than a fixed list this schema would have to guess.
+ * An employee can have many rows over time - some currently allotted
+ * (returned_date NULL), some already returned.
+ */
+function isMissingAssetTable(err) {
+    return err && err.code === 'ER_NO_SUCH_TABLE';
+}
+const MISSING_ASSET_TABLE_MESSAGE =
+    'The employee assets table is missing - migration_023_employee_assets.sql has not been run against this database yet. Run it, then try again.';
+
+router.get('/:id/assets', asyncHandler(async (req, res) => {
+    if (req.user.role === 'employee') {
+        const [selfRows] = await pool.query('SELECT id FROM employees WHERE firebase_uid = ? AND company_id = ?', [req.user.uid, req.user.companyId]);
+        if (selfRows.length === 0 || String(selfRows[0].id) !== String(req.params.id)) {
+            return res.status(403).json({ error: 'Not authorized to view this employee\'s assets' });
+        }
+    }
+    try {
+        const [rows] = await pool.query(
+            'SELECT * FROM employee_assets WHERE employee_id = ? AND company_id = ? ORDER BY allotted_date DESC, id DESC',
+            [req.params.id, req.user.companyId]
+        );
+        return res.json(rows);
+    } catch (err) {
+        if (isMissingAssetTable(err)) return res.status(503).json({ error: MISSING_ASSET_TABLE_MESSAGE });
+        throw err;
+    }
+}));
+
+router.post('/:id/assets', requireAdmin, asyncHandler(async (req, res) => {
+    const { asset_type, asset_details, allotted_date, notes } = req.body;
+    if (!asset_type || !asset_type.trim()) {
+        return res.status(400).json({ error: 'asset_type is required' });
+    }
+    if (!allotted_date) {
+        return res.status(400).json({ error: 'allotted_date is required' });
+    }
+    const [empRows] = await pool.query('SELECT id FROM employees WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
+    if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
+
+    try {
+        const [result] = await pool.query(
+            `INSERT INTO employee_assets (company_id, employee_id, asset_type, asset_details, allotted_date, notes)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [req.user.companyId, req.params.id, asset_type.trim(), asset_details || null, allotted_date, notes || null]
+        );
+        return res.status(201).json({ id: result.insertId, message: 'Asset recorded' });
+    } catch (err) {
+        if (isMissingAssetTable(err)) return res.status(503).json({ error: MISSING_ASSET_TABLE_MESSAGE });
+        throw err;
+    }
+}));
+
+// PUT /employees/:id/assets/:assetId - edit any field, most commonly
+// used to set returned_date when the asset comes back (leaving it out
+// keeps whatever was already stored, same "only touch what's sent"
+// convention as the email/statutory settings PUTs elsewhere).
+router.put('/:id/assets/:assetId', requireAdmin, asyncHandler(async (req, res) => {
+    const { asset_type, asset_details, allotted_date, returned_date, notes } = req.body;
+    const [existingRows] = await pool.query(
+        'SELECT * FROM employee_assets WHERE id = ? AND employee_id = ? AND company_id = ?',
+        [req.params.assetId, req.params.id, req.user.companyId]
+    );
+    if (existingRows.length === 0) return res.status(404).json({ error: 'Asset record not found' });
+    const existing = existingRows[0];
+
+    await pool.query(
+        `UPDATE employee_assets SET asset_type = ?, asset_details = ?, allotted_date = ?, returned_date = ?, notes = ?
+         WHERE id = ? AND employee_id = ? AND company_id = ?`,
+        [
+            asset_type !== undefined && asset_type.trim() ? asset_type.trim() : existing.asset_type,
+            asset_details !== undefined ? asset_details : existing.asset_details,
+            allotted_date !== undefined ? allotted_date : existing.allotted_date,
+            returned_date !== undefined ? returned_date : existing.returned_date,
+            notes !== undefined ? notes : existing.notes,
+            req.params.assetId, req.params.id, req.user.companyId,
+        ]
+    );
+    return res.json({ message: 'Asset updated' });
+}));
+
+router.delete('/:id/assets/:assetId', requireAdmin, asyncHandler(async (req, res) => {
+    await pool.query(
+        'DELETE FROM employee_assets WHERE id = ? AND employee_id = ? AND company_id = ?',
+        [req.params.assetId, req.params.id, req.user.companyId]
+    );
+    return res.json({ message: 'Asset record deleted' });
+}));
+
+/**
  * GET /employees/:id/monthly-summary?year=YYYY&month=M
  *
  * Backs the new Employee Details "Attendance & Leave" table (a

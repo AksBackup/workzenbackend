@@ -3,6 +3,7 @@ const admin = require('firebase-admin');
 const pool = require('../db');
 const adminPanelAuth = require('../middleware/adminPanelAuth');
 const generateLicenseKey = require('../utils/generateLicenseKey');
+const { generateUniqueCompanyCode } = require('../utils/generateCompanyCode');
 const asyncHandler = require('../utils/asyncHandler');
 
 const router = express.Router();
@@ -68,14 +69,16 @@ router.post('/activate', asyncHandler(async (req, res) => {
         );
         const companyId = companyResult.insertId;
 
-        // Same deterministic scheme migration_020 backfilled existing
-        // companies with (CO + zero-padded id) - done as a follow-up
-        // UPDATE rather than in the INSERT itself since the
-        // auto-increment id isn't known until after the row exists.
-        // Guaranteed collision-free since it's derived from the id,
-        // which is already unique by definition - no retry-on-conflict
-        // loop needed the way a name-derived code would require.
-        const companyCode = `CO${String(companyId).padStart(4, '0')}`;
+        // Sequential codes (CO0001, CO0002, ...) were trivially
+        // guessable - enumerate small integers and you have real
+        // customers' codes. Generated instead from the company's own
+        // name + a random suffix (see generateCompanyCode.js), checked
+        // against the DB for a free slot before use. Still a follow-up
+        // UPDATE rather than baked into the INSERT since it's derived
+        // partly from the company name, which we already have, but
+        // keeping it as a separate step matches how the id-derived
+        // scheme worked and keeps this diff small.
+        const companyCode = await generateUniqueCompanyCode(conn, company_name);
         await conn.query('UPDATE companies SET company_code = ? WHERE id = ?', [companyCode, companyId]);
 
         const firebaseUser = await admin.auth().createUser({

@@ -24,6 +24,7 @@ admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const licenseRoutes = require('./routes/license');
 const authRoutes = require('./routes/auth');
 const communicationsEmailRoutes = require('./routes/communicationsEmail');
+const communicationsSmsRoutes = require('./routes/communicationsSms');
 const employeeRoutes = require('./routes/employees');
 const attendanceRoutes = require('./routes/attendance');
 const leaveRoutes = require('./routes/leaves');
@@ -35,6 +36,7 @@ const officeTimePolicyRoutes = require('./routes/officeTimePolicy');
 const overtimeRoutes = require('./routes/overtime');
 const weeklyOffRoutes = require('./routes/weeklyOff');
 const payrollRoutes = require('./routes/payroll');
+const statutorySettingsRoutes = require('./routes/statutorySettings');
 
 // --- Phase 5 parallel build pass (see docs/FROZEN_CONTRACT_V2.md) ---
 
@@ -107,6 +109,7 @@ app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/license', licenseRoutes);
 app.use('/auth', authRoutes);
 app.use('/communications/email', communicationsEmailRoutes);
+app.use('/communications/sms', communicationsSmsRoutes);
 app.use('/employees', employeeRoutes);
 app.use('/attendance', attendanceRoutes);
 app.use('/leave-applications', leaveRoutes);
@@ -118,6 +121,7 @@ app.use('/office-time-policy', officeTimePolicyRoutes);
 app.use('/overtime', overtimeRoutes);
 app.use('/weekly-off', weeklyOffRoutes);
 app.use('/payroll', payrollRoutes);
+app.use('/statutory-settings', statutorySettingsRoutes);
 
 // Agent A scope.
 app.use('/devices', deviceRoutes);
