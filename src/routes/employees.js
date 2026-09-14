@@ -4,6 +4,7 @@ const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
 const { loadWeeklyOffIndex, effectiveOffDaysBitmask } = require('../utils/attendanceRules');
+const { computeMonthlyPaidUsage } = require('../utils/leaveQuota');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -501,30 +502,19 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         [employeeId, monthEnd, monthStart]
     );
 
-    // migration_010: unified per-leave-type monthly quota, replacing the
-    // old flat office_time_policy.monthly_leave_quota. Every leave type
-    // the company has defined gets its own quota/used/remaining line
-    // (see computeLeaveTypeBalances in routes/leaves.js for the same
-    // per-type counting logic used at apply-time) - the flat
-    // leave_quota/leave_used/leave_remaining fields below are kept as a
-    // SUM across all types for any caller still expecting one number,
-    // but the new leave_balances array is the source of truth going
-    // forward.
+    // Shares computeMonthlyPaidUsage with routes/leaves.js so this
+    // screen and Apply Leave/Payroll always agree - see that function's
+    // header comment in utils/leaveQuota.js for why this is monthly
+    // (by explicit request) rather than the annual-bank version an
+    // earlier pass tried first, and how Opening Entry/Earn-Adjust
+    // Leave (leave_balances) plug into a monthly reset without a month
+    // column of their own.
     const [leaveTypeRows] = await pool.query(
-        'SELECT id, name, monthly_quota FROM leave_types WHERE company_id = ? ORDER BY name ASC',
+        'SELECT id, name FROM leave_types WHERE company_id = ? ORDER BY name ASC',
         [req.user.companyId]
     );
-    const [usedByTypeRows] = await pool.query(
-        `SELECT leave_type_id, SUM(COALESCE(paid_days, days_count)) AS used
-         FROM leave_applications
-         WHERE employee_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?
-         GROUP BY leave_type_id`,
-        [employeeId, monthEnd, monthStart]
-    );
-    const usedByType = new Map(usedByTypeRows.map(r => [r.leave_type_id, parseFloat(r.used) || 0]));
-    const leaveBalances = leaveTypeRows.map(lt => {
-        const quota = parseFloat(lt.monthly_quota) || 0;
-        const used = usedByType.get(lt.id) || 0;
+    const leaveBalances = await Promise.all(leaveTypeRows.map(async lt => {
+        const { quota, used } = await computeMonthlyPaidUsage(req.user.companyId, employeeId, lt.id, year, month);
         return {
             leave_type_id: lt.id,
             leave_type_name: lt.name,
@@ -532,8 +522,10 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
             used,
             remaining: Math.max(0, Math.round((quota - used) * 10) / 10),
         };
-    });
+    }));
     const leaveQuota = leaveBalances.reduce((acc, b) => acc + b.quota, 0);
+
+
 
     const [policyRows] = await pool.query(
         'SELECT check_in_window_end FROM office_time_policy WHERE company_id = ?',
@@ -631,7 +623,10 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         // per-type breakdown. leave_used here is paid-days-used summed
         // across types (so it can legitimately be less than leave_days,
         // which counts ALL on-leave calendar days regardless of type or
-        // paid/unpaid split).
+        // paid/unpaid split). leave_balances/leave_quota/leave_used/
+        // leave_remaining reset every month (this `month`/`year`) - see
+        // utils/leaveQuota.js's computeMonthlyPaidUsage for how Opening
+        // Entry/Earn-Adjust Leave plug into that monthly figure.
         leave_quota: leaveQuota,
         leave_used: leaveUsed,
         leave_remaining: leaveRemaining,
