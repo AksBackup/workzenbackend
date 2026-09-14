@@ -63,23 +63,35 @@ router.post('/activate', asyncHandler(async (req, res) => {
             return res.status(409).json({ error: `A company named "${company_name}" is already registered. Please use a more specific name (e.g. add a city or branch).` });
         }
 
-        const [companyResult] = await conn.query(
-            'INSERT INTO companies (name, license_id, status) VALUES (?, ?, ?)',
-            [company_name, license.id, 'active']
-        );
-        const companyId = companyResult.insertId;
-
         // Sequential codes (CO0001, CO0002, ...) were trivially
         // guessable - enumerate small integers and you have real
         // customers' codes. Generated instead from the company's own
         // name + a random suffix (see generateCompanyCode.js), checked
-        // against the DB for a free slot before use. Still a follow-up
-        // UPDATE rather than baked into the INSERT since it's derived
-        // partly from the company name, which we already have, but
-        // keeping it as a separate step matches how the id-derived
-        // scheme worked and keeps this diff small.
-        const companyCode = await generateUniqueCompanyCode(conn, company_name);
-        await conn.query('UPDATE companies SET company_code = ? WHERE id = ?', [companyCode, companyId]);
+        // against the DB for a free slot before use. Generated up front
+        // and included directly in the INSERT below: companies.company_code
+        // is NOT NULL with no default, so an INSERT that omits it (leaving
+        // it for a follow-up UPDATE) is rejected outright by MySQL with
+        // ER_NO_DEFAULT_FOR_FIELD before that UPDATE ever gets a chance to run.
+        // generateUniqueCompanyCode checks for a free slot before returning,
+        // but another activation could still grab the same code between that
+        // check and this INSERT - generateCompanyCode.js documents that
+        // callers must retry on a duplicate-key error, so do that here
+        // rather than letting a rare collision surface as a hard 500.
+        let companyId;
+        for (let attempt = 0; ; attempt++) {
+            const companyCode = await generateUniqueCompanyCode(conn, company_name);
+            try {
+                const [companyResult] = await conn.query(
+                    'INSERT INTO companies (name, license_id, status, company_code) VALUES (?, ?, ?, ?)',
+                    [company_name, license.id, 'active', companyCode]
+                );
+                companyId = companyResult.insertId;
+                break;
+            } catch (err) {
+                if (err.code === 'ER_DUP_ENTRY' && attempt < 5) continue;
+                throw err;
+            }
+        }
 
         const firebaseUser = await admin.auth().createUser({
             email: admin_email,
