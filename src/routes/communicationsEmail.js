@@ -245,7 +245,17 @@ async function sendViaStoredSmtp(companyId, { to, cc, bcc, subject, html }) {
     // regardless of which branch below returns.
     let rows;
     try {
-        [rows] = await pool.query('SELECT * FROM email_settings WHERE company_id = ? AND provider = "smtp"', [companyId]);
+        // BUG FIX (reported live via a real test send): 'provider =
+        // "smtp"' used double quotes for a string literal - MySQL only
+        // treats that as a string when sql_mode does NOT include
+        // ANSI_QUOTES; on a database where it does (common on managed
+        // MySQL - this person's Render DB hit exactly this), double
+        // quotes are IDENTIFIER quotes instead (like backticks), so
+        // "smtp" gets parsed as a column named smtp - hence "Unknown
+        // column 'smtp' in 'where clause'". Single-quoted string
+        // literals are unambiguous in MySQL regardless of sql_mode -
+        // this is the only correct way to write one.
+        [rows] = await pool.query("SELECT * FROM email_settings WHERE company_id = ? AND provider = 'smtp'", [companyId]);
     } catch (err) {
         if (isMissingEmailTables(err)) {
             return { ok: false, error: MISSING_EMAIL_TABLES_MESSAGE };

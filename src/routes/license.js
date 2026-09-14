@@ -202,7 +202,10 @@ router.get('/admin/list', adminPanelAuth, asyncHandler(async (req, res) => {
 }));
 
 router.post('/admin/revoke/:id', adminPanelAuth, asyncHandler(async (req, res) => {
-    await pool.query('UPDATE licenses SET status = "revoked" WHERE id = ?', [req.params.id]);
+    // BUG FIX (same class as communicationsEmail.js - see that file's
+    // comment): double-quoted "revoked" is only a safe string literal
+    // under a non-ANSI_QUOTES sql_mode. Single-quoted is unambiguous.
+    await pool.query("UPDATE licenses SET status = 'revoked' WHERE id = ?", [req.params.id]);
     return res.json({ message: 'Revoked' });
 }));
 
