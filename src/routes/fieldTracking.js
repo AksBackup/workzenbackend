@@ -6,6 +6,23 @@ const asyncHandler = require('../utils/asyncHandler');
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
+// BUG FIX: MySQL's DATETIME literal syntax is 'YYYY-MM-DD HH:MM:SS' - it
+// does not accept the 'T' separator or trailing 'Z' that JS's
+// Date#toISOString() (and every phone's location API) produces, e.g.
+// '2026-09-14T06:53:29Z'. mysql2 only reformats this automatically when
+// given an actual JS Date object; a raw string like the phone sends is
+// passed straight through to the SQL statement and MySQL rejects it with
+// ER_TRUNCATED_WRONG_VALUE (1292). Converting to a Date first and then to
+// MySQL's expected string ourselves - always in UTC, regardless of this
+// server's local timezone - keeps the stored instant identical to what
+// the phone recorded (recorded_at is TIMESTAMP/DATETIME with no timezone
+// info of its own, so it needs to unambiguously mean UTC).
+function toMysqlDatetimeUtc(value) {
+    const d = value instanceof Date ? value : new Date(value);
+    if (isNaN(d.getTime())) return null;
+    return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
 /**
  * Track Field Employee (CONTEXT.md, Attendance #9, migration_015).
  * Deliberately separate from geofencing/mobile-punches: this is a
@@ -39,10 +56,15 @@ router.post('/pings', asyncHandler(async (req, res) => {
         if (!employeeId) return res.status(400).json({ error: 'employee_id required' });
     }
 
+    const recordedAt = toMysqlDatetimeUtc(recorded_at || new Date());
+    if (recordedAt === null) {
+        return res.status(400).json({ error: 'recorded_at must be a valid date/time' });
+    }
+
     await pool.query(
         `INSERT INTO field_location_pings (company_id, employee_id, latitude, longitude, accuracy_meters, recorded_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, employeeId, latitude, longitude, accuracy_meters ?? null, recorded_at || new Date()]
+        [req.user.companyId, employeeId, latitude, longitude, accuracy_meters ?? null, recordedAt]
     );
     return res.status(201).json({ message: 'Recorded' });
 }));
