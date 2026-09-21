@@ -6,7 +6,9 @@ const {
     loadHolidayIndex,
     loadEmployeeHolidayGroups,
     loadWeeklyOffIndex,
+    loadShiftOffIndex,
     effectiveOffDaysBitmask,
+    isAltSaturdayOff,
 } = require('../utils/attendanceRules');
 
 const router = express.Router();
@@ -62,9 +64,10 @@ async function loadCompanyContext(companyId) {
  * Classifies one employee-day. Returns one of:
  * 'holiday' | 'weekly_off' | 'leave' | 'present' | 'half_day' | 'absent'
  */
-function classifyDay({ dateStr, dayOfWeek, isHoliday, offDaysBitmask, isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours }) {
+function classifyDay({ dateStr, dayOfWeek, isHoliday, offDaysBitmask, altSaturdays, isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours }) {
     if (isHoliday(dateStr)) return 'holiday';
     if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) return 'weekly_off';
+    if (isAltSaturdayOff(dateStr, altSaturdays)) return 'weekly_off';
     if (isOnApprovedLeave(dateStr)) return 'leave';
     if (!attendance || !attendance.check_in) return 'absent';
 
@@ -99,7 +102,7 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
     const { fullDayHours, halfDayMinHours } = await loadCompanyContext(companyId);
 
     const [employees] = await pool.query(
-        "SELECT id, name, emp_code, department FROM employees WHERE company_id = ? AND status = 'active'",
+        "SELECT id, name, emp_code, department, shift_id, designation FROM employees WHERE company_id = ? AND status = 'active'",
         [companyId]
     );
     const [attendanceRows] = await pool.query(
@@ -121,30 +124,75 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
     const holidayIndex = await loadHolidayIndex(companyId, date, date);
     const employeeGroups = await loadEmployeeHolidayGroups(companyId);
     const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
+    // migration_027 - resolves shift-wise weekend off (weekly_off_bitmask
+    // AND alt_saturdays) via each employee's shift_id, instead of the
+    // bug this replaces where shift was always passed as null here,
+    // silently skipping shift-level weekly-off even though the
+    // fallback chain (effectiveOffDaysBitmask) already supported it.
+    const shiftOffIndex = await loadShiftOffIndex(companyId);
+    // Full shift details (name/times/grace) for the new Designation /
+    // Shift / Shift Time / Late Hrs / Early Hrs columns, matching the
+    // reference layout (daily_report.jpeg) the client provided -
+    // reusing the same late/early math as GET /reports/late-early
+    // below rather than duplicating a different formula. InTemp/OutTemp
+    // from that same reference image are NOT included - this system has
+    // no thermal-sensor integration on any supported device, so those
+    // columns would only ever show blanks; flagging rather than faking.
+    const [shiftDetailRows] = await pool.query(
+        'SELECT id, name, start_time, end_time, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ?',
+        [companyId]
+    );
+    const shiftDetails = new Map(shiftDetailRows.map(s => [s.id, s]));
 
     const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
 
     const result = employees.map(emp => {
         const attendance = attendanceByEmp.get(emp.id);
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
-        const offDaysBitmask = effectiveOffDaysBitmask(null, emp.department, weeklyOffIndex);
+        const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
+        const offDaysBitmask = effectiveOffDaysBitmask(empShift, emp.department, weeklyOffIndex);
         const status = classifyDay({
             dateStr: date,
             dayOfWeek,
             isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
             offDaysBitmask,
+            altSaturdays: empShift ? empShift.alt_saturdays : null,
             isOnApprovedLeave: () => onLeaveEmpIds.has(emp.id),
             attendance,
             fullDayHours,
             halfDayMinHours,
         });
+
+        const shiftDetail = shiftDetails.get(emp.shift_id) ?? null;
+        let lateByMinutes = 0, earlyByMinutes = 0, workMinutes = null;
+        if (shiftDetail && attendance && attendance.check_in) {
+            const actualIn = new Date(attendance.check_in);
+            const scheduledStart = new Date(`${date}T${shiftDetail.start_time}`);
+            scheduledStart.setMinutes(scheduledStart.getMinutes() + (shiftDetail.late_grace_minutes || 0));
+            if (actualIn > scheduledStart) lateByMinutes = Math.round((actualIn - scheduledStart) / 60000);
+            if (attendance.check_out) {
+                const actualOut = new Date(attendance.check_out);
+                const scheduledEnd = new Date(`${date}T${shiftDetail.end_time}`);
+                scheduledEnd.setMinutes(scheduledEnd.getMinutes() - (shiftDetail.early_grace_minutes || 0));
+                if (actualOut < scheduledEnd) earlyByMinutes = Math.round((scheduledEnd - actualOut) / 60000);
+                workMinutes = Math.round((actualOut - actualIn) / 60000);
+            }
+        }
+
         return {
             employee_id: emp.id,
             employee_name: emp.name,
             emp_code: emp.emp_code,
+            designation: emp.designation,
+            shift_name: shiftDetail ? shiftDetail.name : null,
+            shift_start: shiftDetail ? shiftDetail.start_time : null,
+            shift_end: shiftDetail ? shiftDetail.end_time : null,
             date,
             check_in: attendance ? attendance.check_in : null,
             check_out: attendance ? attendance.check_out : null,
+            late_by_minutes: lateByMinutes,
+            early_by_minutes: earlyByMinutes,
+            work_minutes: workMinutes,
             status,
         };
     });
@@ -184,7 +232,7 @@ async function computeMonthlySummary(companyId, year, month, context) {
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
     const [employees] = await pool.query(
-        "SELECT id, name, emp_code, department FROM employees WHERE company_id = ? AND status = 'active'",
+        "SELECT id, name, emp_code, department, shift_id FROM employees WHERE company_id = ? AND status = 'active'",
         [companyId]
     );
     const [attendanceRows] = await pool.query(
@@ -207,6 +255,9 @@ async function computeMonthlySummary(companyId, year, month, context) {
     const holidayIndex = await loadHolidayIndex(companyId, monthStart, monthEnd);
     const employeeGroups = await loadEmployeeHolidayGroups(companyId);
     const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
+    // migration_027 - see the /daily handler's comment above for why
+    // this replaces passing shift=null here.
+    const shiftOffIndex = await loadShiftOffIndex(companyId);
 
     return employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -218,7 +269,9 @@ async function computeMonthlySummary(companyId, year, month, context) {
             return dateStr >= from && dateStr <= to;
         });
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
-        const offDaysBitmask = effectiveOffDaysBitmask(null, emp.department, weeklyOffIndex);
+        const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
+        const offDaysBitmask = effectiveOffDaysBitmask(empShift, emp.department, weeklyOffIndex);
+        const altSaturdays = empShift ? empShift.alt_saturdays : null;
 
         for (let day = 1; day <= daysInMonth; day++) {
             const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
@@ -228,6 +281,7 @@ async function computeMonthlySummary(companyId, year, month, context) {
                 dateStr, dayOfWeek,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask,
+                altSaturdays,
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
             });
             if (status === 'present') { presentDays++; workingDays++; }
@@ -326,7 +380,7 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
     const { fullDayHours, halfDayMinHours } = await loadCompanyContext(companyId);
 
     const [employees] = await pool.query(
-        "SELECT id, name, emp_code, department FROM employees WHERE company_id = ? AND status = 'active'",
+        "SELECT id, name, emp_code, department, shift_id FROM employees WHERE company_id = ? AND status = 'active'",
         [companyId]
     );
     const [attendanceRows] = await pool.query(
@@ -345,6 +399,7 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
     const holidayIndex = await loadHolidayIndex(companyId, weekStart, weekEnd);
     const employeeGroups = await loadEmployeeHolidayGroups(companyId);
     const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
+    const shiftOffIndex = await loadShiftOffIndex(companyId);
 
     const result = employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -353,7 +408,9 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             return dateStr >= toDateStr(l.from_date) && dateStr <= toDateStr(l.to_date);
         });
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
-        const offDaysBitmask = effectiveOffDaysBitmask(null, emp.department, weeklyOffIndex);
+        const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
+        const offDaysBitmask = effectiveOffDaysBitmask(empShift, emp.department, weeklyOffIndex);
+        const altSaturdays = empShift ? empShift.alt_saturdays : null;
 
         const cursor = new Date(weekStartDate);
         for (let i = 0; i < 7; i++) {
@@ -364,6 +421,7 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
                 dateStr, dayOfWeek,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask,
+                altSaturdays,
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
             });
             if (status === 'present') { presentDays++; workingDays++; }

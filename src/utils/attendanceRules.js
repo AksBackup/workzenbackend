@@ -115,6 +115,21 @@ async function loadWeeklyOffIndex(companyId) {
 }
 
 /**
+ * migration_027: id -> {weekly_off_bitmask, alt_saturdays} for every
+ * shift in the company, so callers with just an employee's shift_id
+ * (not a full resolveEffectiveShift(...) row) can still get shift-wise
+ * weekend-off resolution without an extra query per employee.
+ */
+async function loadShiftOffIndex(companyId) {
+    const [rows] = await pool.query(
+        'SELECT id, weekly_off_bitmask, alt_saturdays FROM shifts WHERE company_id = ?',
+        [companyId]
+    );
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    return { byId };
+}
+
+/**
  * The actual fallback chain: a shift's own weekly_off_bitmask (if set)
  * wins outright (migration_015: NULL = inherit); otherwise a
  * department-specific weekly_off_config row; otherwise the company-wide
@@ -128,9 +143,30 @@ function effectiveOffDaysBitmask(shift, employeeDepartment, weeklyOffIndex) {
     return weeklyOffIndex.companyDefault;
 }
 
+/**
+ * migration_027: is `dateStr` an alternate-Saturday-off per a shift's
+ * `alt_saturdays` field (e.g. "1,3" = 1st and 3rd Saturday of the
+ * month off). Only ever true for an actual Saturday - a non-Saturday
+ * date always returns false regardless of what's configured. Shared
+ * by reports.js (classifyDay) and employees.js's monthly-summary.
+ */
+function isAltSaturdayOff(dateStr, altSaturdays) {
+    if (!altSaturdays) return false;
+    const d = new Date(`${dateStr}T00:00:00`);
+    if (d.getDay() !== 6) return false; // 6 = Saturday
+    const ordinal = Math.ceil(d.getDate() / 7); // 1st/2nd/3rd/4th/5th Saturday of the month
+    return altSaturdays
+        .split(',')
+        .map((s) => parseInt(s.trim(), 10))
+        .filter((n) => !Number.isNaN(n))
+        .includes(ordinal);
+}
+
 module.exports = {
     loadHolidayIndex,
     loadEmployeeHolidayGroups,
     loadWeeklyOffIndex,
+    loadShiftOffIndex,
     effectiveOffDaysBitmask,
+    isAltSaturdayOff,
 };

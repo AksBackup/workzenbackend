@@ -75,6 +75,10 @@ const canteenRoutes = require('./routes/canteen');
 
 // Agent C scope (AGENT_C_PAYROLL_REPORTS_ADMIN.md).
 const loanRoutes = require('./routes/loans');
+const adHocPaymentRoutes = require('./routes/adHocPayments');
+const salaryStructureRoutes = require('./routes/salaryStructures');
+const appUserRoutes = require('./routes/appUsers');
+const importDataRoutes = require('./routes/importData');
 const bonusRoutes = require('./routes/bonuses');
 const conveyanceRoutes = require('./routes/conveyance');
 const reportRoutes = require('./routes/reports');
@@ -145,6 +149,10 @@ app.use('/canteen', canteenRoutes);
 
 // Agent C scope (Phase 5) - appended, existing app.use(...) lines above untouched.
 app.use('/loans', loanRoutes);
+app.use('/ad-hoc-payments', adHocPaymentRoutes);
+app.use('/salary-structures', salaryStructureRoutes);
+app.use('/app-users', appUserRoutes);
+app.use('/import', importDataRoutes);
 app.use('/bonuses', bonusRoutes);
 app.use('/conveyance', conveyanceRoutes);
 app.use('/reports', reportRoutes);

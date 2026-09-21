@@ -3,7 +3,7 @@ const admin = require('firebase-admin');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
-const { loadWeeklyOffIndex, effectiveOffDaysBitmask } = require('../utils/attendanceRules');
+const { loadWeeklyOffIndex, effectiveOffDaysBitmask, isAltSaturdayOff } = require('../utils/attendanceRules');
 const { computeMonthlyPaidUsage } = require('../utils/leaveQuota');
 
 const router = express.Router();
@@ -39,8 +39,21 @@ router.get('/', asyncHandler(async (req, res) => {
  * automatic one, since not every employee needs mobile access.)
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled, branch_id } = req.body;
+    const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled, branch_id,
+        phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
+
+    // id_proof_type is single-select (whichever one document the
+    // employee actually provided - Aadhaar OR PAN OR Voter ID, never
+    // more than one), matching the id_proof_type ENUM added by
+    // migration_024. A number without a type (or vice versa) is
+    // rejected rather than silently dropped.
+    if ((id_proof_type && !id_proof_number) || (id_proof_number && !id_proof_type)) {
+        return res.status(400).json({ error: 'id_proof_type and id_proof_number must be provided together' });
+    }
+    if (id_proof_type && !['aadhaar', 'pan', 'voter_id'].includes(id_proof_type)) {
+        return res.status(400).json({ error: 'id_proof_type must be one of: aadhaar, pan, voter_id' });
+    }
 
     // emp_code is normally auto-generated (see below) but can optionally be
     // supplied explicitly, e.g. to match an ID already printed on an
@@ -82,12 +95,16 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
         const [result] = await conn.query(
             `INSERT INTO employees
-             (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, category_id, remote_location_enabled, branch_id, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+             (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, category_id, remote_location_enabled, branch_id,
+              phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, name, designation || null, department || null,
                 department_id || null, designation_id || null, shift_id || null,
                 doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null,
-                category_id || null, !!remote_location_enabled, branch_id || null]
+                category_id || null, !!remote_location_enabled, branch_id || null,
+                phone || null, personal_email || null, office_email || null, address || null,
+                id_proof_type || null, id_proof_number || null, bank_account_holder || null,
+                bank_account_no || null, bank_ifsc || null, bank_name || null, assigned_device_id || null]
         );
 
         await conn.commit();
@@ -252,8 +269,17 @@ router.delete('/:id/login', requireAdmin, asyncHandler(async (req, res) => {
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     // category_id, remote_location_enabled added by migration_015.
     // branch_id added by migration_016 (Holiday Group resolution needs
-    // to know which branch an employee belongs to).
-    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled', 'branch_id'];
+    // to know which branch an employee belongs to). phone/personal_email/
+    // office_email/address/id_proof_type/id_proof_number/bank_* added by
+    // migration_024 (Employees > Extra Details); assigned_device_id
+    // added by migration_025 (which registered device this employee's
+    // data was pushed to).
+    const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled', 'branch_id',
+        'phone', 'personal_email', 'office_email', 'address', 'id_proof_type', 'id_proof_number', 'bank_account_holder', 'bank_account_no', 'bank_ifsc', 'bank_name', 'assigned_device_id'];
+    if (req.body.id_proof_type !== undefined && req.body.id_proof_type !== null
+        && !['aadhaar', 'pan', 'voter_id'].includes(req.body.id_proof_type)) {
+        return res.status(400).json({ error: 'id_proof_type must be one of: aadhaar, pan, voter_id' });
+    }
     const updates = [];
     const values = [];
     fields.forEach(f => {
@@ -444,7 +470,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     const month = parseInt(req.query.month, 10) || (new Date().getMonth() + 1); // 1-12
 
     const [empRows] = await pool.query(
-        'SELECT id, name, emp_code, dob, department, branch_id FROM employees WHERE id = ? AND company_id = ?',
+        'SELECT id, name, emp_code, dob, department, branch_id, shift_id FROM employees WHERE id = ? AND company_id = ?',
         [employeeId, req.user.companyId]
     );
     if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
@@ -489,13 +515,19 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         holidayByDate.set(toDateStr(row.date), row.name);
     }
     const weeklyOffIndex = await loadWeeklyOffIndex(req.user.companyId);
-    // Shift-level weekly-off override (migration_015) isn't resolved
-    // here - this endpoint doesn't otherwise look up the employee's
-    // shift at all, and adding that is a larger change (see
-    // reports.js's resolveEffectiveShift for what that actually
-    // involves). Department-level override and the company default are
-    // both respected via effectiveOffDaysBitmask.
-    const offBitmask = effectiveOffDaysBitmask(null, employee.department, weeklyOffIndex);
+    // migration_027 - shift-level weekly-off (weekly_off_bitmask AND
+    // alt_saturdays) now actually resolved via the employee's shift_id,
+    // fixing the gap the previous comment here flagged.
+    let empShift = null;
+    if (employee.shift_id != null) {
+        const [shiftRows] = await pool.query(
+            'SELECT weekly_off_bitmask, alt_saturdays FROM shifts WHERE id = ? AND company_id = ?',
+            [employee.shift_id, req.user.companyId]
+        );
+        empShift = shiftRows[0] ?? null;
+    }
+    const offBitmask = effectiveOffDaysBitmask(empShift, employee.department, weeklyOffIndex);
+    const altSaturdays = empShift ? empShift.alt_saturdays : null;
     const [leaveRows] = await pool.query(
         `SELECT from_date, to_date FROM leave_applications
          WHERE employee_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
@@ -550,7 +582,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     for (let d = 1; d <= daysInMonth; d++) {
         const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
         const dow = new Date(year, month - 1, d).getDay(); // 0=Sun..6=Sat
-        const isWeeklyOff = ((offBitmask >> dow) & 1) === 1;
+        const isWeeklyOff = ((offBitmask >> dow) & 1) === 1 || isAltSaturdayOff(dateStr, altSaturdays);
         const holidayName = holidayByDate.get(dateStr);
         const onLeave = leaveRows.some(l => toDateStr(l.from_date) <= dateStr && toDateStr(l.to_date) >= dateStr);
         const att = attendanceByDate.get(dateStr);

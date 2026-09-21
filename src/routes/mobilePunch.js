@@ -149,6 +149,12 @@ router.post('/', asyncHandler(async (req, res) => {
  * Payroll.
  */
 router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
+    // location_type (migration_026): the approver's Office/Field call
+    // for this punch, editable per-punch from the approval screen -
+    // never a gate on approval itself (see checkAgainstZones), just a
+    // record of the approver's judgement on why an outside-geofence
+    // punch is fine.
+    const { location_type } = req.body;
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
@@ -179,9 +185,11 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
 
         const adminId = await _currentAdminId(req);
         await conn.query(
-            `UPDATE mobile_punches SET status = 'approved', approved_by = ?, approved_on = NOW()
+            `UPDATE mobile_punches SET status = 'approved', approved_by = ?, approved_on = NOW()${location_type ? ', location_type = ?' : ''}
              WHERE id = ? AND company_id = ?`,
-            [adminId, req.params.id, req.user.companyId]
+            location_type
+                ? [adminId, location_type, req.params.id, req.user.companyId]
+                : [adminId, req.params.id, req.user.companyId]
         );
 
         await conn.commit();
@@ -198,6 +206,20 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
     } finally {
         conn.release();
     }
+}));
+
+// migration_026 - set/change the Office/Field label on a pending punch
+// independent of approving it, so the dropdown in the approval screen
+// can save immediately as the approver changes it rather than only on
+// final Approve.
+router.patch('/:id/location-type', requireAdmin, asyncHandler(async (req, res) => {
+    const { location_type } = req.body;
+    if (!location_type) return res.status(400).json({ error: 'location_type is required' });
+    await pool.query(
+        'UPDATE mobile_punches SET location_type = ? WHERE id = ? AND company_id = ?',
+        [location_type, req.params.id, req.user.companyId]
+    );
+    return res.json({ message: 'Updated' });
 }));
 
 router.post('/:id/reject', requireAdmin, asyncHandler(async (req, res) => {

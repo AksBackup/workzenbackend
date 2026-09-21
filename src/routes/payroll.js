@@ -36,6 +36,14 @@ router.use(verifyFirebaseToken);
  */
 
 /**
+ * Shared 2-decimal rounding - used across computeMonthlyPayroll and
+ * computeStatutoryDeductions so both round money the same way.
+ */
+function round2(n) {
+    return Math.round(n * 100) / 100;
+}
+
+/**
  * Shared computation behind GET / (all employees, admin) and GET /me
  * (the caller's own row, any employee). Pulled out so both routes stay
  * byte-for-byte identical in how a payslip is computed - the only
@@ -127,6 +135,36 @@ async function computeMonthlyPayroll(companyId, year, month) {
         [companyId, year, month]
     );
     const payrollByEmp = new Map(existingPayroll.map(p => [p.employee_id, p]));
+
+    // migration_028 - active loans per employee, for the projected
+    // (not-yet-committed) monthly deduction shown here. 'salary_percent'
+    // loans get auto-deducted for real when payroll is marked paid (see
+    // POST /:employeeId/mark-paid below) - this function itself is
+    // read-only (called from both GET / and GET /me) and must never
+    // write a loan_payments row on its own, or simply viewing payroll
+    // twice would double-charge the loan. 'installments' loans are
+    // never auto-deducted - shown here purely so the list surfaces that
+    // an employee still has one outstanding.
+    let loanRows = [];
+    try {
+        [loanRows] = await pool.query(
+            `SELECT l.id, l.employee_id, l.principal_amount, l.repayment_mode, l.salary_deduction_percent,
+                    COALESCE((SELECT SUM(amount) FROM loan_payments WHERE loan_id = l.id), 0) AS paid_so_far
+             FROM loans l
+             WHERE l.company_id = ? AND l.status != 'closed'`,
+            [companyId]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+        // migration_028 not applied yet - proceed with no loan deductions,
+        // same defensive fallback pattern as the statutory settings block
+        // above.
+    }
+    const loansByEmp = new Map();
+    for (const l of loanRows) {
+        if (!loansByEmp.has(l.employee_id)) loansByEmp.set(l.employee_id, []);
+        loansByEmp.get(l.employee_id).push(l);
+    }
 
     // Overtime (migration_008) - only APPROVED records count toward pay;
     // pending ones are still awaiting admin sign-off and rejected ones
@@ -238,6 +276,25 @@ async function computeMonthlyPayroll(companyId, year, month) {
         // allowances + bonus + overtime), so they use totalPay.
         const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, roundedBasePay, totalPay);
 
+        // Projected loan deduction (migration_028) - see the loanRows
+        // comment above for why this is a preview only, not a write.
+        let loanDeduction = 0;
+        const empLoans = loansByEmp.get(emp.id) || [];
+        const loanSummaries = empLoans.map(l => {
+            const outstanding = Math.max(0, Number(l.principal_amount) - Number(l.paid_so_far));
+            let projected = 0;
+            if (l.repayment_mode === 'salary_percent' && l.salary_deduction_percent) {
+                projected = Math.min(outstanding, round2(roundedBasePay * Number(l.salary_deduction_percent) / 100));
+                loanDeduction += projected;
+            }
+            return {
+                loan_id: l.id,
+                repayment_mode: l.repayment_mode,
+                outstanding_balance: round2(outstanding),
+                projected_deduction_this_month: round2(projected),
+            };
+        });
+
         return {
             employee_id: emp.id,
             employee_name: emp.name,
@@ -252,7 +309,9 @@ async function computeMonthlyPayroll(companyId, year, month) {
             esi_employee: statutory.esiEmployee,
             esi_employer: statutory.esiEmployer,
             pt_amount: statutory.ptAmount,
-            net_pay: Math.round((totalPay - statutory.pfEmployee - statutory.esiEmployee - statutory.ptAmount) * 100) / 100,
+            loans: loanSummaries,
+            loan_deduction: round2(loanDeduction),
+            net_pay: Math.round((totalPay - statutory.pfEmployee - statutory.esiEmployee - statutory.ptAmount - loanDeduction) * 100) / 100,
             is_paid: existing ? !!existing.is_paid : false,
             paid_on: existing ? existing.paid_on : null,
             // New (pass 2, see daysToCount comment above): lets the UI
@@ -276,7 +335,6 @@ async function computeMonthlyPayroll(companyId, year, month) {
  * only - they're never subtracted from what the employee is paid.
  */
 function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, grossPay) {
-    const round2 = n => Math.round(n * 100) / 100;
 
     let pfEmployee = 0, pfEmployer = 0;
     if (settings.pf_enabled) {
@@ -384,6 +442,53 @@ router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res
          ON DUPLICATE KEY UPDATE is_paid = VALUES(is_paid), paid_on = VALUES(paid_on)`,
         [req.user.companyId, req.params.employeeId, year, month, is_paid, is_paid ? new Date() : null]
     );
+
+    // migration_028 - this is the one place a 'salary_percent' loan's
+    // monthly deduction actually gets written, not computeMonthlyPayroll
+    // (which only ever previews it - see that function's loanRows
+    // comment). Only fires when marking AS paid, not on un-marking -
+    // un-marking doesn't reverse a deduction that already happened.
+    // uq_loan_payroll_auto (loan_id, payroll_year, payroll_month,
+    // source) is what makes this safe to call more than once for the
+    // same employee/month (mark-paid -> un-mark -> mark-paid again).
+    if (is_paid) {
+        try {
+            const [empRows] = await pool.query(
+                'SELECT id FROM employees WHERE id = ? AND company_id = ?',
+                [req.params.employeeId, req.user.companyId]
+            );
+            if (empRows.length) {
+                const payrollRows = await computeMonthlyPayroll(req.user.companyId, year, month);
+                const own = payrollRows.find(r => r.employee_id === Number(req.params.employeeId));
+                if (own && own.loans && own.loans.length) {
+                    for (const loan of own.loans) {
+                        if (loan.repayment_mode !== 'salary_percent' || loan.projected_deduction_this_month <= 0) continue;
+                        await pool.query(
+                            `INSERT IGNORE INTO loan_payments
+                                (company_id, loan_id, amount, payment_date, source, payroll_year, payroll_month, note)
+                             VALUES (?, ?, ?, CURDATE(), 'payroll_auto', ?, ?, ?)`,
+                            [req.user.companyId, loan.loan_id, loan.projected_deduction_this_month, year, month,
+                                `Auto salary deduction - ${year}-${String(month).padStart(2, '0')}`]
+                        );
+                        // Auto-close the loan once it's fully repaid.
+                        const remaining = loan.outstanding_balance - loan.projected_deduction_this_month;
+                        if (remaining <= 0.01) {
+                            await pool.query(
+                                "UPDATE loans SET status = 'closed' WHERE id = ? AND company_id = ?",
+                                [loan.loan_id, req.user.companyId]
+                            );
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            // Best-effort - the payroll_records row above is already
+            // committed, and this is a loans table dependency
+            // (migration_028) that may not exist yet on an older DB.
+            if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+        }
+    }
+
     return res.json({ message: 'Paid status updated' });
 }));
 

@@ -53,6 +53,8 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     // "inherit/off" at the DB level if omitted here.
     const {
         weekly_off_bitmask = null,
+        // migration_027 - "1,3" style Nth-Saturday-of-month off, shift-wise.
+        alt_saturdays = null,
         ot_allowed = true,
         late_grace_minutes = 0,
         early_grace_minutes = 0,
@@ -65,9 +67,9 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
     const [result] = await pool.query(
         `INSERT INTO shifts
-            (company_id, name, start_time, end_time, weekly_off_bitmask, ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, is_half_day_shift)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, name, start_time, end_time, weekly_off_bitmask, !!ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, !!is_half_day_shift]
+            (company_id, name, start_time, end_time, weekly_off_bitmask, alt_saturdays, ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, is_half_day_shift)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, name, start_time, end_time, weekly_off_bitmask, alt_saturdays, !!ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, !!is_half_day_shift]
     );
     return res.status(201).json({ id: result.insertId, name, start_time, end_time, is_default: false });
 }));
@@ -81,7 +83,7 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         'name', 'start_time', 'end_time',
         // migration_015 additions - see POST above / that migration's
         // header comment.
-        'weekly_off_bitmask', 'ot_allowed', 'late_grace_minutes',
+        'weekly_off_bitmask', 'alt_saturdays', 'ot_allowed', 'late_grace_minutes',
         'early_grace_minutes', 'single_punch_policy', 'is_half_day_shift',
     ];
     if (req.body.single_punch_policy !== undefined &&
