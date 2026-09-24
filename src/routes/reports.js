@@ -9,6 +9,13 @@ const {
     loadShiftOffIndex,
     effectiveOffDaysBitmask,
     isAltSaturdayOff,
+    // Task 3 (multi-punch engine) + Task 4 (Office Time Policy v2).
+    derivePunchSpan,
+    loadPunchEventsForDay,
+    loadPunchEventsIndex,
+    loadShiftPolicyIndex,
+    loadShiftPolicyOffIndex,
+    resolveShiftGrace,
 } = require('../utils/attendanceRules');
 
 const router = express.Router();
@@ -63,11 +70,26 @@ async function loadCompanyContext(companyId) {
 /**
  * Classifies one employee-day. Returns one of:
  * 'holiday' | 'weekly_off' | 'leave' | 'present' | 'half_day' | 'absent'
+ *
+ * Task 4: `isWeeklyOff2` is an optional extra weekly-off check (Office
+ * Time Policy's Weekly Off 2 field, migration_034) alongside the
+ * existing bitmask/alt-Saturday checks - defaults to a no-op so every
+ * existing call site that doesn't pass it behaves exactly as before.
+ *
+ * Task 3: `workMinutesOverride` lets a caller hand in a work-minutes
+ * figure already derived from punch_events (utils/attendanceRules.js's
+ * derivePunchSpan, applying the "deduct break hours" policy exception)
+ * instead of the simple check_out-minus-check_in this function
+ * computes on its own. This is GOING FORWARD ONLY (migration_033's own
+ * scope) - a day with no punch_events rows (i.e. everything before
+ * this pass) has no override and falls through to the original
+ * check_in/check_out-based hours math unchanged.
  */
-function classifyDay({ dateStr, dayOfWeek, isHoliday, offDaysBitmask, altSaturdays, isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours }) {
+function classifyDay({ dateStr, dayOfWeek, isHoliday, offDaysBitmask, altSaturdays, isWeeklyOff2 = () => false, isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours, workMinutesOverride = undefined }) {
     if (isHoliday(dateStr)) return 'holiday';
     if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) return 'weekly_off';
     if (isAltSaturdayOff(dateStr, altSaturdays)) return 'weekly_off';
+    if (isWeeklyOff2(dateStr)) return 'weekly_off';
     if (isOnApprovedLeave(dateStr)) return 'leave';
     if (!attendance || !attendance.check_in) return 'absent';
 
@@ -81,10 +103,40 @@ function classifyDay({ dateStr, dayOfWeek, isHoliday, offDaysBitmask, altSaturda
     // Performance reports for the same day.
     if (!attendance.check_out) return 'present';
 
-    const hours = (new Date(attendance.check_out) - new Date(attendance.check_in)) / (1000 * 60 * 60);
+    const hours = workMinutesOverride != null
+        ? workMinutesOverride / 60
+        : (new Date(attendance.check_out) - new Date(attendance.check_in)) / (1000 * 60 * 60);
     if (hours >= fullDayHours) return 'present';
     if (hours >= halfDayMinHours) return 'half_day';
     return 'absent';
+}
+
+/**
+ * Task 4: resolves one employee's weekly-off inputs for classifyDay,
+ * preferring their shift's ASSIGNED Office Time Policy
+ * (migration_034's office_time_policy_shifts) when one exists, falling
+ * back to the shift's own legacy weekly_off_bitmask/alt_saturdays
+ * columns (loadShiftOffIndex, unchanged) when no policy is assigned to
+ * that shift yet. Once a policy is assigned it's authoritative per the
+ * client's instruction ("Office Time Policy becomes the only place
+ * these are configured") - the department/company-wide
+ * weekly_off_config fallback effectiveOffDaysBitmask also has is only
+ * reached for shifts with no assigned policy AND no legacy bitmask of
+ * their own.
+ */
+function resolveEmployeeOffDays(empShiftId, empShift, employeeDepartment, weeklyOffIndex, shiftPolicyOffIndex) {
+    if (empShiftId != null && shiftPolicyOffIndex.has(empShiftId)) {
+        return {
+            offDaysBitmask: shiftPolicyOffIndex.offDaysBitmaskFor(empShiftId),
+            altSaturdays: null,
+            isWeeklyOff2: (d) => shiftPolicyOffIndex.isWeeklyOff2Date(empShiftId, d),
+        };
+    }
+    return {
+        offDaysBitmask: effectiveOffDaysBitmask(empShift, employeeDepartment, weeklyOffIndex),
+        altSaturdays: empShift ? empShift.alt_saturdays : null,
+        isWeeklyOff2: () => false,
+    };
 }
 
 /**
@@ -130,6 +182,16 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
     // silently skipping shift-level weekly-off even though the
     // fallback chain (effectiveOffDaysBitmask) already supported it.
     const shiftOffIndex = await loadShiftOffIndex(companyId);
+    // migration_034 - policy-assigned weekly-off, preferred over the
+    // legacy shift columns above when a shift has a policy assigned -
+    // see resolveEmployeeOffDays.
+    const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId);
+    // migration_034 - policy-assigned grace minutes, preferred over
+    // shifts.late_grace_minutes/early_grace_minutes below.
+    const shiftPolicyIndex = await loadShiftPolicyIndex(companyId);
+    // migration_033 - this day's raw punch events, batched company-wide,
+    // for the multi-punch work_minutes/gap-deduction calculation below.
+    const punchEventsIndex = await loadPunchEventsIndex(companyId, date, date);
     // Full shift details (name/times/grace) for the new Designation /
     // Shift / Shift Time / Late Hrs / Early Hrs columns, matching the
     // reference layout (daily_report.jpeg) the client provided -
@@ -150,32 +212,53 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
         const attendance = attendanceByEmp.get(emp.id);
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
         const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
-        const offDaysBitmask = effectiveOffDaysBitmask(empShift, emp.department, weeklyOffIndex);
+        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+            resolveEmployeeOffDays(emp.shift_id, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+
+        // Task 3: derive this day's punch span/work-minutes from raw
+        // punch_events when any exist (going-forward-only per
+        // migration_033) - "Deduct Break Hours From Work Duration"
+        // applied per the employee's shift's assigned policy, default
+        // OFF (full elapsed span) when no policy is assigned.
+        const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, date);
+        const deductBreaks = emp.shift_id != null ? shiftPolicyIndex.deductBreaksFor(emp.shift_id) : false;
+        const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
+
         const status = classifyDay({
             dateStr: date,
             dayOfWeek,
             isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
             offDaysBitmask,
-            altSaturdays: empShift ? empShift.alt_saturdays : null,
+            altSaturdays,
+            isWeeklyOff2,
             isOnApprovedLeave: () => onLeaveEmpIds.has(emp.id),
             attendance,
             fullDayHours,
             halfDayMinHours,
+            workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
         });
 
         const shiftDetail = shiftDetails.get(emp.shift_id) ?? null;
         let lateByMinutes = 0, earlyByMinutes = 0, workMinutes = null;
         if (shiftDetail && attendance && attendance.check_in) {
+            const grace = emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id)
+                ? shiftPolicyIndex.graceFor(emp.shift_id)
+                : { lateGraceMinutes: shiftDetail.late_grace_minutes || 0, earlyGraceMinutes: shiftDetail.early_grace_minutes || 0 };
             const actualIn = new Date(attendance.check_in);
             const scheduledStart = new Date(`${date}T${shiftDetail.start_time}`);
-            scheduledStart.setMinutes(scheduledStart.getMinutes() + (shiftDetail.late_grace_minutes || 0));
+            scheduledStart.setMinutes(scheduledStart.getMinutes() + grace.lateGraceMinutes);
             if (actualIn > scheduledStart) lateByMinutes = Math.round((actualIn - scheduledStart) / 60000);
             if (attendance.check_out) {
                 const actualOut = new Date(attendance.check_out);
                 const scheduledEnd = new Date(`${date}T${shiftDetail.end_time}`);
-                scheduledEnd.setMinutes(scheduledEnd.getMinutes() - (shiftDetail.early_grace_minutes || 0));
+                scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
                 if (actualOut < scheduledEnd) earlyByMinutes = Math.round((scheduledEnd - actualOut) / 60000);
-                workMinutes = Math.round((actualOut - actualIn) / 60000);
+                // Task 3: prefer the punch_events-derived figure (which
+                // respects the deduct-breaks policy) over the plain
+                // check_out-minus-check_in span used before this pass.
+                workMinutes = punchSpan && punchSpan.workMinutes != null
+                    ? punchSpan.workMinutes
+                    : Math.round((actualOut - actualIn) / 60000);
             }
         }
 
@@ -258,6 +341,15 @@ async function computeMonthlySummary(companyId, year, month, context) {
     // migration_027 - see the /daily handler's comment above for why
     // this replaces passing shift=null here.
     const shiftOffIndex = await loadShiftOffIndex(companyId);
+    // migration_034 - policy-assigned weekly-off, preferred per shift
+    // when assigned (see resolveEmployeeOffDays).
+    const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId);
+    // migration_033/034 - this month's raw punch events plus each
+    // shift's deduct-break-hours policy flag, for the same
+    // punch_events-derived work-minutes classifyDay now accepts - see
+    // the /daily handler's comment above.
+    const punchEventsIndex = await loadPunchEventsIndex(companyId, monthStart, monthEnd);
+    const shiftPolicyIndex = await loadShiftPolicyIndex(companyId);
 
     return employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -270,19 +362,24 @@ async function computeMonthlySummary(companyId, year, month, context) {
         });
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
         const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
-        const offDaysBitmask = effectiveOffDaysBitmask(empShift, emp.department, weeklyOffIndex);
-        const altSaturdays = empShift ? empShift.alt_saturdays : null;
+        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+            resolveEmployeeOffDays(emp.shift_id, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+        const deductBreaks = emp.shift_id != null ? shiftPolicyIndex.deductBreaksFor(emp.shift_id) : false;
 
         for (let day = 1; day <= daysInMonth; day++) {
             const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
             const dayOfWeek = new Date(year, month - 1, day).getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
+            const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
             const status = classifyDay({
                 dateStr, dayOfWeek,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask,
                 altSaturdays,
+                isWeeklyOff2,
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
+                workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
             });
             if (status === 'present') { presentDays++; workingDays++; }
             else if (status === 'half_day') { halfDays++; workingDays++; }
@@ -400,6 +497,9 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
     const employeeGroups = await loadEmployeeHolidayGroups(companyId);
     const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
     const shiftOffIndex = await loadShiftOffIndex(companyId);
+    const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId);
+    const punchEventsIndex = await loadPunchEventsIndex(companyId, weekStart, weekEnd);
+    const shiftPolicyIndex = await loadShiftPolicyIndex(companyId);
 
     const result = employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -409,20 +509,25 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
         });
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
         const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
-        const offDaysBitmask = effectiveOffDaysBitmask(empShift, emp.department, weeklyOffIndex);
-        const altSaturdays = empShift ? empShift.alt_saturdays : null;
+        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+            resolveEmployeeOffDays(emp.shift_id, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+        const deductBreaks = emp.shift_id != null ? shiftPolicyIndex.deductBreaksFor(emp.shift_id) : false;
 
         const cursor = new Date(weekStartDate);
         for (let i = 0; i < 7; i++) {
             const dateStr = toDateStr(cursor);
             const dayOfWeek = cursor.getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
+            const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
             const status = classifyDay({
                 dateStr, dayOfWeek,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask,
                 altSaturdays,
+                isWeeklyOff2,
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
+                workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
             });
             if (status === 'present') { presentDays++; workingDays++; }
             else if (status === 'half_day') { halfDays++; workingDays++; }
@@ -537,12 +642,16 @@ router.get('/late-early', requireAdmin, asyncHandler(async (req, res) => {
         if (!attendance) continue; // absent entirely - not this report's concern, /reports/daily covers absence
         const shift = await resolveEffectiveShift(req.user.companyId, emp.id, date);
         if (!shift) continue; // covered instead by /reports/na-shift
+        // migration_034 - prefer the shift's assigned Office Time
+        // Policy's grace minutes over the shift row's own legacy
+        // columns (see resolveShiftGrace's comment).
+        const grace = await resolveShiftGrace(req.user.companyId, shift);
 
         let isLate = false, lateByMinutes = 0, isEarly = false, earlyByMinutes = 0;
 
         if (attendance.check_in) {
             const scheduledStart = new Date(`${date}T${shift.start_time}`);
-            scheduledStart.setMinutes(scheduledStart.getMinutes() + shift.late_grace_minutes);
+            scheduledStart.setMinutes(scheduledStart.getMinutes() + grace.lateGraceMinutes);
             const actualIn = new Date(attendance.check_in);
             if (actualIn > scheduledStart) {
                 isLate = true;
@@ -551,7 +660,7 @@ router.get('/late-early', requireAdmin, asyncHandler(async (req, res) => {
         }
         if (attendance.check_out) {
             const scheduledEnd = new Date(`${date}T${shift.end_time}`);
-            scheduledEnd.setMinutes(scheduledEnd.getMinutes() - shift.early_grace_minutes);
+            scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
             const actualOut = new Date(attendance.check_out);
             if (actualOut < scheduledEnd) {
                 isEarly = true;
@@ -689,16 +798,17 @@ async function computeLateEarlyForDate(companyId, date) {
         if (!attendance) continue;
         const shift = await resolveEffectiveShift(companyId, emp.id, date);
         if (!shift) continue;
+        const grace = await resolveShiftGrace(companyId, shift);
 
         let isLate = false, isEarly = false;
         if (attendance.check_in) {
             const scheduledStart = new Date(`${date}T${shift.start_time}`);
-            scheduledStart.setMinutes(scheduledStart.getMinutes() + shift.late_grace_minutes);
+            scheduledStart.setMinutes(scheduledStart.getMinutes() + grace.lateGraceMinutes);
             if (new Date(attendance.check_in) > scheduledStart) isLate = true;
         }
         if (attendance.check_out) {
             const scheduledEnd = new Date(`${date}T${shift.end_time}`);
-            scheduledEnd.setMinutes(scheduledEnd.getMinutes() - shift.early_grace_minutes);
+            scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
             if (new Date(attendance.check_out) < scheduledEnd) isEarly = true;
         }
         if (isLate || isEarly) result.push({ employee_id: emp.id, is_late: isLate, is_early: isEarly });

@@ -104,7 +104,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const [result] = await pool.query(
         `INSERT INTO loans (company_id, employee_id, principal_amount, monthly_deduction, repayment_mode, salary_deduction_percent, interest_rate, start_month, start_year)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, employee_id, principal_amount, monthly_deduction || null, repayment_mode,
+        [req.user.companyId, employee_id, principal_amount, monthly_deduction || 0, repayment_mode,
             salary_deduction_percent || null, interest_rate || null, start_month, start_year]
     );
     return res.status(201).json({ id: result.insertId });

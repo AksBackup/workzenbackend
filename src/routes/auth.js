@@ -151,4 +151,90 @@ router.post('/employee-login', asyncHandler(async (req, res) => {
     });
 }));
 
+/**
+ * POST /auth/app-user-login (migration_031)
+ *
+ * Mirrors POST /employee-login above exactly - same reasoning, same
+ * server-side "resolve id -> hidden email, forward password to
+ * Firebase" trick, just resolving against app_users+employees instead
+ * of employees.email directly. See appUsers.js's header comment for
+ * what this closes (and what it still doesn't - most other routes
+ * don't yet accept role 'app_user').
+ *
+ * body: { company_code, emp_code, password }
+ * response: { idToken, refreshToken, app_user: {...}, company_name }
+ */
+router.post('/app-user-login', asyncHandler(async (req, res) => {
+    const { company_code, emp_code, password } = req.body;
+    if (!company_code || !emp_code || !password) {
+        return res.status(400).json({ error: 'company_code, emp_code, and password are required' });
+    }
+
+    const [companyRows] = await pool.query(
+        'SELECT id, name FROM companies WHERE company_code = ?',
+        [String(company_code).trim().toUpperCase()]
+    );
+    if (companyRows.length === 0) {
+        return res.status(404).json({ error: 'Company code not found. Check it with your admin.' });
+    }
+    const company = companyRows[0];
+
+    const [rows] = await pool.query(
+        `SELECT u.id, u.firebase_uid, u.status, e.name, e.emp_code
+         FROM app_users u
+         JOIN employees e ON e.id = u.employee_id
+         WHERE u.company_id = ? AND e.emp_code = ?`,
+        [company.id, emp_code]
+    );
+    if (rows.length === 0 || !rows[0].firebase_uid) {
+        return res.status(404).json({ error: 'Employee ID not found, or an app login has not been set up for it yet - contact your admin.' });
+    }
+    const appUser = rows[0];
+    if (appUser.status !== 'active') {
+        return res.status(403).json({ error: 'This login has been disabled. Contact your admin.' });
+    }
+
+    let webApiKey;
+    try {
+        webApiKey = getFirebaseWebApiKey();
+    } catch (err) {
+        return res.status(500).json({ error: 'Login is not fully configured on the server yet - contact your admin.' });
+    }
+
+    const generatedEmail = `au${appUser.id}@appuser.internal`;
+    let firebaseResult;
+    try {
+        const resp = await fetch(
+            `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${webApiKey}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: generatedEmail, password, returnSecureToken: true }),
+            }
+        );
+        firebaseResult = await resp.json();
+        if (!resp.ok) {
+            const code = firebaseResult.error?.message || 'UNKNOWN_ERROR';
+            let friendly = 'Login failed. Please try again.';
+            if (['INVALID_PASSWORD', 'INVALID_LOGIN_CREDENTIALS', 'EMAIL_NOT_FOUND'].includes(code)) {
+                friendly = 'Incorrect Employee ID or password.';
+            } else if (code === 'USER_DISABLED') {
+                friendly = 'This login has been disabled. Contact your admin.';
+            } else if (code === 'TOO_MANY_ATTEMPTS_TRY_LATER') {
+                friendly = 'Too many failed attempts. Try again later.';
+            }
+            return res.status(401).json({ error: friendly });
+        }
+    } catch (err) {
+        return res.status(502).json({ error: 'Could not reach the authentication service. Please try again.' });
+    }
+
+    return res.json({
+        idToken: firebaseResult.idToken,
+        refreshToken: firebaseResult.refreshToken,
+        app_user: { id: appUser.id, name: appUser.name, emp_code: appUser.emp_code },
+        company_name: company.name,
+    });
+}));
+
 module.exports = router;

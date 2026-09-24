@@ -7,11 +7,21 @@ const pool = require('../db');
  * before it's confirmed, per the brief ("overtime will require admin
  * approvement for the confirmation").
  *
- * Deliberately does nothing if the company hasn't set
- * office_time_policy.overtime_rate_per_hour yet - a NULL rate means "not
- * configured", not "free overtime at ₹0/hour", so nothing is computed
- * (and nothing silently priced at zero) until an admin sets a rate in
- * Settings > Office Time.
+ * Rate resolution (migration_035 added the per-employee override):
+ *   1. If this employee has an active statutory/OT override
+ *      (employees.statutory_override_active) with an ot_rate_type set,
+ *      use THAT rate instead of the company-wide one:
+ *        - 'fixed'      -> ot_rate_value, a flat rupees-per-OT-hour figure.
+ *        - 'percentage' -> ot_rate_value% of this employee's derived
+ *          per-hour salary rate, i.e. employees.salary / (full_day_hours
+ *          * days in dateStr's month) - full_day_hours comes from
+ *          office_time_policy, the same figure payroll.js's
+ *          computeMonthlyPayroll uses to decide full/half day pay.
+ *   2. Otherwise, fall back to the original company-wide behaviour:
+ *      office_time_policy.overtime_rate_per_hour. A NULL rate there
+ *      still means "not configured", not "free overtime at ₹0/hour" -
+ *      nothing is computed until either an admin sets a company rate or
+ *      this employee has their own override.
  *
  * Called from:
  *   - attendance.js  POST /attendance        (single punch write)
@@ -49,13 +59,55 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
     }
 
     const [policyRows] = await pool.query(
-        'SELECT check_out_time, overtime_rate_per_hour FROM office_time_policy WHERE company_id = ?',
+        'SELECT check_out_time, overtime_rate_per_hour, full_day_hours FROM office_time_policy WHERE company_id = ?',
         [companyId]
     );
-    if (policyRows.length === 0 || policyRows[0].overtime_rate_per_hour === null) {
+    if (policyRows.length === 0) return;
+    const { check_out_time, overtime_rate_per_hour, full_day_hours } = policyRows[0];
+
+    // migration_035 - this employee's own OT rate override, if any.
+    // Defensive on the column set (ER_BAD_FIELD_ERROR) the same way the
+    // rest of this backend handles migrations that may not have been
+    // applied yet to an older DB.
+    let employeeOverride = null;
+    try {
+        const [empRows] = await pool.query(
+            'SELECT salary, ot_rate_type, ot_rate_value, statutory_override_active FROM employees WHERE id = ? AND company_id = ?',
+            [employeeId, companyId]
+        );
+        if (empRows.length > 0 && empRows[0].statutory_override_active && empRows[0].ot_rate_type) {
+            employeeOverride = empRows[0];
+        }
+    } catch (err) {
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+        // migration_035 not applied yet - proceed with no OT override.
+    }
+
+    let rate;
+    if (employeeOverride) {
+        if (employeeOverride.ot_rate_type === 'fixed') {
+            rate = parseFloat(employeeOverride.ot_rate_value) || 0;
+        } else {
+            // 'percentage' - of this employee's derived per-hour salary
+            // rate. Falls back to a rate of 0 (not an error) if salary or
+            // full_day_hours isn't set - an OT % of an undefined base pay
+            // isn't computable, and silently skipping is safer than
+            // guessing.
+            const daysInMonth = new Date(
+                Number(dateStr.slice(0, 4)), Number(dateStr.slice(5, 7)), 0
+            ).getDate();
+            const fullDayHours = Number(full_day_hours) || 8.0;
+            const monthlySalary = Number(employeeOverride.salary) || 0;
+            const hourlyRate = monthlySalary > 0 ? monthlySalary / (fullDayHours * daysInMonth) : 0;
+            rate = round2(hourlyRate * (parseFloat(employeeOverride.ot_rate_value) || 0) / 100);
+        }
+    } else if (overtime_rate_per_hour !== null) {
+        rate = parseFloat(overtime_rate_per_hour);
+    } else {
+        // No employee override and no company-wide rate configured -
+        // same "not configured" no-op as before this migration.
         return;
     }
-    const { check_out_time, overtime_rate_per_hour } = policyRows[0];
 
     const checkOut = new Date(checkOutValue);
     if (Number.isNaN(checkOut.getTime())) return;
@@ -80,7 +132,6 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
         return;
     }
 
-    const rate = parseFloat(overtime_rate_per_hour);
     const amount = overtimeHours * rate;
 
     await pool.query(
@@ -102,6 +153,10 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
            status = IF(status = 'approved', status, 'pending')`,
         [companyId, employeeId, dateStr, checkOutValue, overtimeHours.toFixed(2), rate.toFixed(2), amount.toFixed(2)]
     );
+}
+
+function round2(n) {
+    return Math.round(n * 100) / 100;
 }
 
 module.exports = { computeAndRecordOvertime };

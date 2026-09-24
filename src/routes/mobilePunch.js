@@ -101,14 +101,16 @@ router.get('/', asyncHandler(async (req, res) => {
 // POST /mobile-punches - the phone submits HERE, never straight to
 // /attendance or /attendance/sync (see CONTEXT.md section 7: that's
 // the entire point of this queue existing).
-// body: { date, check_in?, check_out?, latitude?, longitude?, accuracy_meters?, remark?, employee_id? }
+// body: { date, check_in?, check_out?, latitude?, longitude?, accuracy_meters?, remark?, employee_id?, photo_base64? }
 // employee_id in the body is only honored for an admin caller (e.g. an
 // admin keying in a correction later, per migration_013's submitted_by
 // comment) - an 'employee' caller always gets their own id, ignoring
 // anything sent in the body, so this can't be used to submit on behalf
 // of someone else.
+// photo_base64 (migration_032) is entirely optional - a punch with no
+// photo attached must still succeed exactly as before this migration.
 router.post('/', asyncHandler(async (req, res) => {
-    const { date, check_in, check_out, latitude, longitude, accuracy_meters, remark } = req.body;
+    const { date, check_in, check_out, latitude, longitude, accuracy_meters, remark, photo_base64 } = req.body;
     if (!date) return res.status(400).json({ error: 'date required' });
     if (!check_in && !check_out) {
         return res.status(400).json({ error: 'At least one of check_in or check_out is required' });
@@ -125,11 +127,11 @@ router.post('/', asyncHandler(async (req, res) => {
 
     const [result] = await pool.query(
         `INSERT INTO mobile_punches
-            (company_id, employee_id, date, check_in, check_out, latitude, longitude, accuracy_meters, remark, submitted_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            (company_id, employee_id, date, check_in, check_out, latitude, longitude, accuracy_meters, photo_base64, remark, submitted_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
             req.user.companyId, employeeId, date, check_in || null, check_out || null,
-            latitude ?? null, longitude ?? null, accuracy_meters ?? null, remark || null, employeeId
+            latitude ?? null, longitude ?? null, accuracy_meters ?? null, photo_base64 || null, remark || null, employeeId
         ]
     );
     return res.status(201).json({ id: result.insertId });

@@ -169,4 +169,223 @@ module.exports = {
     loadShiftOffIndex,
     effectiveOffDaysBitmask,
     isAltSaturdayOff,
+    // Task 3 (multi-punch engine) + Task 4 (Office Time Policy v2)
+    // additions below. All new exports, nothing above this line
+    // changed in signature or behavior - routes/employees.js (not
+    // owned by this pass) imports loadWeeklyOffIndex/
+    // effectiveOffDaysBitmask/isAltSaturdayOff and keeps working
+    // exactly as before.
+    derivePunchSpan,
+    loadPunchEventsForDay,
+    loadPunchEventsIndex,
+    loadShiftPolicyIndex,
+    loadShiftPolicyOffIndex,
+    resolveShiftGrace,
+    isNthWeekdayOfMonthOff,
 };
+
+/**
+ * Task 3: derives {firstIn, lastOut, workMinutes} from one day's raw
+ * punch_events rows (migration_033). Implements the client's exact
+ * rule: full elapsed span (last punch-out minus first punch-in) by
+ * default - every gap, including lunch/stepping-out, counts as office
+ * time. When `deductBreaks` is true (the employee's shift's assigned
+ * Office Time Policy has deduct_break_hours_from_work_duration ON),
+ * every punch-out -> next punch-in gap is subtracted instead.
+ */
+function derivePunchSpan(events, deductBreaks) {
+    if (!events || events.length === 0) return { firstIn: null, lastOut: null, workMinutes: null };
+    const sorted = [...events].sort((a, b) => new Date(a.punch_time) - new Date(b.punch_time));
+    const ins = sorted.filter((e) => e.punch_type === 'in');
+    const outs = sorted.filter((e) => e.punch_type === 'out');
+    if (ins.length === 0 || outs.length === 0) {
+        // No complete in+out pair yet today (e.g. only a check-in so
+        // far) - nothing to span, matches classifyDay's existing
+        // "no checkout yet -> present, no hours check" behavior.
+        return {
+            firstIn: ins.length ? ins[0].punch_time : null,
+            lastOut: outs.length ? outs[outs.length - 1].punch_time : null,
+            workMinutes: null,
+        };
+    }
+
+    const firstIn = ins[0].punch_time;
+    const lastOut = outs[outs.length - 1].punch_time;
+    let workMinutes = Math.round((new Date(lastOut) - new Date(firstIn)) / 60000);
+
+    if (deductBreaks) {
+        for (let i = 0; i < sorted.length - 1; i++) {
+            const cur = sorted[i];
+            const next = sorted[i + 1];
+            if (cur.punch_type === 'out' && next.punch_type === 'in' && new Date(next.punch_time) < new Date(lastOut)) {
+                const gapMinutes = Math.round((new Date(next.punch_time) - new Date(cur.punch_time)) / 60000);
+                if (gapMinutes > 0) workMinutes -= gapMinutes;
+            }
+        }
+        if (workMinutes < 0) workMinutes = 0;
+    }
+
+    return { firstIn, lastOut, workMinutes };
+}
+
+function toDateStrLocal(d) {
+    if (d == null) return null;
+    return d instanceof Date ? d.toISOString().slice(0, 10) : String(d);
+}
+
+/** Single employee-day lookup - used by anywhere not already looping a date range. */
+async function loadPunchEventsForDay(companyId, employeeId, dateStr) {
+    const [rows] = await pool.query(
+        'SELECT punch_time, punch_type FROM punch_events WHERE company_id = ? AND employee_id = ? AND date = ? ORDER BY punch_time ASC',
+        [companyId, employeeId, dateStr]
+    );
+    return rows;
+}
+
+/**
+ * Batched version for report loops (monthly/weekly/daily reports
+ * iterate many employee-days) - one query per (companyId, fromDate,
+ * toDate) window instead of a query per employee-day, same batching
+ * reasoning as loadHolidayIndex/loadWeeklyOffIndex above.
+ */
+async function loadPunchEventsIndex(companyId, fromDateStr, toDateStr) {
+    const [rows] = await pool.query(
+        'SELECT employee_id, date, punch_time, punch_type FROM punch_events WHERE company_id = ? AND date BETWEEN ? AND ? ORDER BY punch_time ASC',
+        [companyId, fromDateStr, toDateStr]
+    );
+    const byKey = new Map();
+    for (const r of rows) {
+        const key = `${r.employee_id}|${toDateStrLocal(r.date)}`;
+        if (!byKey.has(key)) byKey.set(key, []);
+        byKey.get(key).push(r);
+    }
+    return {
+        forEmployeeDate(employeeId, dateStr) {
+            return byKey.get(`${employeeId}|${dateStr}`) || [];
+        },
+    };
+}
+
+/**
+ * Task 4: company-wide, batched map of shift_id -> its assigned Office
+ * Time Policy row's relevant fields (migration_034's
+ * office_time_policy_shifts join). A shift with no assigned policy
+ * simply won't appear in the map - callers fall back to the shift's
+ * own legacy columns (still physically present - see migration_034's
+ * header comment on why they weren't dropped) for those shifts.
+ */
+async function loadShiftPolicyIndex(companyId) {
+    const [rows] = await pool.query(
+        `SELECT ops.shift_id, p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences,
+                p.grace_late_coming_minutes, p.grace_early_going_minutes,
+                p.deduct_break_hours_from_work_duration
+         FROM office_time_policy_shifts ops
+         JOIN office_time_policies p ON p.id = ops.policy_id
+         WHERE ops.company_id = ?`,
+        [companyId]
+    );
+    const byShiftId = new Map(rows.map((r) => [r.shift_id, r]));
+    return {
+        has(shiftId) {
+            return byShiftId.has(shiftId);
+        },
+        deductBreaksFor(shiftId) {
+            const r = byShiftId.get(shiftId);
+            return !!(r && r.deduct_break_hours_from_work_duration);
+        },
+        graceFor(shiftId) {
+            const r = byShiftId.get(shiftId);
+            return {
+                lateGraceMinutes: r ? r.grace_late_coming_minutes || 0 : 0,
+                earlyGraceMinutes: r ? r.grace_early_going_minutes || 0 : 0,
+            };
+        },
+    };
+}
+
+/**
+ * Task 4 weekly-off half of loadShiftPolicyIndex, kept as its own
+ * function (rather than folded into loadShiftPolicyIndex) since
+ * reports.js's three off-days call sites (daily/monthly/weekly) don't
+ * all need the grace/deduct-breaks fields, only the weekly-off ones.
+ */
+async function loadShiftPolicyOffIndex(companyId) {
+    const [rows] = await pool.query(
+        `SELECT ops.shift_id, p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences
+         FROM office_time_policy_shifts ops
+         JOIN office_time_policies p ON p.id = ops.policy_id
+         WHERE ops.company_id = ?`,
+        [companyId]
+    );
+    const byShiftId = new Map(rows.map((r) => [r.shift_id, r]));
+    return {
+        has(shiftId) {
+            return byShiftId.has(shiftId);
+        },
+        offDaysBitmaskFor(shiftId) {
+            const r = byShiftId.get(shiftId);
+            if (!r) return 0;
+            let mask = 0;
+            if (r.weekly_off_1_day != null) mask |= (1 << r.weekly_off_1_day);
+            // Only folded into the plain weekly bitmask when there's no
+            // ordinal-occurrence restriction - an occurrence-restricted
+            // Weekly Off 2 is checked per-date via isWeeklyOff2Date
+            // instead (a day-of-week bit alone can't express "only the
+            // 1st and 3rd occurrence").
+            if (r.weekly_off_2_day != null && !r.weekly_off_2_occurrences) mask |= (1 << r.weekly_off_2_day);
+            return mask;
+        },
+        isWeeklyOff2Date(shiftId, dateStr) {
+            const r = byShiftId.get(shiftId);
+            if (!r || !r.weekly_off_2_occurrences) return false;
+            return isNthWeekdayOfMonthOff(dateStr, r.weekly_off_2_day, r.weekly_off_2_occurrences);
+        },
+    };
+}
+
+/**
+ * Single-shift, per-call grace lookup - matches resolveEffectiveShift's
+ * (routes/reports.js) own per-call style for the late-early/performance
+ * reports, which already loop employee-by-employee rather than
+ * batching. Falls back to the shift row's own now-legacy
+ * late_grace_minutes/early_grace_minutes when no policy is assigned to
+ * it yet, so an unassigned shift doesn't silently lose its grace
+ * configuration the moment migration_034 runs.
+ */
+async function resolveShiftGrace(companyId, shift) {
+    if (!shift) return { lateGraceMinutes: 0, earlyGraceMinutes: 0 };
+    const [rows] = await pool.query(
+        `SELECT p.grace_late_coming_minutes, p.grace_early_going_minutes
+         FROM office_time_policy_shifts ops
+         JOIN office_time_policies p ON p.id = ops.policy_id
+         WHERE ops.shift_id = ? AND ops.company_id = ? LIMIT 1`,
+        [shift.id, companyId]
+    );
+    if (rows.length > 0) {
+        return {
+            lateGraceMinutes: rows[0].grace_late_coming_minutes || 0,
+            earlyGraceMinutes: rows[0].grace_early_going_minutes || 0,
+        };
+    }
+    return { lateGraceMinutes: shift.late_grace_minutes || 0, earlyGraceMinutes: shift.early_grace_minutes || 0 };
+}
+
+/**
+ * Generalized version of isAltSaturdayOff (kept alongside it unchanged,
+ * for routes/employees.js - see the module.exports comment above) -
+ * same ordinal-occurrence rule, any weekday instead of hardcoded
+ * Saturday, for Office Time Policy's Weekly Off 2 field (a day picker
+ * plus occurrence checkboxes 1-5, not fixed to Saturday like the old
+ * shift-level alt_saturdays field was).
+ */
+function isNthWeekdayOfMonthOff(dateStr, weekday, occurrences) {
+    if (weekday == null || !occurrences) return false;
+    const d = new Date(`${dateStr}T00:00:00`);
+    if (d.getDay() !== weekday) return false;
+    const ordinal = Math.ceil(d.getDate() / 7);
+    return occurrences
+        .split(',')
+        .map((s) => parseInt(s.trim(), 10))
+        .filter((n) => !Number.isNaN(n))
+        .includes(ordinal);
+}

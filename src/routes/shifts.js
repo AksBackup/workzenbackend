@@ -51,13 +51,19 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     // migration's header comment for exactly what each one means and
     // what it does/doesn't affect). All are optional and default to
     // "inherit/off" at the DB level if omitted here.
+    //
+    // Task 4 / migration_034: weekly_off_bitmask, alt_saturdays,
+    // late_grace_minutes and early_grace_minutes are NO LONGER accepted
+    // here - per the client's explicit instruction, Office Time Policy
+    // is now the only place these are configured (see
+    // lib/screens/settings/office_time_screen.dart and
+    // routes/officeTimePolicy.js's new /policies routes). The columns
+    // still physically exist on this table (not dropped - see
+    // migration_034's header comment on why) but this route stops
+    // reading/writing them going forward; any value already stored on
+    // an existing shift is simply frozen at whatever it was.
     const {
-        weekly_off_bitmask = null,
-        // migration_027 - "1,3" style Nth-Saturday-of-month off, shift-wise.
-        alt_saturdays = null,
         ot_allowed = true,
-        late_grace_minutes = 0,
-        early_grace_minutes = 0,
         single_punch_policy = 'none',
         is_half_day_shift = false,
     } = req.body;
@@ -67,9 +73,9 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
     const [result] = await pool.query(
         `INSERT INTO shifts
-            (company_id, name, start_time, end_time, weekly_off_bitmask, alt_saturdays, ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, is_half_day_shift)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, name, start_time, end_time, weekly_off_bitmask, alt_saturdays, !!ot_allowed, late_grace_minutes, early_grace_minutes, single_punch_policy, !!is_half_day_shift]
+            (company_id, name, start_time, end_time, ot_allowed, single_punch_policy, is_half_day_shift)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, name, start_time, end_time, !!ot_allowed, single_punch_policy, !!is_half_day_shift]
     );
     return res.status(201).json({ id: result.insertId, name, start_time, end_time, is_default: false });
 }));
@@ -79,12 +85,13 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     // only DELETE is blocked for it. `is_default` itself is never
     // accepted here, so a client can't promote/demote a shift's
     // protected status through this route.
+    //
+    // Task 4 / migration_034: weekly_off_bitmask, alt_saturdays,
+    // late_grace_minutes, early_grace_minutes removed from this list -
+    // see the POST handler's comment above for why.
     const fields = [
         'name', 'start_time', 'end_time',
-        // migration_015 additions - see POST above / that migration's
-        // header comment.
-        'weekly_off_bitmask', 'alt_saturdays', 'ot_allowed', 'late_grace_minutes',
-        'early_grace_minutes', 'single_punch_policy', 'is_half_day_shift',
+        'ot_allowed', 'single_punch_policy', 'is_half_day_shift',
     ];
     if (req.body.single_punch_policy !== undefined &&
         !['none', 'absent', 'half_day', 'leave'].includes(req.body.single_punch_policy)) {

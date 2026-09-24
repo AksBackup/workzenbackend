@@ -40,8 +40,16 @@ router.get('/', asyncHandler(async (req, res) => {
  */
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled, branch_id,
-        phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id } = req.body;
+        phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id,
+        pf_percent, epf_percent, esi_percent, pf_limit, ot_rate_type, ot_rate_value, tds_amount, tds_percent, statutory_override_active } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
+
+    // migration_035 - Employee Extra Details v2 (statutory/OT overrides).
+    // ot_rate_type is single-select like id_proof_type above - only
+    // meaningful together with a value, and only one of 'fixed'/'percentage'.
+    if (ot_rate_type !== undefined && ot_rate_type !== null && !['fixed', 'percentage'].includes(ot_rate_type)) {
+        return res.status(400).json({ error: "ot_rate_type must be 'fixed' or 'percentage'" });
+    }
 
     // id_proof_type is single-select (whichever one document the
     // employee actually provided - Aadhaar OR PAN OR Voter ID, never
@@ -96,15 +104,19 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         const [result] = await conn.query(
             `INSERT INTO employees
              (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, category_id, remote_location_enabled, branch_id,
-              phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+              phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id,
+              pf_percent, epf_percent, esi_percent, pf_limit, ot_rate_type, ot_rate_value, tds_amount, tds_percent, statutory_override_active, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, name, designation || null, department || null,
                 department_id || null, designation_id || null, shift_id || null,
                 doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null,
                 category_id || null, !!remote_location_enabled, branch_id || null,
                 phone || null, personal_email || null, office_email || null, address || null,
                 id_proof_type || null, id_proof_number || null, bank_account_holder || null,
-                bank_account_no || null, bank_ifsc || null, bank_name || null, assigned_device_id || null]
+                bank_account_no || null, bank_ifsc || null, bank_name || null, assigned_device_id || null,
+                pf_percent ?? null, epf_percent ?? null, esi_percent ?? null, pf_limit ?? null,
+                ot_rate_type || null, ot_rate_value ?? null, tds_amount ?? null, tds_percent ?? null,
+                !!statutory_override_active]
         );
 
         await conn.commit();
@@ -274,11 +286,20 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     // migration_024 (Employees > Extra Details); assigned_device_id
     // added by migration_025 (which registered device this employee's
     // data was pushed to).
+    // pf_percent/epf_percent/esi_percent/pf_limit/ot_rate_type/
+    // ot_rate_value/tds_amount/tds_percent/statutory_override_active
+    // added by migration_035 (Employee Extra Details v2 - per-employee
+    // statutory/OT overrides; see that migration's header comment).
     const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled', 'branch_id',
-        'phone', 'personal_email', 'office_email', 'address', 'id_proof_type', 'id_proof_number', 'bank_account_holder', 'bank_account_no', 'bank_ifsc', 'bank_name', 'assigned_device_id'];
+        'phone', 'personal_email', 'office_email', 'address', 'id_proof_type', 'id_proof_number', 'bank_account_holder', 'bank_account_no', 'bank_ifsc', 'bank_name', 'assigned_device_id',
+        'pf_percent', 'epf_percent', 'esi_percent', 'pf_limit', 'ot_rate_type', 'ot_rate_value', 'tds_amount', 'tds_percent', 'statutory_override_active'];
     if (req.body.id_proof_type !== undefined && req.body.id_proof_type !== null
         && !['aadhaar', 'pan', 'voter_id'].includes(req.body.id_proof_type)) {
         return res.status(400).json({ error: 'id_proof_type must be one of: aadhaar, pan, voter_id' });
+    }
+    if (req.body.ot_rate_type !== undefined && req.body.ot_rate_type !== null
+        && !['fixed', 'percentage'].includes(req.body.ot_rate_type)) {
+        return res.status(400).json({ error: "ot_rate_type must be 'fixed' or 'percentage'" });
     }
     const updates = [];
     const values = [];

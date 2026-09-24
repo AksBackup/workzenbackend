@@ -74,13 +74,39 @@ async function computeMonthlyPayroll(companyId, year, month) {
     const isFutureMonth = year > now.getFullYear() || (year === now.getFullYear() && month > now.getMonth() + 1);
     const daysToCount = isFutureMonth ? 0 : (isCurrentMonth ? now.getDate() : daysInMonth);
 
-    const [employees] = await pool.query(
-        `SELECT e.id, e.name, e.emp_code, e.salary, d.default_salary
-         FROM employees e
-         LEFT JOIN designations d ON d.id = e.designation_id
-         WHERE e.company_id = ? AND e.status = 'active'`,
-        [companyId]
-    );
+    // pf_percent/epf_percent/esi_percent/pf_limit/tds_amount/tds_percent/
+    // statutory_override_active added by migration_035 - per-employee
+    // overrides of the company-wide Statutory Settings, applied below in
+    // computeStatutoryDeductions only when statutory_override_active is
+    // true (see that function's header comment). Wrapped in a try/catch
+    // with the same defensive fallback as the statutory_settings block
+    // further down, since migration_035 may not have been run yet on an
+    // older DB.
+    let employees;
+    try {
+        [employees] = await pool.query(
+            `SELECT e.id, e.name, e.emp_code, e.salary, d.default_salary,
+                    e.pf_percent, e.epf_percent, e.esi_percent, e.pf_limit,
+                    e.tds_amount, e.tds_percent, e.statutory_override_active
+             FROM employees e
+             LEFT JOIN designations d ON d.id = e.designation_id
+             WHERE e.company_id = ? AND e.status = 'active'`,
+            [companyId]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+        // migration_035 not applied yet - fall back to the pre-migration
+        // column set; every employee is simply treated as having no
+        // statutory/OT override (same as statutory_override_active being
+        // false for everyone).
+        [employees] = await pool.query(
+            `SELECT e.id, e.name, e.emp_code, e.salary, d.default_salary
+             FROM employees e
+             LEFT JOIN designations d ON d.id = e.designation_id
+             WHERE e.company_id = ? AND e.status = 'active'`,
+            [companyId]
+        );
+    }
 
     const [policyRows] = await pool.query(
         'SELECT full_day_hours, half_day_min_hours FROM office_time_policy WHERE company_id = ?',
@@ -274,7 +300,12 @@ async function computeMonthlyPayroll(companyId, year, month) {
         // deduction, not charged on bonus/overtime. ESI and PT are
         // conventionally checked against gross pay instead (basic +
         // allowances + bonus + overtime), so they use totalPay.
-        const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, roundedBasePay, totalPay);
+        const employeeOverride = emp.statutory_override_active === undefined ? null : {
+            active: !!emp.statutory_override_active,
+            pfPercent: emp.pf_percent, epfPercent: emp.epf_percent, esiPercent: emp.esi_percent,
+            pfLimit: emp.pf_limit, tdsAmount: emp.tds_amount, tdsPercent: emp.tds_percent,
+        };
+        const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, roundedBasePay, totalPay, employeeOverride);
 
         // Projected loan deduction (migration_028) - see the loanRows
         // comment above for why this is a preview only, not a write.
@@ -309,9 +340,13 @@ async function computeMonthlyPayroll(companyId, year, month) {
             esi_employee: statutory.esiEmployee,
             esi_employer: statutory.esiEmployer,
             pt_amount: statutory.ptAmount,
+            // migration_035 - per-employee TDS, only nonzero when this
+            // employee has an active statutory override with a TDS
+            // amount/percent set (see computeStatutoryDeductions above).
+            tds_amount: statutory.tdsAmount,
             loans: loanSummaries,
             loan_deduction: round2(loanDeduction),
-            net_pay: Math.round((totalPay - statutory.pfEmployee - statutory.esiEmployee - statutory.ptAmount - loanDeduction) * 100) / 100,
+            net_pay: Math.round((totalPay - statutory.pfEmployee - statutory.esiEmployee - statutory.ptAmount - statutory.tdsAmount - loanDeduction) * 100) / 100,
             is_paid: existing ? !!existing.is_paid : false,
             paid_on: existing ? existing.paid_on : null,
             // New (pass 2, see daysToCount comment above): lets the UI
@@ -333,23 +368,45 @@ async function computeMonthlyPayroll(companyId, year, month) {
  * comment for what each setting means; employer-side figures
  * (pf_employer/esi_employer) are informational company-cost numbers
  * only - they're never subtracted from what the employee is paid.
+ *
+ * `employeeOverride` (migration_035, optional/nullable): per-employee
+ * PF%/EPF%/ESI%/PF wage ceiling that override the company-wide
+ * settings above for this one employee, PLUS a TDS deduction
+ * (flat amount + percent of gross) that has no company-wide equivalent
+ * at all. Only applied when employeeOverride.active is true - an
+ * override value that was typed in but the "Active" checkbox left
+ * unticked has no effect, so filling in the fields doesn't
+ * accidentally start changing someone's pay. PF/ESI/PT *eligibility*
+ * (settings.pf_enabled/esi_enabled/pt_enabled) always stays
+ * company-wide - an override changes the rate/ceiling used, it can't
+ * turn on a scheme the company has switched off entirely.
  */
-function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, grossPay) {
+function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, grossPay, employeeOverride) {
+    const override = employeeOverride && employeeOverride.active ? employeeOverride : null;
 
     let pfEmployee = 0, pfEmployer = 0;
     if (settings.pf_enabled) {
+        const pfEmployeeRate = override && override.pfPercent !== null && override.pfPercent !== undefined
+            ? Number(override.pfPercent) : Number(settings.pf_employee_rate);
+        const pfEmployerRate = override && override.epfPercent !== null && override.epfPercent !== undefined
+            ? Number(override.epfPercent) : Number(settings.pf_employer_rate);
+        const pfCeiling = override && override.pfLimit !== null && override.pfLimit !== undefined
+            ? Number(override.pfLimit) : Number(settings.pf_wage_ceiling);
         let pfWage = basePayForPf;
-        if (settings.pf_apply_ceiling) pfWage = Math.min(pfWage, Number(settings.pf_wage_ceiling));
-        pfEmployee = round2(pfWage * Number(settings.pf_employee_rate) / 100);
-        pfEmployer = round2(pfWage * Number(settings.pf_employer_rate) / 100);
+        if (settings.pf_apply_ceiling) pfWage = Math.min(pfWage, pfCeiling);
+        pfEmployee = round2(pfWage * pfEmployeeRate / 100);
+        pfEmployer = round2(pfWage * pfEmployerRate / 100);
     }
 
     let esiEmployee = 0, esiEmployer = 0;
     // ESI is all-or-nothing on eligibility, not prorated at the
     // ceiling like PF: an employee over the wage ceiling simply isn't
-    // covered by ESI that month at all.
+    // covered by ESI that month at all. (The wage ceiling itself has no
+    // per-employee override - only the employee-side rate does.)
     if (settings.esi_enabled && grossPay <= Number(settings.esi_wage_ceiling)) {
-        esiEmployee = round2(grossPay * Number(settings.esi_employee_rate) / 100);
+        const esiEmployeeRate = override && override.esiPercent !== null && override.esiPercent !== undefined
+            ? Number(override.esiPercent) : Number(settings.esi_employee_rate);
+        esiEmployee = round2(grossPay * esiEmployeeRate / 100);
         esiEmployer = round2(grossPay * Number(settings.esi_employer_rate) / 100);
     }
 
@@ -363,7 +420,18 @@ function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, grossPay) {
         if (slab) ptAmount = round2(Number(slab.pt_amount));
     }
 
-    return { pfEmployee, pfEmployer, esiEmployee, esiEmployer, ptAmount };
+    // TDS (migration_035) - purely per-employee, no company-wide
+    // setting to fall back to, so it's simply 0 when there's no active
+    // override. Flat amount and percent-of-gross are additive (an
+    // employee can have either, both, or neither).
+    let tdsAmount = 0;
+    if (override) {
+        const flat = override.tdsAmount !== null && override.tdsAmount !== undefined ? Number(override.tdsAmount) : 0;
+        const pct = override.tdsPercent !== null && override.tdsPercent !== undefined ? Number(override.tdsPercent) : 0;
+        tdsAmount = round2(flat + (grossPay * pct / 100));
+    }
+
+    return { pfEmployee, pfEmployer, esiEmployee, esiEmployer, ptAmount, tdsAmount };
 }
 
 router.get('/', requireAdmin, asyncHandler(async (req, res) => {

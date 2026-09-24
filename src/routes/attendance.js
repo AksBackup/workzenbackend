@@ -7,6 +7,76 @@ const { computeAndRecordOvertime } = require('../utils/overtime');
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
+/**
+ * Task 3 (multi-punch engine, migration_033): records each
+ * check_in/check_out this call carries as its own row in punch_events,
+ * then recomputes attendance.check_in/check_out for that employee/day
+ * from EVERY punch_event on record for that day (not just this call's
+ * values) - earliest 'in' as check_in, latest 'out' as check_out. This
+ * replaces the old COALESCE-only upsert, which overwrote check_in on a
+ * second punch-in of the same day instead of preserving the first one
+ * - see migration_033's header comment for the full reasoning.
+ *
+ * attendance.check_in/check_out remain a single pair per day, so every
+ * EXISTING reader of them (payroll.js, most of reports.js, the Flutter
+ * app) keeps working unchanged and automatically gets the correct
+ * full-span hours - it's exactly first-in/last-out now, not "whatever
+ * the last call happened to send". The "Deduct Break Hours From Work
+ * Duration" exception (Office Time Policy, migration_034) needs the
+ * raw gaps between punches, which only routes/reports.js's GET /daily
+ * and classifyDay (both updated this pass) actually read from
+ * punch_events directly - every OTHER existing reader of
+ * check_in/check_out still gets the full-span number, not the
+ * gap-deducted one, until it's updated to do the same lookup. Flagging
+ * this plainly rather than silently patching every consumer (some of
+ * which - payroll.js - are explicitly out of this pass's owned files).
+ *
+ * Not wrapped in an explicit transaction (matches this file's existing
+ * style - neither POST / nor POST /sync used one before this pass
+ * either), so a genuinely simultaneous double-punch for the same
+ * employee/day is a known, pre-existing class of race this pass
+ * doesn't newly introduce or newly fix - flagged rather than silently
+ * assumed safe.
+ */
+async function recordPunchEventsAndDeriveAttendance({
+    companyId, employeeId, date, checkIn, checkOut, source, deviceId, verifyMode, syncedFromLocal,
+}) {
+    if (checkIn) {
+        await pool.query(
+            `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
+             VALUES (?, ?, ?, ?, 'in', ?, ?, ?)`,
+            [companyId, employeeId, date, checkIn, source || 'scanner', deviceId || null, verifyMode || 'unknown']
+        );
+    }
+    if (checkOut) {
+        await pool.query(
+            `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
+             VALUES (?, ?, ?, ?, 'out', ?, ?, ?)`,
+            [companyId, employeeId, date, checkOut, source || 'scanner', deviceId || null, verifyMode || 'unknown']
+        );
+    }
+    if (!checkIn && !checkOut) return;
+
+    const [events] = await pool.query(
+        'SELECT punch_time, punch_type FROM punch_events WHERE company_id = ? AND employee_id = ? AND date = ? ORDER BY punch_time ASC',
+        [companyId, employeeId, date]
+    );
+    const ins = events.filter((e) => e.punch_type === 'in');
+    const outs = events.filter((e) => e.punch_type === 'out');
+    const derivedCheckIn = ins.length ? ins[0].punch_time : null;
+    const derivedCheckOut = outs.length ? outs[outs.length - 1].punch_time : null;
+
+    await pool.query(
+        `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, verify_mode, synced_from_local)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           check_in = VALUES(check_in),
+           check_out = VALUES(check_out),
+           verify_mode = COALESCE(VALUES(verify_mode), verify_mode)`,
+        [companyId, employeeId, date, derivedCheckIn, derivedCheckOut, source || 'manual', deviceId || null, verifyMode || 'unknown', !!syncedFromLocal]
+    );
+}
+
 // Admin: any employee in the company (optionally filtered). Employee: only self.
 // Joins employees so callers (e.g. the app's Today/Yesterday/Calendar attendance
 // view) get a display name directly instead of having to cross-reference a
@@ -75,15 +145,11 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { employee_id, date, check_in, check_out, source, device_id, verify_mode } = req.body;
     if (!employee_id || !date) return res.status(400).json({ error: 'employee_id and date required' });
 
-    await pool.query(
-        `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, verify_mode)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE
-           check_in = COALESCE(VALUES(check_in), check_in),
-           check_out = COALESCE(VALUES(check_out), check_out),
-           verify_mode = COALESCE(VALUES(verify_mode), verify_mode)`,
-        [req.user.companyId, employee_id, date, check_in || null, check_out || null, source || 'manual', device_id || null, verify_mode || 'unknown']
-    );
+    await recordPunchEventsAndDeriveAttendance({
+        companyId: req.user.companyId, employeeId: employee_id, date,
+        checkIn: check_in || null, checkOut: check_out || null,
+        source: source || 'manual', deviceId: device_id || null, verifyMode: verify_mode || 'unknown',
+    });
     if (check_out) {
         // Best-effort - a failure here shouldn't fail the punch write
         // itself, which is the actual attendance record of record.
@@ -139,16 +205,11 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
         const source = VALID_ATTENDANCE_SOURCES.has(r.source) ? r.source : 'scanner';
         const verifyMode = VALID_VERIFY_MODES.has(r.verify_mode) ? r.verify_mode : 'unknown';
         try {
-            await pool.query(
-                `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, verify_mode, synced_from_local)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)
-                 ON DUPLICATE KEY UPDATE
-                   check_in = COALESCE(VALUES(check_in), check_in),
-                   check_out = COALESCE(VALUES(check_out), check_out),
-                   verify_mode = COALESCE(VALUES(verify_mode), verify_mode)`,
-                [req.user.companyId, r.employee_id, r.date, r.check_in || null, r.check_out || null,
-                    source, r.device_id || null, verifyMode]
-            );
+            await recordPunchEventsAndDeriveAttendance({
+                companyId: req.user.companyId, employeeId: r.employee_id, date: r.date,
+                checkIn: r.check_in || null, checkOut: r.check_out || null,
+                source, deviceId: r.device_id || null, verifyMode, syncedFromLocal: true,
+            });
             succeeded.push(r);
         } catch (err) {
             console.error('Sync failed for one record:', { employee_id: r.employee_id, date: r.date, error: err.message });
