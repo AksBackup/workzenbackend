@@ -301,6 +301,36 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         && !['fixed', 'percentage'].includes(req.body.ot_rate_type)) {
         return res.status(400).json({ error: "ot_rate_type must be 'fixed' or 'percentage'" });
     }
+    // Payment Setup integration fix: `salary` used to be applied
+    // unconditionally from whatever this form's own Salary field
+    // happened to hold. routes/salaryStructures.js separately
+    // overwrites this exact same column with
+    // addition_total - deduction_total on every Payment Setup save
+    // (see that file's header comment) - two screens writing the same
+    // column with no coordination meant a routine Edit Employee save
+    // (changing a phone number, say) could silently blow away a
+    // gross salary that Payment Setup had computed, with no warning
+    // either screen ever showed. Once Payment Setup has been used for
+    // an employee (salary_heads has rows), it becomes the only place
+    // that may change employees.salary - a `salary` field in this
+    // request is now silently dropped (not applied) rather than
+    // written, and callers are told so via `warnings` in the response
+    // so this isn't a silent no-op from the admin's point of view.
+    let salaryWarning = null;
+    if (req.body.salary !== undefined) {
+        const [headRows] = await pool.query(
+            'SELECT 1 FROM salary_heads WHERE employee_id = ? AND company_id = ? LIMIT 1',
+            [req.params.id, req.user.companyId]
+        ).catch(err => {
+            if (err.code === 'ER_NO_SUCH_TABLE') return [[]]; // migration_035 not applied yet - nothing to protect against yet
+            throw err;
+        });
+        if (headRows.length > 0) {
+            salaryWarning = 'Salary was not changed here - this employee has a Payment Setup salary structure, edit it from Payment Setup instead.';
+            delete req.body.salary;
+        }
+    }
+
     const updates = [];
     const values = [];
     fields.forEach(f => {
@@ -328,7 +358,14 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         empCodeChanging = true;
     }
 
-    if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+    if (updates.length === 0) {
+        // Only reachable with nothing left to update if `salary` was the
+        // ONLY field sent and the guard above just dropped it - that's a
+        // successful, expected outcome (Payment Setup wins), not a
+        // client error, so respond 200 with the warning instead of 400.
+        if (salaryWarning) return res.json({ message: 'No changes applied', warnings: [salaryWarning] });
+        return res.status(400).json({ error: 'No fields to update' });
+    }
 
     // Any change to name or emp_code invalidates whatever's currently on
     // the device for this employee - force the push button to re-enable
@@ -343,7 +380,7 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         `UPDATE employees SET ${updates.join(', ')} WHERE id = ? AND company_id = ?`,
         values
     );
-    return res.json({ message: 'Updated' });
+    return res.json(salaryWarning ? { message: 'Updated', warnings: [salaryWarning] } : { message: 'Updated' });
 }));
 
 /**

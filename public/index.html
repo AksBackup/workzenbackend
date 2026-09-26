@@ -5,152 +5,587 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HRMS License Admin</title>
 <style>
-  :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80; --red:#f87171; }
+  :root { --bg:#0f172a; --card:#1e293b; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --green:#4ade80; --red:#f87171; --amber:#fbbf24; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 32px; }
   h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 0 0 12px; }
   .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 24px; max-width: 900px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 24px; max-width: 1100px; }
   .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
   label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-  input { background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
+  input, select { background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 13px; }
   button { background: var(--accent); color: #0f172a; border: none; padding: 9px 16px; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; }
   button.secondary { background: var(--border); color: var(--text); }
   button.danger { background: var(--red); color: #0f172a; }
+  button.warn { background: var(--amber); color: #0f172a; }
+  button:disabled { opacity: 0.5; cursor: default; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; }
-  .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
+  .badge { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
   .badge.unused { background: #334155; color: var(--muted); }
   .badge.active { background: rgba(74,222,128,0.15); color: var(--green); }
-  .badge.revoked, .badge.expired { background: rgba(248,113,113,0.15); color: var(--red); }
-  .keyval { font-family: monospace; font-size: 13px; letter-spacing: 0.5px; }
+  .badge.revoked, .badge.expired, .badge.disabled { background: rgba(248,113,113,0.15); color: var(--red); }
+  .badge.super_admin { background: rgba(56,189,248,0.15); color: var(--accent); }
+  .badge.admin { background: #334155; color: var(--muted); }
+  .keyval { font-family: monospace; font-size: 12.5px; letter-spacing: 0.3px; }
+  .muted { color: var(--muted); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--border); max-width: 1100px; }
+  .tab { padding: 10px 16px; font-size: 13px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .err { color: var(--red); font-size: 12.5px; margin-top: 8px; }
+  .ok { color: var(--green); font-size: 12.5px; margin-top: 8px; }
   #gateScreen { max-width: 380px; margin: 100px auto; }
   #mainScreen { display: none; }
+  .keys-out { background:#0f172a; border:1px solid var(--border); border-radius:6px; padding:10px; margin-top:10px; font-family:monospace; font-size:12.5px; white-space:pre-wrap; word-break:break-all; }
+  .topbar { display:flex; justify-content:space-between; align-items:center; max-width:1100px; margin-bottom: 8px; }
+  .whoami { font-size:12px; color: var(--muted); }
 </style>
 </head>
 <body>
 
 <div id="gateScreen">
   <h1>HRMS License Admin</h1>
-  <p class="subtitle">Internal tool &mdash; enter the panel secret to continue</p>
+  <p class="subtitle">Internal tool &mdash; sign in to continue</p>
   <div class="card">
-    <label for="panelKey">Panel Secret</label>
-    <input type="password" id="panelKey" style="width:100%; margin-bottom: 12px;">
-    <button onclick="unlockPanel()" style="width:100%;">Unlock</button>
+    <label for="loginEmail">Email</label>
+    <input type="email" id="loginEmail" style="width:100%; margin-bottom: 12px;">
+    <label for="loginPassword">Password</label>
+    <input type="password" id="loginPassword" style="width:100%; margin-bottom: 12px;">
+    <button onclick="login()" style="width:100%;">Sign in</button>
+    <div id="loginError" class="err"></div>
+    <p class="subtitle" style="margin: 16px 0 4px;">Break-glass (legacy panel secret, no named account)</p>
+    <div class="row">
+      <input type="password" id="legacyKey" placeholder="PANEL_SECRET" style="flex:1;">
+      <button class="secondary" onclick="legacyLogin()">Use secret</button>
+    </div>
   </div>
 </div>
 
 <div id="mainScreen">
-  <h1>HRMS License Admin</h1>
-  <p class="subtitle">Generate and manage license keys &mdash; one company, one license, one admin</p>
-
-  <div class="card">
-    <div class="row">
-      <div>
-        <label for="maxEmployees">Max Employees</label>
-        <input type="number" id="maxEmployees" value="50">
-      </div>
-      <div>
-        <label for="expiresDays">Expires In (days, blank = never)</label>
-        <input type="number" id="expiresDays" placeholder="365">
-      </div>
-      <button onclick="generateKey()">Generate License Key</button>
+  <div class="topbar">
+    <div>
+      <h1>HRMS License Admin</h1>
+      <p class="subtitle" style="margin-bottom:0;">Generate and manage license keys</p>
+    </div>
+    <div class="whoami">
+      <span id="whoamiText">&nbsp;</span>
+      &nbsp;&middot;&nbsp;
+      <a href="#" onclick="logout(); return false;" style="color: var(--accent);">Sign out</a>
     </div>
   </div>
 
-  <div class="card">
-    <div style="display:flex; justify-content:space-between; align-items:center;">
-      <strong>All Licenses</strong>
-      <button class="secondary" onclick="loadLicenses()">Refresh</button>
-    </div>
-    <table>
-      <thead>
-        <tr>
-          <th>Key</th><th>Company</th><th>Status</th><th>Max Emp.</th><th>Expires</th><th>Activated</th><th></th>
-        </tr>
-      </thead>
-      <tbody id="licenseTableBody"></tbody>
-    </table>
+  <div class="tabs" id="tabBar">
+    <div class="tab active" data-tab="licenses" onclick="showTab('licenses')">Licenses</div>
+    <div class="tab" data-tab="companies" onclick="showTab('companies')" data-super-only>Companies</div>
+    <div class="tab" data-tab="admins" onclick="showTab('admins')" data-super-only>Panel Admins</div>
+    <div class="tab" data-tab="audit" onclick="showTab('audit')" data-super-only>Audit Log</div>
   </div>
+
+  <!-- ===================== LICENSES TAB ===================== -->
+  <div class="tab-panel active" id="tab-licenses">
+    <div class="card">
+      <h2>Generate a single license (one company)</h2>
+      <div class="row">
+        <div>
+          <label for="maxEmployees">Max Employees</label>
+          <input type="number" id="maxEmployees" value="50">
+        </div>
+        <div>
+          <label for="expiresDays">Expires In (days, blank = never)</label>
+          <input type="number" id="expiresDays" placeholder="365">
+        </div>
+        <button onclick="generateKey()">Generate License Key</button>
+      </div>
+      <div id="generateKeyOut"></div>
+    </div>
+
+    <div class="card">
+      <h2>Generate a batch (multiple PCs, one company + admin email)</h2>
+      <p class="subtitle" style="margin-bottom:12px;">Every key in a batch shares the same company name and admin email. The first key activated creates the company; every other key in the batch just registers another PC under it.</p>
+      <div class="row">
+        <div>
+          <label for="batchCompanyName">Company Name</label>
+          <input type="text" id="batchCompanyName" placeholder="Acme Textiles">
+        </div>
+        <div>
+          <label for="batchAdminEmail">Admin Email</label>
+          <input type="email" id="batchAdminEmail" placeholder="admin@acme.com">
+        </div>
+        <div>
+          <label for="batchMaxEmployees">Max Employees</label>
+          <input type="number" id="batchMaxEmployees" value="50">
+        </div>
+        <div>
+          <label for="batchCount">Number of Keys (PCs)</label>
+          <input type="number" id="batchCount" value="5" min="1" max="200">
+        </div>
+        <div>
+          <label for="batchExpiresDays">Expires In (days, blank = never)</label>
+          <input type="number" id="batchExpiresDays" placeholder="365">
+        </div>
+        <button onclick="generateBatch()">Generate Batch</button>
+      </div>
+      <div id="generateBatchOut"></div>
+    </div>
+
+    <div class="card">
+      <h2>Add more keys to an existing batch</h2>
+      <div class="row">
+        <div>
+          <label for="addKeysBatchId">Batch ID</label>
+          <input type="number" id="addKeysBatchId" placeholder="see Batch ID column below">
+        </div>
+        <div>
+          <label for="addKeysCount">Additional Keys</label>
+          <input type="number" id="addKeysCount" value="1" min="1" max="200">
+        </div>
+        <button onclick="addKeysToBatch()">Add Keys</button>
+      </div>
+      <div id="addKeysOut"></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>All Licenses</strong>
+        <button class="secondary" onclick="loadLicenses()">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Key</th><th>Company</th><th>Batch</th><th>Status</th><th>Max Emp.</th><th>Expires</th><th>Activated</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="licenseTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===================== COMPANIES TAB (super_admin) ===================== -->
+  <div class="tab-panel" id="tab-companies">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>All Companies</strong>
+        <button class="secondary" onclick="loadCompanies()">Refresh</button>
+      </div>
+      <p class="subtitle" style="margin: 8px 0 0;">Feature locks apply to every user at that company, admins included. Toggling takes effect on their next screen load.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Company</th><th>Code</th><th>Admin</th><th>Active Employees</th><th>Licenses</th><th>Payroll</th><th>Geofence</th>
+          </tr>
+        </thead>
+        <tbody id="companyTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===================== PANEL ADMINS TAB (super_admin) ===================== -->
+  <div class="tab-panel" id="tab-admins">
+    <div class="card">
+      <h2>Create a panel account</h2>
+      <div class="row">
+        <div>
+          <label for="newAdminName">Name</label>
+          <input type="text" id="newAdminName">
+        </div>
+        <div>
+          <label for="newAdminEmail">Email</label>
+          <input type="email" id="newAdminEmail">
+        </div>
+        <div>
+          <label for="newAdminPassword">Password</label>
+          <input type="password" id="newAdminPassword">
+        </div>
+        <div>
+          <label for="newAdminRole">Role</label>
+          <select id="newAdminRole">
+            <option value="admin">admin</option>
+            <option value="super_admin">super_admin</option>
+          </select>
+        </div>
+        <button onclick="createPanelAdmin()">Create</button>
+      </div>
+      <div id="createAdminOut"></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>Panel Accounts</strong>
+        <button class="secondary" onclick="loadPanelAdmins()">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Created</th><th></th></tr>
+        </thead>
+        <tbody id="adminsTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===================== AUDIT LOG TAB (super_admin) ===================== -->
+  <div class="tab-panel" id="tab-audit">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>Audit Log</strong>
+        <button class="secondary" onclick="loadAuditLog()">Refresh</button>
+      </div>
+      <p class="subtitle" style="margin: 8px 0 0;">Every generate / revoke / renew / feature-flag / account-management action, newest first.</p>
+      <table>
+        <thead>
+          <tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th></tr>
+        </thead>
+        <tbody id="auditTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
 </div>
 
 <script>
   const API_BASE = window.location.origin;
+  let ME = null; // { admin, role, via } from GET /panel/me
 
-  function getSecret() { return localStorage.getItem('panelSecret') || ''; }
+  function getToken() { return localStorage.getItem('panelToken') || ''; }
+  function getLegacyKey() { return localStorage.getItem('panelLegacyKey') || ''; }
 
-  function unlockPanel() {
-    const key = document.getElementById('panelKey').value.trim();
-    if (!key) return;
-    localStorage.setItem('panelSecret', key);
-    checkAccess();
+  /** One shared fetch wrapper: Bearer token first, legacy x-panel-key as fallback (mirrors adminPanelAuth.js's own priority). Never send both. */
+  async function panelFetch(path, opts) {
+    opts = opts || {};
+    const headers = Object.assign({}, opts.headers || {});
+    const token = getToken();
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    } else {
+      headers['x-panel-key'] = getLegacyKey();
+    }
+    const res = await fetch(`${API_BASE}${path}`, Object.assign({}, opts, { headers }));
+    if (res.status === 401) {
+      // Session expired/invalid - drop back to the gate screen rather
+      // than silently failing every subsequent call.
+      logout();
+      throw new Error('Session expired. Please sign in again.');
+    }
+    return res;
   }
 
-  async function checkAccess() {
+  function setText(id, text) { const el = document.getElementById(id); if (el) el.textContent = text; }
+
+  async function login() {
+    setText('loginError', '');
+    const email = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPassword').value;
+    if (!email || !password) { setText('loginError', 'Enter email and password.'); return; }
     try {
-      const res = await fetch(`${API_BASE}/license/admin/list`, {
-        headers: { 'x-panel-key': getSecret() }
+      const res = await fetch(`${API_BASE}/panel/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
       });
-      if (res.ok) {
-        document.getElementById('gateScreen').style.display = 'none';
-        document.getElementById('mainScreen').style.display = 'block';
-        loadLicenses();
-      } else {
-        localStorage.removeItem('panelSecret');
-      }
-    } catch (e) { /* server unreachable, stay on gate screen */ }
+      const data = await res.json();
+      if (!res.ok) { setText('loginError', data.error || 'Login failed.'); return; }
+      localStorage.setItem('panelToken', data.token);
+      localStorage.removeItem('panelLegacyKey');
+      await afterLogin();
+    } catch (e) {
+      setText('loginError', String(e));
+    }
   }
+
+  function legacyLogin() {
+    const key = document.getElementById('legacyKey').value.trim();
+    if (!key) return;
+    localStorage.setItem('panelLegacyKey', key);
+    localStorage.removeItem('panelToken');
+    afterLogin();
+  }
+
+  async function logout() {
+    try { await panelFetch('/panel/logout', { method: 'POST' }); } catch (e) { /* best-effort */ }
+    localStorage.removeItem('panelToken');
+    localStorage.removeItem('panelLegacyKey');
+    document.getElementById('mainScreen').style.display = 'none';
+    document.getElementById('gateScreen').style.display = 'block';
+  }
+
+  async function afterLogin() {
+    try {
+      const res = await panelFetch('/panel/me');
+      if (!res.ok) throw new Error('not authorized');
+      ME = await res.json();
+    } catch (e) {
+      // Legacy PANEL_SECRET path still works even if /panel/me somehow
+      // isn't reachable - fall back to "super_admin, unnamed" rather
+      // than bouncing back to the gate screen on a working secret.
+      ME = { admin: null, role: 'super_admin', via: 'legacy_panel_secret' };
+    }
+    document.getElementById('gateScreen').style.display = 'none';
+    document.getElementById('mainScreen').style.display = 'block';
+    setText('whoamiText', ME.admin ? `${ME.admin.name} (${ME.role})` : `Legacy panel secret (${ME.role})`);
+    document.querySelectorAll('[data-super-only]').forEach(el => {
+      el.style.display = ME.role === 'super_admin' ? '' : 'none';
+    });
+    loadLicenses();
+  }
+
+  function showTab(name) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === `tab-${name}`));
+    if (name === 'licenses') loadLicenses();
+    if (name === 'companies') loadCompanies();
+    if (name === 'admins') loadPanelAdmins();
+    if (name === 'audit') loadAuditLog();
+  }
+
+  // ---------------- Licenses tab ----------------
 
   async function generateKey() {
     const max_employees = parseInt(document.getElementById('maxEmployees').value, 10) || 50;
     const expiresDaysVal = document.getElementById('expiresDays').value;
     const expires_in_days = expiresDaysVal ? parseInt(expiresDaysVal, 10) : null;
-
-    const res = await fetch(`${API_BASE}/license/admin/generate`, {
+    const res = await panelFetch('/license/admin/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-panel-key': getSecret() },
-      body: JSON.stringify({ max_employees, expires_in_days })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_employees, expires_in_days }),
     });
+    const data = await res.json();
     if (res.ok) {
-      const data = await res.json();
-      alert(`New license key: ${data.license_key}`);
+      document.getElementById('generateKeyOut').innerHTML = `<div class="ok">New license key: <span class="keyval">${data.license_key}</span></div>`;
       loadLicenses();
     } else {
-      alert('Failed to generate key');
+      document.getElementById('generateKeyOut').innerHTML = `<div class="err">${data.error || 'Failed to generate key'}</div>`;
+    }
+  }
+
+  async function generateBatch() {
+    const company_name = document.getElementById('batchCompanyName').value.trim();
+    const admin_email = document.getElementById('batchAdminEmail').value.trim();
+    const number_of_employees = parseInt(document.getElementById('batchMaxEmployees').value, 10) || 50;
+    const number_of_license_keys = parseInt(document.getElementById('batchCount').value, 10) || 1;
+    const expiresDaysVal = document.getElementById('batchExpiresDays').value;
+    const expires_in_days = expiresDaysVal ? parseInt(expiresDaysVal, 10) : null;
+    const out = document.getElementById('generateBatchOut');
+    if (!company_name || !admin_email) { out.innerHTML = '<div class="err">Company name and admin email are required.</div>'; return; }
+    const res = await panelFetch('/license/admin/generate-batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ company_name, admin_email, number_of_employees, number_of_license_keys, expires_in_days }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      out.innerHTML = `<div class="ok">Batch #${data.batch_id} created with ${data.license_keys.length} key(s):</div>` +
+        `<div class="keys-out">${data.license_keys.join('\n')}</div>`;
+      loadLicenses();
+    } else {
+      out.innerHTML = `<div class="err">${data.error || 'Failed to generate batch'}</div>`;
+    }
+  }
+
+  async function addKeysToBatch() {
+    const batchId = parseInt(document.getElementById('addKeysBatchId').value, 10);
+    const count = parseInt(document.getElementById('addKeysCount').value, 10) || 1;
+    const out = document.getElementById('addKeysOut');
+    if (!batchId) { out.innerHTML = '<div class="err">Enter a batch ID (see the Batch column below).</div>'; return; }
+    const res = await panelFetch(`/license/admin/batches/${batchId}/add-keys`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      out.innerHTML = `<div class="ok">${data.license_keys.length} key(s) added:</div><div class="keys-out">${data.license_keys.join('\n')}</div>`;
+      loadLicenses();
+    } else {
+      out.innerHTML = `<div class="err">${data.error || 'Failed to add keys'}</div>`;
     }
   }
 
   async function loadLicenses() {
-    const res = await fetch(`${API_BASE}/license/admin/list`, {
-      headers: { 'x-panel-key': getSecret() }
-    });
+    const res = await panelFetch('/license/admin/list');
     if (!res.ok) return;
     const rows = await res.json();
     const tbody = document.getElementById('licenseTableBody');
-    tbody.innerHTML = rows.map(r => `
+    tbody.innerHTML = rows.map(r => {
+      const companyLabel = r.company_name || (r.batch_company_name ? `<span class="muted">${r.batch_company_name} (not yet activated)</span>` : '<span class="muted">unassigned</span>');
+      const batchLabel = r.license_batch_id ? `#${r.license_batch_id}<br><span class="muted">${r.batch_admin_email || ''}</span>` : '<span class="muted">&mdash;</span>';
+      const actions = [];
+      if (r.status === 'active') {
+        actions.push(`<button class="danger" onclick="revokeKey(${r.id})">Revoke</button>`);
+      }
+      if (r.status !== 'revoked') {
+        actions.push(`<button class="warn" onclick="renewKey(${r.id})">Renew</button>`);
+      }
+      return `
       <tr>
         <td class="keyval">${r.license_key}</td>
-        <td>${r.company_name || '<span style="color:var(--muted)">unassigned</span>'}</td>
+        <td>${companyLabel}</td>
+        <td>${batchLabel}</td>
         <td><span class="badge ${r.status}">${r.status}</span></td>
         <td>${r.max_employees}</td>
         <td>${r.expires_at ? new Date(r.expires_at).toLocaleDateString() : '&mdash;'}</td>
         <td>${r.activated_at ? new Date(r.activated_at).toLocaleDateString() : '&mdash;'}</td>
-        <td>${r.status === 'active' ? `<button class="danger" onclick="revokeKey(${r.id})">Revoke</button>` : ''}</td>
+        <td>${actions.join(' ')}</td>
+      </tr>
+    `;
+    }).join('');
+  }
+
+  async function revokeKey(id) {
+    if (!confirm('Revoke this license? That PC will lose access immediately.')) return;
+    await panelFetch(`/license/admin/revoke/${id}`, { method: 'POST' });
+    loadLicenses();
+  }
+
+  async function renewKey(id) {
+    const days = prompt('Extend by how many days?', '365');
+    if (!days) return;
+    const extend_days = parseInt(days, 10);
+    if (!extend_days || extend_days < 1) { alert('Enter a positive number of days.'); return; }
+    const res = await panelFetch(`/license/admin/renew/${id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ extend_days }),
+    });
+    const data = await res.json();
+    if (!res.ok) alert(data.error || 'Renew failed');
+    loadLicenses();
+  }
+
+  // ---------------- Companies tab ----------------
+
+  async function loadCompanies() {
+    const res = await panelFetch('/panel/companies');
+    if (!res.ok) return;
+    const rows = await res.json();
+    const tbody = document.getElementById('companyTableBody');
+    tbody.innerHTML = rows.map(r => {
+      const flags = r.feature_flags || {};
+      const payrollLocked = flags.payroll === false;
+      const geofenceLocked = flags.geofence === false;
+      return `
+      <tr>
+        <td>${r.name}<br><span class="muted">${r.company_code || ''}</span></td>
+        <td class="keyval">${r.company_code || '&mdash;'}</td>
+        <td>${r.admin_name || '<span class="muted">no admin yet</span>'}<br><span class="muted">${r.admin_email || ''}</span></td>
+        <td>${r.active_employee_count}</td>
+        <td>${r.active_license_count} active / ${r.license_count} total</td>
+        <td><button class="${payrollLocked ? 'warn' : 'secondary'}" onclick="toggleFeatureFlag(${r.id}, 'payroll', ${payrollLocked})">${payrollLocked ? 'Unlock' : 'Lock'}</button></td>
+        <td><button class="${geofenceLocked ? 'warn' : 'secondary'}" onclick="toggleFeatureFlag(${r.id}, 'geofence', ${geofenceLocked})">${geofenceLocked ? 'Unlock' : 'Lock'}</button></td>
+      </tr>
+    `;
+    }).join('');
+  }
+
+  async function toggleFeatureFlag(companyId, flagName, currentlyLocked) {
+    const body = {};
+    body[flagName] = currentlyLocked; // currently locked -> set to true (unlocked); currently unlocked -> set to false (lock it)
+    const res = await panelFetch(`/license/admin/companies/${companyId}/feature-flags`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { const data = await res.json(); alert(data.error || 'Failed to update'); }
+    loadCompanies();
+  }
+
+  // ---------------- Panel Admins tab ----------------
+
+  async function createPanelAdmin() {
+    const name = document.getElementById('newAdminName').value.trim();
+    const email = document.getElementById('newAdminEmail').value.trim();
+    const password = document.getElementById('newAdminPassword').value;
+    const role = document.getElementById('newAdminRole').value;
+    const out = document.getElementById('createAdminOut');
+    const res = await panelFetch('/panel/admins', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, email, password, role }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      out.innerHTML = '<div class="ok">Account created.</div>';
+      document.getElementById('newAdminName').value = '';
+      document.getElementById('newAdminEmail').value = '';
+      document.getElementById('newAdminPassword').value = '';
+      loadPanelAdmins();
+    } else {
+      out.innerHTML = `<div class="err">${data.error || 'Failed to create account'}</div>`;
+    }
+  }
+
+  async function loadPanelAdmins() {
+    const res = await panelFetch('/panel/admins');
+    if (!res.ok) return;
+    const rows = await res.json();
+    const tbody = document.getElementById('adminsTableBody');
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td>${r.name}</td>
+        <td>${r.email}</td>
+        <td><span class="badge ${r.role}">${r.role}</span></td>
+        <td><span class="badge ${r.status === 'disabled' ? 'disabled' : 'active'}">${r.status}</span></td>
+        <td>${new Date(r.created_at).toLocaleDateString()}</td>
+        <td>
+          <button class="secondary" onclick="resetPanelAdminPassword(${r.id})">Reset password</button>
+          <button class="${r.status === 'disabled' ? '' : 'danger'}" onclick="togglePanelAdminStatus(${r.id}, '${r.status}')">${r.status === 'disabled' ? 'Enable' : 'Disable'}</button>
+        </td>
       </tr>
     `).join('');
   }
 
-  async function revokeKey(id) {
-    if (!confirm('Revoke this license? The company will lose access.')) return;
-    await fetch(`${API_BASE}/license/admin/revoke/${id}`, {
-      method: 'POST',
-      headers: { 'x-panel-key': getSecret() }
+  async function togglePanelAdminStatus(id, currentStatus) {
+    const newStatus = currentStatus === 'disabled' ? 'active' : 'disabled';
+    if (newStatus === 'disabled' && !confirm('Disable this account? They will be signed out immediately.')) return;
+    const res = await panelFetch(`/panel/admins/${id}/status`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: newStatus }),
     });
-    loadLicenses();
+    if (!res.ok) { const data = await res.json(); alert(data.error || 'Failed to update'); }
+    loadPanelAdmins();
   }
 
-  checkAccess();
+  async function resetPanelAdminPassword(id) {
+    const password = prompt('New password (min 8 characters):');
+    if (!password) return;
+    const res = await panelFetch(`/panel/admins/${id}/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password }),
+    });
+    const data = await res.json();
+    if (!res.ok) alert(data.error || 'Failed to reset password');
+    else alert('Password reset. That account has been signed out everywhere.');
+  }
+
+  // ---------------- Audit Log tab ----------------
+
+  async function loadAuditLog() {
+    const res = await panelFetch('/panel/audit-log?limit=200');
+    if (!res.ok) return;
+    const rows = await res.json();
+    const tbody = document.getElementById('auditTableBody');
+    tbody.innerHTML = rows.map(r => `
+      <tr>
+        <td>${new Date(r.created_at).toLocaleString()}</td>
+        <td>${r.panel_admin_name || '<span class="muted">legacy panel secret</span>'}</td>
+        <td>${r.action}</td>
+        <td>${r.target_type} #${r.target_id ?? '&mdash;'}</td>
+        <td class="keyval">${r.detail ? JSON.stringify(r.detail) : ''}</td>
+      </tr>
+    `).join('');
+  }
+
+  // ---------------- Boot ----------------
+
+  (async function boot() {
+    if (getToken() || getLegacyKey()) {
+      await afterLogin();
+    }
+  })();
 </script>
 </body>
 </html>

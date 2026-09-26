@@ -57,10 +57,48 @@ router.get('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
     const deduction = heads.filter(h => h.head_type === 'deduction')
         .map(h => ({ id: h.id, head_name: h.head_name, amount: Number(h.amount), sort_order: h.sort_order }));
 
+    // Bonus <-> Payment Setup visibility (new feature request): "if a
+    // bonus is created for someone it should be automatically added as
+    // a head in Payment Setup and read the same value". Deliberately
+    // NOT written into `salary_heads` as a real addition row - heads
+    // are a permanent, recurring structure (this whole endpoint
+    // full-replaces them on every PUT), while a bonus from
+    // routes/bonuses.js is a one-off amount for one specific
+    // year/month. Silently inserting a "Bonus" head here would (a) keep
+    // recurring into every future month's payroll after the bonus
+    // period ends, since nothing would ever remove it, and (b) get
+    // silently deleted the next time the admin saves ANY unrelated
+    // heads change, since PUT does a full replace - neither is what
+    // "should be automatically added" was asking for. Instead this is
+    // a read-only, separate field showing the CURRENT bonus figure for
+    // ?year=&month= (defaults to today's month if omitted) - genuinely
+    // "the same value", live from routes/bonuses.js's own total,
+    // without corrupting the recurring structure. Included in
+    // gross_salary_with_bonus below so the number the admin sees here
+    // matches what routes/payroll.js will actually pay out for that
+    // month.
+    const bonusYear = Number(req.query.year) || new Date().getFullYear();
+    const bonusMonth = Number(req.query.month) || (new Date().getMonth() + 1);
+    let currentMonthBonus = 0;
+    try {
+        const [bonusRows] = await pool.query(
+            'SELECT COALESCE(SUM(amount), 0) AS total FROM bonuses WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?',
+            [req.user.companyId, req.params.employeeId, bonusYear, bonusMonth]
+        );
+        currentMonthBonus = Number(bonusRows[0].total);
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err; // bonuses table not migrated yet - treat as zero, same defensive fallback as the heads query above
+    }
+
+    const grossSalary = empRows[0].salary === null ? null : Number(empRows[0].salary);
     return res.json({
         addition,
         deduction,
-        gross_salary: empRows[0].salary === null ? null : Number(empRows[0].salary),
+        gross_salary: grossSalary,
+        current_month_bonus: currentMonthBonus,
+        current_month_bonus_year: bonusYear,
+        current_month_bonus_month: bonusMonth,
+        gross_salary_with_bonus: grossSalary === null ? null : grossSalary + currentMonthBonus,
     });
 }));
 

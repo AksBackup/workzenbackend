@@ -108,6 +108,35 @@ async function computeMonthlyPayroll(companyId, year, month) {
         );
     }
 
+    // Payment Setup integration fix: this used to only ever read
+    // employees.salary/designations.default_salary, with no visibility
+    // into whether an employee actually has Payment Setup heads
+    // configured at all (routes/salaryStructures.js writes
+    // addition_total - deduction_total into employees.salary on every
+    // save, so the FLAT NUMBER was already correct - what was missing
+    // is any way for this screen to show the breakdown behind that
+    // number, or to tell "Payment Setup was used" apart from "nobody
+    // ever touched Payment Setup, this is just the raw employees.salary
+    // field"). Fetched once for the whole company, not per-employee.
+    let salaryHeadTotals = [];
+    try {
+        [salaryHeadTotals] = await pool.query(
+            `SELECT employee_id,
+                    SUM(CASE WHEN head_type = 'addition' THEN amount ELSE 0 END) AS addition_total,
+                    SUM(CASE WHEN head_type = 'deduction' THEN amount ELSE 0 END) AS deduction_total
+             FROM salary_heads
+             WHERE company_id = ?
+             GROUP BY employee_id`,
+            [companyId]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+        // migration_035 not applied yet - every employee behaves as
+        // "no Payment Setup heads", same defensive fallback pattern
+        // salaryStructures.js itself already uses.
+    }
+    const salaryHeadsByEmp = new Map(salaryHeadTotals.map(r => [r.employee_id, r]));
+
     const [policyRows] = await pool.query(
         'SELECT full_day_hours, half_day_min_hours FROM office_time_policy WHERE company_id = ?',
         [companyId]
@@ -295,6 +324,16 @@ async function computeMonthlyPayroll(companyId, year, month) {
         const roundedBasePay = Math.round(basePay * 100) / 100;
         const totalPay = Math.round((basePay + bonus + overtimePay) * 100) / 100;
 
+        // Payment Setup breakdown for this employee (see the batched
+        // query above) - hasSalaryStructure lets the UI say plainly
+        // "this figure came from Payment Setup" vs "nobody has
+        // configured Payment Setup for this employee yet, this is just
+        // the flat Salary field" instead of presenting both the same
+        // way and leaving the admin to guess which one they're looking
+        // at.
+        const headsSummary = salaryHeadsByEmp.get(emp.id);
+        const hasSalaryStructure = !!headsSummary;
+
         // PF wages = the earned base pay for this period (already
         // prorated for absences/LOP above) - PF is a wage-linked
         // deduction, not charged on bonus/overtime. ESI and PT are
@@ -347,6 +386,9 @@ async function computeMonthlyPayroll(companyId, year, month) {
             loans: loanSummaries,
             loan_deduction: round2(loanDeduction),
             net_pay: Math.round((totalPay - statutory.pfEmployee - statutory.esiEmployee - statutory.ptAmount - statutory.tdsAmount - loanDeduction) * 100) / 100,
+            has_salary_structure: hasSalaryStructure,
+            addition_total: hasSalaryStructure ? round2(Number(headsSummary.addition_total)) : null,
+            deduction_total: hasSalaryStructure ? round2(Number(headsSummary.deduction_total)) : null,
             is_paid: existing ? !!existing.is_paid : false,
             paid_on: existing ? existing.paid_on : null,
             // New (pass 2, see daysToCount comment above): lets the UI
