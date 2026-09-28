@@ -153,10 +153,26 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
     const companyId = req.user.companyId;
     const { fullDayHours, halfDayMinHours } = await loadCompanyContext(companyId);
 
+    // migration_037: card_no (employees) and attendance_remarks feed the
+    // CardNo / Remark columns of daily_report.jpeg. Branch name comes
+    // from the existing branches table (migration_016).
     const [employees] = await pool.query(
-        "SELECT id, name, emp_code, department, shift_id, designation FROM employees WHERE company_id = ? AND status = 'active'",
+        `SELECT e.id, e.name, e.emp_code, e.department, e.shift_id, e.designation, e.card_no, b.name AS branch_name
+         FROM employees e LEFT JOIN branches b ON b.id = e.branch_id
+         WHERE e.company_id = ? AND e.status = 'active'`,
         [companyId]
     );
+    let remarkRows = [];
+    try {
+        [remarkRows] = await pool.query(
+            'SELECT employee_id, remark FROM attendance_remarks WHERE company_id = ? AND date = ?',
+            [companyId, date]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    const remarkByEmp = new Map(remarkRows.map(r => [r.employee_id, r.remark]));
+    const overtimeIndex = await loadOvertimeIndex(companyId, date, date);
     const [attendanceRows] = await pool.query(
         'SELECT employee_id, check_in, check_out FROM attendance WHERE company_id = ? AND date = ?',
         [companyId, date]
@@ -277,9 +293,44 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
             early_by_minutes: earlyByMinutes,
             work_minutes: workMinutes,
             status,
+            card_no: emp.card_no || null,
+            department: emp.department || null,
+            branch_name: emp.branch_name || null,
+            overtime_minutes: overtimeIndex.minutesFor(emp.id, date),
+            remark: remarkByEmp.get(emp.id) || null,
+            // Present in daily_report.jpeg but there is no thermal
+            // sensor data anywhere in this system - always null, the
+            // screen renders them as blank columns to match the layout.
+            in_temp: null,
+            out_temp: null,
         };
     });
     return res.json(result);
+}));
+
+/**
+ * PUT /reports/daily-remark - the Remark column of the Daily Report.
+ * body: { employee_id, date, remark }. Empty remark clears it. Kept in
+ * its own table (attendance_remarks) rather than a column on
+ * attendance so remarking an ABSENT employee doesn't create an
+ * attendance row that other logic could misread as a punch.
+ */
+router.put('/daily-remark', requireAdmin, asyncHandler(async (req, res) => {
+    const { employee_id, date, remark } = req.body;
+    if (!employee_id || !date) return res.status(400).json({ error: 'employee_id and date are required' });
+    const text = (remark || '').trim().slice(0, 255);
+    const [emp] = await pool.query('SELECT id FROM employees WHERE id = ? AND company_id = ?', [employee_id, req.user.companyId]);
+    if (emp.length === 0) return res.status(404).json({ error: 'Employee not found' });
+    if (text === '') {
+        await pool.query('DELETE FROM attendance_remarks WHERE company_id = ? AND employee_id = ? AND date = ?', [req.user.companyId, employee_id, date]);
+    } else {
+        await pool.query(
+            `INSERT INTO attendance_remarks (company_id, employee_id, date, remark) VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE remark = VALUES(remark)`,
+            [req.user.companyId, employee_id, date, text]
+        );
+    }
+    return res.json({ message: 'Saved' });
 }));
 
 /**
@@ -668,14 +719,23 @@ router.get('/late-early', requireAdmin, asyncHandler(async (req, res) => {
             }
         }
 
-        if (isLate || isEarly) {
-            result.push({
-                employee_id: emp.id, employee_name: emp.name, emp_code: emp.emp_code, date,
-                shift_name: shift.name, check_in: attendance.check_in, check_out: attendance.check_out,
-                is_late: isLate, late_by_minutes: lateByMinutes,
-                is_early: isEarly, early_by_minutes: earlyByMinutes,
-            });
-        }
+        // Changed per the client's direction: this used to only include
+        // employees who were actually late and/or left early. Now every
+        // punched-in employee appears, with a `status` field, so the
+        // report answers "who was on time AND who wasn't" in one place
+        // rather than needing the absence of a row to mean "on time" -
+        // status is still skipped entirely for anyone absent (see the
+        // `continue` above - you can't be "late" on a day you never
+        // punched in at all, that's /reports/daily's concern) or with no
+        // resolvable shift (/reports/na-shift's concern).
+        const status = isLate && isEarly ? 'late_and_early' : isLate ? 'late' : isEarly ? 'early' : 'on_time';
+        result.push({
+            employee_id: emp.id, employee_name: emp.name, emp_code: emp.emp_code, date,
+            shift_name: shift.name, check_in: attendance.check_in, check_out: attendance.check_out,
+            is_late: isLate, late_by_minutes: lateByMinutes,
+            is_early: isEarly, early_by_minutes: earlyByMinutes,
+            status,
+        });
     }
     return res.json(result);
 }));
@@ -815,5 +875,347 @@ async function computeLateEarlyForDate(companyId, date) {
     }
     return result;
 }
+
+/**
+ * Monthly Muster / Attendance Register (client-supplied reference
+ * images: na_shift_report.jpeg and Performance_Monthly_Report.jpeg).
+ *
+ * IMPORTANT NAMING NOTE: despite the client's reference filenames,
+ * this is NOT the same report as GET /na-shift above (that one lists
+ * employees with no resolvable shift at all - a config-warning list)
+ * and it is NOT the same as GET /performance above (a monthly
+ * scorecard: attendance %, late count, OT hours - one row per
+ * employee, no day-by-day grid). Both reference images are actually
+ * ONE report type - a day-by-day attendance calendar for a month -
+ * just single-employee (na_shift_report.jpeg, with a rich per-employee
+ * summary line) vs. multi-employee (Performance_Monthly_Report.jpeg,
+ * stacked per-employee blocks, no summary line). Rather than repurpose
+ * either existing, differently-behaved endpoint under a confusing
+ * name, this is a new, third report type - GET /monthly-muster
+ * (single employee, WITH the summary) and GET /monthly-muster-all
+ * (every active employee, WITHOUT it, matching each reference image's
+ * own layout).
+ *
+ * Reuses every existing per-day classification/holiday/weekly-off/
+ * shift-policy/punch-events utility computeMonthlySummary and GET
+ * /daily above already use - this is genuinely the same per-day
+ * computation, just collecting the full row (not just a tally) for
+ * every day, plus batch-resolving each day's effective shift (shift
+ * roster override -> employee's own shift -> company default) without
+ * a query per employee per day the way resolveEffectiveShift above
+ * does for a single date - that pattern doesn't scale to 30 days x
+ * every employee in one report.
+ */
+async function loadShiftAssignmentIndex(companyId, monthStart, monthEnd) {
+    const [rows] = await pool.query(
+        `SELECT sa.employee_id, sa.effective_from, sa.effective_to, s.id AS shift_id, s.name, s.start_time, s.end_time,
+                s.late_grace_minutes, s.early_grace_minutes
+         FROM shift_assignments sa
+         JOIN shifts s ON s.id = sa.shift_id
+         WHERE sa.company_id = ? AND sa.effective_from <= ? AND (sa.effective_to IS NULL OR sa.effective_to >= ?)`,
+        [companyId, monthEnd, monthStart]
+    );
+    const byEmployee = new Map();
+    for (const r of rows) {
+        if (!byEmployee.has(r.employee_id)) byEmployee.set(r.employee_id, []);
+        byEmployee.get(r.employee_id).push(r);
+    }
+    return {
+        // Same fallback chain as resolveEffectiveShift above, just
+        // resolved in-memory against pre-loaded rows instead of a
+        // query per (employee, date) pair.
+        resolve(employeeId, dateStr, employeeOwnShift, defaultShift) {
+            const assignments = byEmployee.get(employeeId);
+            if (assignments) {
+                const applicable = assignments
+                    .filter(a => a.effective_from <= dateStr && (!a.effective_to || a.effective_to >= dateStr))
+                    .sort((a, b) => (a.effective_from < b.effective_from ? 1 : -1));
+                if (applicable.length > 0) return applicable[0];
+            }
+            return employeeOwnShift || defaultShift || null;
+        },
+    };
+}
+
+async function loadOvertimeIndex(companyId, monthStart, monthEnd) {
+    let rows = [];
+    try {
+        [rows] = await pool.query(
+            `SELECT employee_id, date, overtime_hours FROM overtime_records
+             WHERE company_id = ? AND date BETWEEN ? AND ? AND status = 'approved'`,
+            [companyId, monthStart, monthEnd]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    const byKey = new Map(rows.map(r => [`${r.employee_id}|${toDateStr(r.date)}`, Number(r.overtime_hours) || 0]));
+    return { minutesFor: (employeeId, dateStr) => Math.round((byKey.get(`${employeeId}|${dateStr}`) || 0) * 60) };
+}
+
+const SHIFT_CODE_FALLBACK = 'GEN'; // used only when a resolved shift has no name at all - shouldn't normally happen
+
+// Generalized from a month-only computation (still used that way by
+// /monthly-muster(-all)) to an arbitrary inclusive date range, so
+// /weekly-muster below can reuse every bit of this rather than a
+// duplicate week-only copy. `monthStart`/`monthEnd` names kept as-is
+// internally (despite now being a possibly-week-long range) to keep
+// this diff small - they're just "range start"/"range end" now.
+async function computeMuster(companyId, monthStart, monthEnd, context, { employeeId } = {}) {
+    const { fullDayHours, halfDayMinHours } = context;
+    // Build the list of date strings in [monthStart, monthEnd] by
+    // stepping a Date object, rather than assuming a calendar month -
+    // this is what makes an arbitrary week (or any other range) work
+    // the same way a full month already did.
+    const dateStrsInRange = [];
+    {
+        const cursor = new Date(`${monthStart}T00:00:00`);
+        const end = new Date(`${monthEnd}T00:00:00`);
+        while (cursor <= end) {
+            dateStrsInRange.push(toDateStr(cursor));
+            cursor.setDate(cursor.getDate() + 1);
+        }
+    }
+    const daysInMonth = dateStrsInRange.length;
+
+    const empParams = [companyId];
+    let empFilterSql = '';
+    if (employeeId) {
+        empFilterSql = ' AND id = ?';
+        empParams.push(employeeId);
+    }
+    const [employees] = await pool.query(
+        `SELECT id, name, emp_code, department, shift_id FROM employees WHERE company_id = ? AND status = 'active'${empFilterSql}`,
+        empParams
+    );
+    if (employees.length === 0) return [];
+
+    const [attendanceRows] = await pool.query(
+        'SELECT employee_id, date, check_in, check_out FROM attendance WHERE company_id = ? AND date BETWEEN ? AND ?',
+        [companyId, monthStart, monthEnd]
+    );
+    const attendanceByEmpDate = new Map(attendanceRows.map(r => [`${r.employee_id}|${toDateStr(r.date)}`, r]));
+
+    const [leaveRows] = await pool.query(
+        `SELECT employee_id, from_date, to_date FROM leave_applications
+         WHERE company_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
+        [companyId, monthEnd, monthStart]
+    );
+
+    const holidayIndex = await loadHolidayIndex(companyId, monthStart, monthEnd);
+    const employeeGroups = await loadEmployeeHolidayGroups(companyId);
+    const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
+    const shiftOffIndex = await loadShiftOffIndex(companyId);
+    const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId);
+    const shiftPolicyIndex = await loadShiftPolicyIndex(companyId);
+    const punchEventsIndex = await loadPunchEventsIndex(companyId, monthStart, monthEnd);
+    const shiftAssignmentIndex = await loadShiftAssignmentIndex(companyId, monthStart, monthEnd);
+    const overtimeIndex = await loadOvertimeIndex(companyId, monthStart, monthEnd);
+
+    const [shiftDetailRows] = await pool.query(
+        'SELECT id, name, start_time, end_time, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ?',
+        [companyId]
+    );
+    const shiftDetails = new Map(shiftDetailRows.map(s => [s.id, s]));
+    const [defaultShiftRows] = await pool.query(
+        'SELECT id, name, start_time, end_time, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ? AND is_default = TRUE LIMIT 1',
+        [companyId]
+    );
+    const defaultShift = defaultShiftRows[0] || null;
+
+    return employees.map(emp => {
+        const isOnApprovedLeave = (dateStr) => leaveRows.some(l => {
+            if (l.employee_id !== emp.id) return false;
+            const from = toDateStr(l.from_date);
+            const to = toDateStr(l.to_date);
+            return dateStr >= from && dateStr <= to;
+        });
+        const employeeGroupId = employeeGroups.get(emp.id) ?? null;
+        const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
+        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+            resolveEmployeeOffDays(emp.shift_id, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+        const deductBreaks = emp.shift_id != null ? shiftPolicyIndex.deductBreaksFor(emp.shift_id) : false;
+        const employeeOwnShiftDetail = shiftDetails.get(emp.shift_id) ?? null;
+
+        const days = [];
+        let totalWorkMinutes = 0, totalOvertimeMinutes = 0;
+        let presentDays = 0, absentDays = 0, weeklyOffDays = 0, holidayDays = 0, leaveDays = 0;
+        let lateByMinutesTotal = 0, lateByDays = 0, earlyByMinutesTotal = 0, earlyByDays = 0;
+        const shiftCounts = {};
+
+        for (let dayIndex = 0; dayIndex < dateStrsInRange.length; dayIndex++) {
+            const dateStr = dateStrsInRange[dayIndex];
+            const day = Number(dateStr.slice(-2)); // calendar day-of-month, still shown in the grid header even for a week-only range
+            const dayOfWeek = new Date(`${dateStr}T00:00:00`).getDay();
+            const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`) || null;
+            const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
+
+            const status = classifyDay({
+                dateStr, dayOfWeek,
+                isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
+                offDaysBitmask, altSaturdays, isWeeklyOff2,
+                isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
+                workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
+            });
+
+            const resolvedShift = shiftAssignmentIndex.resolve(emp.id, dateStr, employeeOwnShiftDetail, defaultShift);
+
+            let lateByMinutes = 0, earlyByMinutes = 0, workMinutes = null;
+            if (resolvedShift && attendance && attendance.check_in) {
+                const grace = emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id)
+                    ? shiftPolicyIndex.graceFor(emp.shift_id)
+                    : { lateGraceMinutes: resolvedShift.late_grace_minutes || 0, earlyGraceMinutes: resolvedShift.early_grace_minutes || 0 };
+                const actualIn = new Date(attendance.check_in);
+                const scheduledStart = new Date(`${dateStr}T${resolvedShift.start_time}`);
+                scheduledStart.setMinutes(scheduledStart.getMinutes() + grace.lateGraceMinutes);
+                if (actualIn > scheduledStart) lateByMinutes = Math.round((actualIn - scheduledStart) / 60000);
+                if (attendance.check_out) {
+                    const actualOut = new Date(attendance.check_out);
+                    const scheduledEnd = new Date(`${dateStr}T${resolvedShift.end_time}`);
+                    scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
+                    if (actualOut < scheduledEnd) earlyByMinutes = Math.round((scheduledEnd - actualOut) / 60000);
+                    workMinutes = punchSpan && punchSpan.workMinutes != null
+                        ? punchSpan.workMinutes
+                        : Math.round((actualOut - actualIn) / 60000);
+                }
+            }
+            const overtimeMinutes = overtimeIndex.minutesFor(emp.id, dateStr);
+
+            if (status === 'present' || status === 'half_day') presentDays += status === 'half_day' ? 0.5 : 1;
+            else if (status === 'absent') absentDays++;
+            else if (status === 'weekly_off') weeklyOffDays++;
+            else if (status === 'holiday') holidayDays++;
+            else if (status === 'leave') leaveDays++;
+
+            if (workMinutes) totalWorkMinutes += workMinutes;
+            totalOvertimeMinutes += overtimeMinutes;
+            if (lateByMinutes > 0) { lateByMinutesTotal += lateByMinutes; lateByDays++; }
+            if (earlyByMinutes > 0) { earlyByMinutesTotal += earlyByMinutes; earlyByDays++; }
+
+            const shiftCode = resolvedShift ? resolvedShift.name : SHIFT_CODE_FALLBACK;
+            shiftCounts[shiftCode] = (shiftCounts[shiftCode] || 0) + 1;
+
+            days.push({
+                day,
+                date: dateStr,
+                status,
+                check_in: attendance ? attendance.check_in : null,
+                check_out: attendance ? attendance.check_out : null,
+                work_minutes: workMinutes,
+                late_by_minutes: lateByMinutes,
+                early_by_minutes: earlyByMinutes,
+                overtime_minutes: overtimeMinutes,
+                shift_code: shiftCode,
+            });
+        }
+
+        const workingDaysWithPay = presentDays; // present + half-days already weighted above
+        return {
+            employee_id: emp.id,
+            employee_name: emp.name,
+            emp_code: emp.emp_code,
+            days,
+            summary: {
+                total_work_minutes: totalWorkMinutes,
+                total_overtime_minutes: totalOvertimeMinutes,
+                present_days: presentDays,
+                absent_days: absentDays,
+                weekly_off_days: weeklyOffDays,
+                holiday_days: holidayDays,
+                leave_days: leaveDays,
+                late_by_minutes_total: lateByMinutesTotal,
+                late_by_days: lateByDays,
+                early_by_minutes_total: earlyByMinutesTotal,
+                early_by_days: earlyByDays,
+                average_working_minutes: workingDaysWithPay > 0 ? Math.round(totalWorkMinutes / workingDaysWithPay) : 0,
+                shift_counts: shiftCounts,
+                total_shift_count: daysInMonth,
+            },
+        };
+    });
+}
+
+/**
+ * GET /reports/monthly-muster?employee_id=&year=&month=
+ * Single-employee day-by-day attendance calendar with the full summary
+ * block - matches na_shift_report.jpeg.
+ */
+router.get('/monthly-muster', requireAdmin, asyncHandler(async (req, res) => {
+    const employeeId = parseInt(req.query.employee_id, 10);
+    const year = parseInt(req.query.year, 10);
+    const month = parseInt(req.query.month, 10);
+    if (!employeeId || !year || !month || month < 1 || month > 12) {
+        return res.status(400).json({ error: 'employee_id, year, and month (1-12) query params required' });
+    }
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
+    const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
+    const context = await loadCompanyContext(req.user.companyId);
+    const result = await computeMuster(req.user.companyId, monthStart, monthEnd, context, { employeeId });
+    if (result.length === 0) return res.status(404).json({ error: 'Employee not found or not active' });
+    return res.json(result[0]);
+}));
+
+/**
+ * GET /reports/monthly-muster-all?year=&month=
+ * Every active employee's day-by-day calendar, WITHOUT the summary
+ * block (each entry is just { employee_id, employee_name, emp_code,
+ * days }) - matches Performance_Monthly_Report.jpeg's simpler stacked
+ * layout. Same underlying computation as /monthly-muster; the summary
+ * is dropped here rather than computed and discarded on the client, to
+ * keep the payload proportionate to "every employee, every day of the
+ * month" already being a fair amount of data.
+ */
+router.get('/monthly-muster-all', requireAdmin, asyncHandler(async (req, res) => {
+    const year = parseInt(req.query.year, 10);
+    const month = parseInt(req.query.month, 10);
+    if (!year || !month || month < 1 || month > 12) {
+        return res.status(400).json({ error: 'year and month (1-12) query params required' });
+    }
+    const daysInMonth = new Date(year, month, 0).getDate();
+    const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
+    const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
+    const context = await loadCompanyContext(req.user.companyId);
+    const result = await computeMuster(req.user.companyId, monthStart, monthEnd, context);
+    return res.json(result.map(r => ({
+        employee_id: r.employee_id,
+        employee_name: r.employee_name,
+        emp_code: r.emp_code,
+        days: r.days,
+    })));
+}));
+
+/**
+ * GET /reports/weekly-muster?date=
+ * Same day-by-day grid as /monthly-muster-all, windowed to one Sun-Sat
+ * week instead of a calendar month - the "Muster Grid" tab on Weekly
+ * Report. Same Sun-Sat boundary rule GET /weekly above already uses,
+ * kept identical so both tabs of Weekly Report agree on which 7 days
+ * are "this week". No summary block, same reasoning as
+ * /monthly-muster-all (this is the "all employees" shape; a rich
+ * per-employee summary for a single week wasn't asked for - shout if
+ * you want a single-employee weekly equivalent of /monthly-muster too).
+ */
+router.get('/weekly-muster', requireAdmin, asyncHandler(async (req, res) => {
+    const { date } = req.query;
+    if (!date) return res.status(400).json({ error: 'date (YYYY-MM-DD, any day in the target week) query param required' });
+
+    const anchor = new Date(`${date}T00:00:00`);
+    const weekStartDate = new Date(anchor);
+    weekStartDate.setDate(anchor.getDate() - anchor.getDay());
+    const weekEndDate = new Date(weekStartDate);
+    weekEndDate.setDate(weekStartDate.getDate() + 6);
+    const weekStart = toDateStr(weekStartDate);
+    const weekEnd = toDateStr(weekEndDate);
+
+    const context = await loadCompanyContext(req.user.companyId);
+    const result = await computeMuster(req.user.companyId, weekStart, weekEnd, context);
+    return res.json(result.map(r => ({
+        employee_id: r.employee_id,
+        employee_name: r.employee_name,
+        emp_code: r.emp_code,
+        days: r.days,
+    })));
+}));
 
 module.exports = router;

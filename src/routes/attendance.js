@@ -236,3 +236,6 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 module.exports = router;
+// Exported so routes/adms.js (Cloud Server push) records punches through the
+// exact same multi-punch path as the desktop sync - no second copy of this logic.
+module.exports.recordPunchEventsAndDeriveAttendance = recordPunchEventsAndDeriveAttendance;

@@ -41,7 +41,7 @@ router.get('/', asyncHandler(async (req, res) => {
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, biometric_template_id, photo_url, emp_code, category_id, remote_location_enabled, branch_id,
         phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id,
-        pf_percent, epf_percent, esi_percent, pf_limit, ot_rate_type, ot_rate_value, tds_amount, tds_percent, statutory_override_active } = req.body;
+        pf_percent, epf_percent, esi_percent, pf_limit, ot_rate_type, ot_rate_value, tds_amount, tds_percent, statutory_override_active, card_no } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
 
     // migration_035 - Employee Extra Details v2 (statutory/OT overrides).
@@ -105,8 +105,8 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
             `INSERT INTO employees
              (company_id, emp_code, name, designation, department, department_id, designation_id, shift_id, doj, dob, salary, photo_url, biometric_template_id, category_id, remote_location_enabled, branch_id,
               phone, personal_email, office_email, address, id_proof_type, id_proof_number, bank_account_holder, bank_account_no, bank_ifsc, bank_name, assigned_device_id,
-              pf_percent, epf_percent, esi_percent, pf_limit, ot_rate_type, ot_rate_value, tds_amount, tds_percent, statutory_override_active, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+              pf_percent, epf_percent, esi_percent, pf_limit, ot_rate_type, ot_rate_value, tds_amount, tds_percent, statutory_override_active, card_no, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
             [req.user.companyId, empCode, name, designation || null, department || null,
                 department_id || null, designation_id || null, shift_id || null,
                 doj || null, dob || null, salary || null, photo_url || null, biometric_template_id || null,
@@ -116,7 +116,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
                 bank_account_no || null, bank_ifsc || null, bank_name || null, assigned_device_id || null,
                 pf_percent ?? null, epf_percent ?? null, esi_percent ?? null, pf_limit ?? null,
                 ot_rate_type || null, ot_rate_value ?? null, tds_amount ?? null, tds_percent ?? null,
-                !!statutory_override_active]
+                !!statutory_override_active, card_no || null]
         );
 
         await conn.commit();
@@ -292,7 +292,7 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     // statutory/OT overrides; see that migration's header comment).
     const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled', 'branch_id',
         'phone', 'personal_email', 'office_email', 'address', 'id_proof_type', 'id_proof_number', 'bank_account_holder', 'bank_account_no', 'bank_ifsc', 'bank_name', 'assigned_device_id',
-        'pf_percent', 'epf_percent', 'esi_percent', 'pf_limit', 'ot_rate_type', 'ot_rate_value', 'tds_amount', 'tds_percent', 'statutory_override_active'];
+        'pf_percent', 'epf_percent', 'esi_percent', 'pf_limit', 'ot_rate_type', 'ot_rate_value', 'tds_amount', 'tds_percent', 'statutory_override_active', 'card_no'];
     if (req.body.id_proof_type !== undefined && req.body.id_proof_type !== null
         && !['aadhaar', 'pan', 'voter_id'].includes(req.body.id_proof_type)) {
         return res.status(400).json({ error: 'id_proof_type must be one of: aadhaar, pan, voter_id' });

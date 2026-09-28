@@ -65,7 +65,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['device_name', 'device_code', 'serial_no', 'location', 'ip_address', 'port', 'comm_password', 'status', 'model'];
+    const fields = ['device_name', 'device_code', 'serial_no', 'location', 'ip_address', 'port', 'comm_password', 'status', 'model', 'adms_enabled'];
     if (req.body.device_code !== undefined && req.body.device_code !== null && String(req.body.device_code).trim() !== ''
         && !/^[a-zA-Z0-9]+$/.test(String(req.body.device_code).trim())) {
         return res.status(400).json({ error: 'device_code must be alphanumeric' });

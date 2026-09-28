@@ -22,6 +22,10 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const licenseRoutes = require('./routes/license');
+// migration_036: two-tier vendor panel login (admin / super_admin) + audit log.
+const panelAdminRoutes = require('./routes/panelAdmins');
+// migration_038: Cloud Server (ADMS/iClock) push receiver - public by design.
+const admsRoutes = require('./routes/adms');
 const authRoutes = require('./routes/auth');
 const communicationsEmailRoutes = require('./routes/communicationsEmail');
 const communicationsSmsRoutes = require('./routes/communicationsSms');
@@ -103,6 +107,10 @@ const rawPunchRoutes = require('./routes/rawPunches');
 const pool = require('./db');
 
 const app = express();
+// Render terminates TLS at its proxy. Without this, req.ip is the proxy's
+// address, so the /iclock per-IP rate limit would put every device (and
+// every attacker) in ONE shared bucket.
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
@@ -111,6 +119,12 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use('/license', licenseRoutes);
+app.use('/panel', panelAdminRoutes);
+// Cloud Server (ADMS) - devices push here with no login; locked down inside
+// routes/adms.js (registered serial + per-device switch + rate limit).
+// Mounted after express.json() on purpose: devices send text/plain, which
+// express.json() ignores, and adms.js parses its own text body.
+app.use('/iclock', admsRoutes);
 app.use('/auth', authRoutes);
 app.use('/communications/email', communicationsEmailRoutes);
 app.use('/communications/sms', communicationsSmsRoutes);
