@@ -25,6 +25,7 @@ const licenseRoutes = require('./routes/license');
 // migration_036: two-tier vendor panel login (admin / super_admin) + audit log.
 const panelAdminRoutes = require('./routes/panelAdmins');
 // migration_038: Cloud Server (ADMS/iClock) push receiver - public by design.
+const { verifyFirebaseToken, requireFeature } = require('./middleware/verifyFirebaseToken');
 const admsRoutes = require('./routes/adms');
 const authRoutes = require('./routes/auth');
 const communicationsEmailRoutes = require('./routes/communicationsEmail');
@@ -179,8 +180,8 @@ app.use('/calendar-events', calendarEventRoutes);
 app.use('/dashboard-notes', dashboardNotesRoutes);
 app.use('/holiday-groups', holidayGroupRoutes);
 app.use('/employee-categories', employeeCategoryRoutes);
-app.use('/geofence-zones', geofenceZoneRoutes);
-app.use('/field-tracking', fieldTrackingRoutes);
+app.use('/geofence-zones', verifyFirebaseToken, requireFeature('geofence'), geofenceZoneRoutes);
+app.use('/field-tracking', verifyFirebaseToken, requireFeature('geofence'), fieldTrackingRoutes);
 app.use('/raw-punches', rawPunchRoutes);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));

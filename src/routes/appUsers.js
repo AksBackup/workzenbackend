@@ -2,7 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const admin = require('firebase-admin');
 const pool = require('../db');
-const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
+const { verifyFirebaseToken, requireAdminOnly: requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
 
 const router = express.Router();

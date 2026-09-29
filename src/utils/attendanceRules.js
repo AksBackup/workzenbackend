@@ -162,7 +162,36 @@ function isAltSaturdayOff(dateStr, altSaturdays) {
         .includes(ordinal);
 }
 
+/**
+ * Office Time Policy "prefix / suffix day" rules.
+ *   prefix: weekly-off/holiday block becomes ABSENT if the working day just BEFORE it was absent
+ *   suffix: ... if the working day just AFTER it was absent
+ *   both:   ... only if BOTH the day before AND after were absent
+ * `days` = [{ status }] in date order. A "block" is a run of consecutive
+ * 'weekly_off' / 'holiday' days. Only 'absent' neighbours count (leave,
+ * half_day, present do not). A block touching the start/end of the range
+ * has an unknown neighbour on that side, which counts as NOT absent.
+ * Mutates and returns `days`, setting status 'absent' and .converted=true.
+ */
+function applyPrefixSuffixAbsent(days, flags) {
+    if (!flags || (!flags.prefix && !flags.suffix && !flags.both)) return days;
+    const isOff = (st) => st === 'weekly_off' || st === 'holiday';
+    let i = 0;
+    while (i < days.length) {
+        if (!isOff(days[i].status)) { i++; continue; }
+        let j = i;
+        while (j + 1 < days.length && isOff(days[j + 1].status)) j++;
+        const before = i > 0 ? days[i - 1].status === 'absent' : false;
+        const after = j + 1 < days.length ? days[j + 1].status === 'absent' : false;
+        const hit = (flags.prefix && before) || (flags.suffix && after) || (flags.both && before && after);
+        if (hit) for (let k = i; k <= j; k++) { days[k].status = 'absent'; days[k].converted = true; }
+        i = j + 1;
+    }
+    return days;
+}
+
 module.exports = {
+    applyPrefixSuffixAbsent,
     loadHolidayIndex,
     loadEmployeeHolidayGroups,
     loadWeeklyOffIndex,
@@ -278,7 +307,8 @@ async function loadShiftPolicyIndex(companyId) {
     const [rows] = await pool.query(
         `SELECT ops.shift_id, p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences,
                 p.grace_late_coming_minutes, p.grace_early_going_minutes,
-                p.deduct_break_hours_from_work_duration
+                p.deduct_break_hours_from_work_duration,
+                p.mark_absent_prefix_day, p.mark_absent_suffix_day, p.mark_absent_both_prefix_suffix_day
          FROM office_time_policy_shifts ops
          JOIN office_time_policies p ON p.id = ops.policy_id
          WHERE ops.company_id = ?`,
@@ -292,6 +322,14 @@ async function loadShiftPolicyIndex(companyId) {
         deductBreaksFor(shiftId) {
             const r = byShiftId.get(shiftId);
             return !!(r && r.deduct_break_hours_from_work_duration);
+        },
+        prefixSuffixFor(shiftId) {
+            const r = byShiftId.get(shiftId);
+            return {
+                prefix: !!(r && r.mark_absent_prefix_day),
+                suffix: !!(r && r.mark_absent_suffix_day),
+                both: !!(r && r.mark_absent_both_prefix_suffix_day),
+            };
         },
         graceFor(shiftId) {
             const r = byShiftId.get(shiftId);

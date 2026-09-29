@@ -1,7 +1,7 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const pool = require('../db');
-const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
+const { verifyFirebaseToken, requireAdmin, isStaff } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
 const { loadWeeklyOffIndex, effectiveOffDaysBitmask, isAltSaturdayOff } = require('../utils/attendanceRules');
 const { computeMonthlyPaidUsage } = require('../utils/leaveQuota');
@@ -11,7 +11,7 @@ router.use(verifyFirebaseToken);
 
 // Admin: all employees in their company. Employee: only their own record.
 router.get('/', asyncHandler(async (req, res) => {
-    if (req.user.role === 'admin') {
+    if (isStaff(req.user)) {
         const [rows] = await pool.query('SELECT * FROM employees WHERE company_id = ?', [req.user.companyId]);
         return res.json(rows);
     }

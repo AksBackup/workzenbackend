@@ -14,6 +14,7 @@ const {
     loadPunchEventsForDay,
     loadPunchEventsIndex,
     loadShiftPolicyIndex,
+    applyPrefixSuffixAbsent,
     loadShiftPolicyOffIndex,
     resolveShiftGrace,
 } = require('../utils/attendanceRules');
@@ -417,6 +418,7 @@ async function computeMonthlySummary(companyId, year, month, context) {
             resolveEmployeeOffDays(emp.shift_id, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
         const deductBreaks = emp.shift_id != null ? shiftPolicyIndex.deductBreaksFor(emp.shift_id) : false;
 
+        const dayList = [];
         for (let day = 1; day <= daysInMonth; day++) {
             const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
             const dayOfWeek = new Date(year, month - 1, day).getDay();
@@ -432,6 +434,11 @@ async function computeMonthlySummary(companyId, year, month, context) {
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
                 workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
             });
+            dayList.push({ status });
+        }
+        // Office Time Policy prefix/suffix-day rules (weekly-off/holiday -> absent).
+        applyPrefixSuffixAbsent(dayList, emp.shift_id != null ? shiftPolicyIndex.prefixSuffixFor(emp.shift_id) : null);
+        for (const { status } of dayList) {
             if (status === 'present') { presentDays++; workingDays++; }
             else if (status === 'half_day') { halfDays++; workingDays++; }
             else if (status === 'absent') { absentDays++; workingDays++; }
