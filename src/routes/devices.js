@@ -32,7 +32,7 @@ router.get('/', asyncHandler(async (req, res) => {
 }));
 
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { device_name, device_code, serial_no, location, ip_address, port, comm_password, status, model } = req.body;
+    const { device_name, device_code, serial_no, location, ip_address, port, comm_password, status, model, adms_enabled } = req.body;
     if (!device_name) return res.status(400).json({ error: 'device_name required' });
     // device_code (migration_025) is the alphanumeric ID the admin
     // assigns when registering this device - separate from serial_no
@@ -52,15 +52,20 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         }
     }
 
+    // Trim the serial (the ADMS lookup is an exact match, so a stray space
+    // would silently break it) and coerce the toggle to a real boolean.
+    const cleanSerial = typeof serial_no === 'string' ? serial_no.trim() : serial_no;
+    const admsOn = adms_enabled === true || adms_enabled === 1 || adms_enabled === '1' || adms_enabled === 'true';
+
     const [result] = await pool.query(
-        `INSERT INTO devices (company_id, device_name, device_code, serial_no, location, ip_address, port, comm_password, status, model)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, device_name, device_code || null, serial_no || null, location || null, ip_address || null, port || 4370, comm_password || null, status || 'offline', model || 'f22']
+        `INSERT INTO devices (company_id, device_name, device_code, serial_no, location, ip_address, port, comm_password, status, model, adms_enabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, device_name, device_code || null, cleanSerial || null, location || null, ip_address || null, port || 4370, comm_password || null, status || 'offline', model || 'f22', admsOn ? 1 : 0]
     );
     return res.status(201).json({
-        id: result.insertId, device_name, device_code: device_code || null, serial_no, location, ip_address,
+        id: result.insertId, device_name, device_code: device_code || null, serial_no: cleanSerial || null, location, ip_address,
         port: port || 4370, comm_password: comm_password || null, status: status || 'offline',
-        model: model || 'f22',
+        model: model || 'f22', adms_enabled: admsOn,
     });
 }));
 
@@ -75,7 +80,10 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     fields.forEach(f => {
         if (req.body[f] !== undefined) {
             updates.push(`${f} = ?`);
-            values.push(req.body[f]);
+            let v = req.body[f];
+            if (f === 'serial_no' && typeof v === 'string') v = v.trim() || null;
+            if (f === 'adms_enabled') v = (v === true || v === 1 || v === '1' || v === 'true') ? 1 : 0;
+            values.push(v);
         }
     });
     if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
