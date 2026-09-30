@@ -20,6 +20,7 @@ const {
     loadShiftPolicyOffIndex,
     resolveShiftGrace,
 } = require('../utils/attendanceRules');
+const { classifyDay, resolveEmployeeOffDays, hasRealCheckout, computeLateEarly } = require('../utils/dayClassifier');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -71,6 +72,7 @@ async function loadCompanyContext(companyId) {
 }
 
 /**
+<<<<<<< HEAD
  * Classifies one employee-day. Returns one of:
  * 'holiday' | 'weekly_off' | 'leave' | 'present' | 'half_day' | 'absent'
  *
@@ -122,6 +124,8 @@ function resolveEmployeeOffDays(empShiftId, empShift, employeeDepartment, weekly
 }
 
 /**
+=======
+>>>>>>> b066605 (payroll v2)
  * GET /reports/daily?date=YYYY-MM-DD
  * Every active employee for one day, with a derived status - unlike
  * plain GET /attendance (which only returns rows that exist in the
@@ -232,12 +236,17 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
         const deductBreaks = effectiveShiftId != null ? shiftPolicyIndex.deductBreaksFor(effectiveShiftId) : false;
         const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
 
+<<<<<<< HEAD
         const firstIn = punchSpan?.firstIn || attendance?.check_in || null;
         const lastOut = punchSpan?.lastOut || attendance?.check_out || null;
         const lateEarly = lateEarlyMinutesForPunches(date, resolvedShift, firstIn, lastOut, policy);
+=======
+        const le = computeLateEarly(date, attendance, shiftDetails.get(emp.shift_id) ?? null, (emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id) ? shiftPolicyIndex.graceFor(emp.shift_id) : null));
+>>>>>>> b066605 (payroll v2)
         const status = classifyDay({
             dateStr: date,
             dayOfWeek,
+            rules: shiftPolicyIndex.rulesFor(emp.shift_id), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
             isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
             offDaysBitmask,
             altSaturdays,
@@ -266,8 +275,13 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
             const scheduledStart = new Date(`${date}T${shiftDetail.start_time}`);
             scheduledStart.setMinutes(scheduledStart.getMinutes() + grace.lateGraceMinutes);
             if (actualIn > scheduledStart) lateByMinutes = Math.round((actualIn - scheduledStart) / 60000);
+<<<<<<< HEAD
             if (lastOut) {
                 const actualOut = new Date(lastOut);
+=======
+            if (hasRealCheckout(attendance)) {
+                const actualOut = new Date(attendance.check_out);
+>>>>>>> b066605 (payroll v2)
                 const scheduledEnd = new Date(`${date}T${shiftDetail.end_time}`);
                 scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
                 if (actualOut < scheduledEnd) earlyByMinutes = Math.round((scheduledEnd - actualOut) / 60000);
@@ -401,6 +415,8 @@ async function computeMonthlySummary(companyId, year, month, context) {
     // the /daily handler's comment above.
     const punchEventsIndex = await loadPunchEventsIndex(companyId, monthStart, monthEnd);
     const shiftPolicyIndex = await loadShiftPolicyIndex(companyId);
+    const [shiftRowsAll] = await pool.query('SELECT id, name, start_time, end_time, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ?', [companyId]);
+    const shiftsById = new Map(shiftRowsAll.map(x => [x.id, x]));
 
     return employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -428,6 +444,7 @@ async function computeMonthlySummary(companyId, year, month, context) {
             const { offDaysBitmask, altSaturdays, isWeeklyOff2 } = resolveEmployeeOffDays(effectiveShiftId, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
             const policy = effectiveShiftId != null && shiftPolicyIndex.has(effectiveShiftId) ? shiftPolicyIndex.policyFor(effectiveShiftId) : null;
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
+<<<<<<< HEAD
             const pair = pairPunchEvents(dayEvents, { considerOnlyFirstLastPunch: !!policy?.consider_only_first_last_punch });
             const firstIn = pair.firstIn || attendance?.check_in || null;
             const lastOut = pair.lastOut || attendance?.check_out || null;
@@ -439,6 +456,19 @@ async function computeMonthlySummary(companyId, year, month, context) {
                 attendance: firstIn ? { check_in: firstIn, check_out: lastOut } : attendance,
                 fullDayHours, halfDayMinHours, workMinutesOverride: workMinutes, policy,
                 lateByMinutes: lateEarly.lateByMinutes, earlyByMinutes: lateEarly.earlyByMinutes,
+=======
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
+            const le = computeLateEarly(dateStr, attendance, shiftsById.get(emp.shift_id) ?? null, (emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id) ? shiftPolicyIndex.graceFor(emp.shift_id) : null));
+            const status = classifyDay({
+                dateStr, dayOfWeek,
+                rules: shiftPolicyIndex.rulesFor(emp.shift_id), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
+                isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
+                offDaysBitmask,
+                altSaturdays,
+                isWeeklyOff2,
+                isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
+                workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
+>>>>>>> b066605 (payroll v2)
             });
             dayList.push({ status });
         }
@@ -564,10 +594,15 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
     const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId);
     const punchEventsIndex = await loadPunchEventsIndex(companyId, weekStart, weekEnd);
     const shiftPolicyIndex = await loadShiftPolicyIndex(companyId);
+<<<<<<< HEAD
     const shiftAssignmentIndex = await loadShiftAssignmentIndex(companyId, weekStart, weekEnd);
     const [shiftRows] = await pool.query('SELECT id, name, start_time, end_time, late_grace_minutes, early_grace_minutes, is_default FROM shifts WHERE company_id = ?', [companyId]);
     const shiftDetails = new Map(shiftRows.map(r => [r.id, r]));
     const defaultShift = shiftRows.find(r => r.is_default) || null;
+=======
+    const [shiftRowsAll] = await pool.query('SELECT id, name, start_time, end_time, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ?', [companyId]);
+    const shiftsById = new Map(shiftRowsAll.map(x => [x.id, x]));
+>>>>>>> b066605 (payroll v2)
 
     const result = employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
@@ -576,6 +611,16 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             return dateStr >= toDateStr(l.from_date) && dateStr <= toDateStr(l.to_date);
         });
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
+<<<<<<< HEAD
+=======
+        const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
+        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+            resolveEmployeeOffDays(emp.shift_id, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+        const deductBreaks = emp.shift_id != null ? shiftPolicyIndex.deductBreaksFor(emp.shift_id) : false;
+
+        const weekDays = [];
+        let weekWorkMinutes = 0, weekLateDays = 0, weekEarlyDays = 0;
+>>>>>>> b066605 (payroll v2)
         const cursor = new Date(weekStartDate);
         for (let i = 0; i < 7; i++) {
             const dateStr = toDateStr(cursor);
@@ -588,13 +633,19 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
                 resolveEmployeeOffDays(effectiveShiftId, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
             const policy = effectiveShiftId != null && shiftPolicyIndex.has(effectiveShiftId) ? shiftPolicyIndex.policyFor(effectiveShiftId) : null;
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
+<<<<<<< HEAD
             const pair = pairPunchEvents(dayEvents, { considerOnlyFirstLastPunch: !!policy?.consider_only_first_last_punch });
             const firstIn = pair.firstIn || attendance?.check_in || null;
             const lastOut = pair.lastOut || attendance?.check_out || null;
             const workMinutes = pair.intervals.length > 0 ? pair.totalWorkMinutes : (attendance?.check_in && attendance?.check_out ? Math.max(0, Math.round((new Date(attendance.check_out) - new Date(attendance.check_in)) / 60000)) : null);
             const lateEarly = lateEarlyMinutesForPunches(dateStr, resolvedShift, firstIn, lastOut, policy);
+=======
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
+            const le = computeLateEarly(dateStr, attendance, shiftsById.get(emp.shift_id) ?? null, (emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id) ? shiftPolicyIndex.graceFor(emp.shift_id) : null));
+>>>>>>> b066605 (payroll v2)
             const status = classifyDay({
                 dateStr, dayOfWeek,
+                rules: shiftPolicyIndex.rulesFor(emp.shift_id), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask, altSaturdays, isWeeklyOff2,
                 isOnApprovedLeave,
@@ -606,6 +657,21 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             else if (status === 'half_day') { halfDays++; workingDays++; }
             else if (status === 'absent') { absentDays++; workingDays++; }
             else if (status === 'leave') { leaveDays++; }
+            // Per-day detail so the Weekly report can actually show data
+            // (previously only 5 counters came back).
+            const realOut = hasRealCheckout(attendance);
+            const dayWork = punchSpan && punchSpan.workMinutes != null
+                ? punchSpan.workMinutes
+                : (realOut ? Math.round((new Date(attendance.check_out) - new Date(attendance.check_in)) / 60000) : null);
+            if (dayWork) weekWorkMinutes += dayWork;
+            if (le.lateMinutes > 0) weekLateDays++;
+            if (le.earlyMinutes > 0) weekEarlyDays++;
+            weekDays.push({
+                date: dateStr, weekday: dayOfWeek, status,
+                check_in: attendance ? attendance.check_in : null,
+                check_out: realOut ? attendance.check_out : null,
+                work_minutes: dayWork, late_by_minutes: le.lateMinutes, early_by_minutes: le.earlyMinutes,
+            });
             cursor.setDate(cursor.getDate() + 1);
         }
 
@@ -614,6 +680,8 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             week_start: weekStart, week_end: weekEnd,
             present_days: presentDays, half_days: halfDays, absent_days: absentDays,
             leave_days: leaveDays, working_days: workingDays,
+            total_work_minutes: weekWorkMinutes, late_days: weekLateDays, early_days: weekEarlyDays,
+            days: weekDays,
         };
     });
     return res.json(result);
@@ -738,7 +806,14 @@ router.get('/late-early', requireAdmin, asyncHandler(async (req, res) => {
                 lateByMinutes = Math.round((actualIn - scheduledStart) / 60000);
             }
         }
+<<<<<<< HEAD
         if (lastOut) {
+=======
+        // Early punch-OUT: only meaningful with a REAL check-out (a later
+        // punch than the check-in). A single scan stored as check_out ===
+        // check_in used to be reported as "left 9 hours early".
+        if (hasRealCheckout(attendance)) {
+>>>>>>> b066605 (payroll v2)
             const scheduledEnd = new Date(`${date}T${shift.end_time}`);
             scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
             const actualOut = new Date(lastOut);
@@ -760,7 +835,9 @@ router.get('/late-early', requireAdmin, asyncHandler(async (req, res) => {
         const status = isLate && isEarly ? 'late_and_early' : isLate ? 'late' : isEarly ? 'early' : 'on_time';
         result.push({
             employee_id: emp.id, employee_name: emp.name, emp_code: emp.emp_code, date,
-            shift_name: shift.name, check_in: attendance.check_in, check_out: attendance.check_out,
+            shift_name: shift.name, shift_start: shift.start_time, shift_end: shift.end_time,
+            check_in: attendance.check_in, check_out: hasRealCheckout(attendance) ? attendance.check_out : null,
+            missed_punch_out: !!attendance.check_in && !hasRealCheckout(attendance),
             is_late: isLate, late_by_minutes: lateByMinutes,
             is_early: isEarly, early_by_minutes: earlyByMinutes,
             status,
@@ -895,7 +972,7 @@ async function computeLateEarlyForDate(companyId, date) {
             scheduledStart.setMinutes(scheduledStart.getMinutes() + grace.lateGraceMinutes);
             if (new Date(attendance.check_in) > scheduledStart) isLate = true;
         }
-        if (attendance.check_out) {
+        if (hasRealCheckout(attendance)) {
             const scheduledEnd = new Date(`${date}T${shift.end_time}`);
             scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
             if (new Date(attendance.check_out) < scheduledEnd) isEarly = true;
@@ -1079,6 +1156,7 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
                 resolveEmployeeOffDays(effectiveShiftId, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
             const policy = effectiveShiftId != null && shiftPolicyIndex.has(effectiveShiftId) ? shiftPolicyIndex.policyFor(effectiveShiftId) : null;
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
+<<<<<<< HEAD
             const pair = pairPunchEvents(dayEvents, { considerOnlyFirstLastPunch: !!policy?.consider_only_first_last_punch });
             const firstIn = pair.firstIn || attendance?.check_in || null;
             const lastOut = pair.lastOut || attendance?.check_out || null;
@@ -1087,12 +1165,45 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
             const status = classifyDay({
                 dateStr, dayOfWeek,
                 isHoliday: d => holidayIndex.isHoliday(d, employeeGroupId),
+=======
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
+
+            const resolvedShift = shiftAssignmentIndex.resolve(emp.id, dateStr, employeeOwnShiftDetail, defaultShift);
+            const le = computeLateEarly(dateStr, attendance, resolvedShift, (emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id) ? shiftPolicyIndex.graceFor(emp.shift_id) : null));
+            const status = classifyDay({
+                dateStr, dayOfWeek,
+                rules: shiftPolicyIndex.rulesFor(emp.shift_id), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
+                isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
+>>>>>>> b066605 (payroll v2)
                 offDaysBitmask, altSaturdays, isWeeklyOff2,
                 isOnApprovedLeave, attendance: firstIn ? { check_in: firstIn, check_out: lastOut } : attendance, fullDayHours, halfDayMinHours,
                 workMinutesOverride: workMinutes, policy, lateByMinutes: lateEarly.lateByMinutes, earlyByMinutes: lateEarly.earlyByMinutes,
             });
+<<<<<<< HEAD
             let lateByMinutes = lateEarly.lateByMinutes;
             let earlyByMinutes = lateEarly.earlyByMinutes;
+=======
+
+            let lateByMinutes = 0, earlyByMinutes = 0, workMinutes = null;
+            if (resolvedShift && attendance && attendance.check_in) {
+                const grace = emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id)
+                    ? shiftPolicyIndex.graceFor(emp.shift_id)
+                    : { lateGraceMinutes: resolvedShift.late_grace_minutes || 0, earlyGraceMinutes: resolvedShift.early_grace_minutes || 0 };
+                const actualIn = new Date(attendance.check_in);
+                const scheduledStart = new Date(`${dateStr}T${resolvedShift.start_time}`);
+                scheduledStart.setMinutes(scheduledStart.getMinutes() + grace.lateGraceMinutes);
+                if (actualIn > scheduledStart) lateByMinutes = Math.round((actualIn - scheduledStart) / 60000);
+                if (hasRealCheckout(attendance)) {
+                    const actualOut = new Date(attendance.check_out);
+                    const scheduledEnd = new Date(`${dateStr}T${resolvedShift.end_time}`);
+                    scheduledEnd.setMinutes(scheduledEnd.getMinutes() - grace.earlyGraceMinutes);
+                    if (actualOut < scheduledEnd) earlyByMinutes = Math.round((scheduledEnd - actualOut) / 60000);
+                    workMinutes = punchSpan && punchSpan.workMinutes != null
+                        ? punchSpan.workMinutes
+                        : Math.round((actualOut - actualIn) / 60000);
+                }
+            }
+>>>>>>> b066605 (payroll v2)
             const overtimeMinutes = overtimeIndex.minutesFor(emp.id, dateStr);
 
             if (status === 'present' || status === 'half_day') presentDays += status === 'half_day' ? 0.5 : 1;
@@ -1317,6 +1428,137 @@ router.get('/weekly-muster', requireAdmin, asyncHandler(async (req, res) => {
         emp_code: r.emp_code,
         days: r.days,
     })));
+}));
+
+
+/**
+ * GET /reports/all-in-out?from=YYYY-MM-DD&to=YYYY-MM-DD[&employee_id=]
+ * "All In/Out" report - EVERY punch of every employee per day (not just the
+ * first-in/last-out pair stored in `attendance`).
+ *
+ * Rules (per the client's brief):
+ *  - Punches are taken from raw_punches (every device scan, de-duplicated by
+ *    device+user+time) merged with punch_events (manual / mobile / synced).
+ *  - Only punches inside the employee's shift window are counted:
+ *      window start = shift start - early-coming allowance (2h default)
+ *      window end   = shift end                                (OT not allowed)
+ *                   = shift end + max OT (policy max_ot_minutes, else 12h) (OT allowed)
+ *    Punches outside the window are still returned (outside_window=true) so the
+ *    admin can see them, but are NOT counted in total work time.
+ *  - Counted punches alternate IN, OUT, IN, OUT ... (1st punch = in, 2nd = out,
+ *    3rd = in ...). Each IN->OUT duration is summed = total work time of the day.
+ *    An odd trailing punch is an IN with no OUT (missing_out=true, adds 0).
+ *  - Two scans within 1 minute of each other are treated as a double-tap and the
+ *    later one is ignored.
+ */
+router.get('/all-in-out', requireAdmin, asyncHandler(async (req, res) => {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ error: 'from and to (YYYY-MM-DD) query params required' });
+    const companyId = req.user.companyId;
+    const empFilter = req.query.employee_id ? parseInt(req.query.employee_id, 10) : null;
+
+    const [employees] = await pool.query(
+        `SELECT id, name, emp_code, shift_id FROM employees WHERE company_id = ? AND status = 'active'${empFilter ? ' AND id = ?' : ''}`,
+        empFilter ? [companyId, empFilter] : [companyId]
+    );
+    const empById = new Map(employees.map(e => [e.id, e]));
+
+    const [shiftRows] = await pool.query('SELECT id, name, start_time, end_time, ot_allowed, is_default FROM shifts WHERE company_id = ?', [companyId]);
+    const shiftsById = new Map(shiftRows.map(x => [x.id, x]));
+    const defaultShift = shiftRows.find(x => x.is_default) || null;
+    let maxOtByShift = new Map();
+    try {
+        const [pr] = await pool.query(
+            `SELECT ops.shift_id, p.max_ot_minutes FROM office_time_policy_shifts ops
+             JOIN office_time_policies p ON p.id = ops.policy_id WHERE ops.company_id = ?`, [companyId]);
+        maxOtByShift = new Map(pr.map(r => [r.shift_id, r.max_ot_minutes]));
+    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+
+    const fmt = (d) => (d instanceof Date ? d.toISOString().slice(0, 19).replace('T', ' ') : String(d).slice(0, 19).replace('T', ' '));
+    const punchesByKey = new Map(); // `${empId}|${date}` -> Map<time, source>
+    const add = (empId, timeStr, source) => {
+        if (!empById.has(empId)) return;
+        const key = `${empId}|${timeStr.slice(0, 10)}`;
+        if (!punchesByKey.has(key)) punchesByKey.set(key, new Map());
+        if (!punchesByKey.get(key).has(timeStr)) punchesByKey.get(key).set(timeStr, source);
+    };
+    const [raw] = await pool.query(
+        `SELECT employee_id, punch_time FROM raw_punches
+         WHERE company_id = ? AND employee_id IS NOT NULL AND punch_time >= ? AND punch_time < DATE_ADD(?, INTERVAL 1 DAY)`,
+        [companyId, from, to]
+    );
+    raw.forEach(r => add(r.employee_id, fmt(r.punch_time), 'device'));
+    try {
+        const [ev] = await pool.query(
+            'SELECT employee_id, punch_time FROM punch_events WHERE company_id = ? AND date BETWEEN ? AND ?',
+            [companyId, from, to]
+        );
+        ev.forEach(r => add(r.employee_id, fmt(r.punch_time), 'app'));
+    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    // Fall back to attendance first/last for days that have no raw/event rows at all
+    // (legacy rows from before punch_events existed).
+    const [att] = await pool.query(
+        'SELECT employee_id, date, check_in, check_out FROM attendance WHERE company_id = ? AND date BETWEEN ? AND ?',
+        [companyId, from, to]
+    );
+    for (const a of att) {
+        const key = `${a.employee_id}|${toDateStr(a.date)}`;
+        if (punchesByKey.has(key)) continue;
+        if (a.check_in) add(a.employee_id, fmt(a.check_in), 'attendance');
+        if (a.check_out && hasRealCheckout(a)) add(a.employee_id, fmt(a.check_out), 'attendance');
+    }
+
+    const rows = [];
+    for (const [key, timeMap] of punchesByKey) {
+        const [empIdStr, date] = key.split('|');
+        const emp = empById.get(Number(empIdStr));
+        const shift = (emp.shift_id != null ? shiftsById.get(emp.shift_id) : null) || defaultShift;
+
+        let winStart = null, winEnd = null;
+        if (shift && shift.start_time && shift.end_time) {
+            winStart = new Date(`${date}T${shift.start_time}`); winStart.setHours(winStart.getHours() - 2);
+            winEnd = new Date(`${date}T${shift.end_time}`);
+            if (winEnd <= new Date(`${date}T${shift.start_time}`)) winEnd.setDate(winEnd.getDate() + 1); // overnight shift
+            if (shift.ot_allowed) {
+                const maxOt = maxOtByShift.get(shift.id);
+                winEnd.setMinutes(winEnd.getMinutes() + (maxOt != null && Number(maxOt) > 0 ? Number(maxOt) : 12 * 60));
+            }
+        }
+
+        const times = [...timeMap.keys()].sort();
+        const punches = [];
+        let lastCounted = null;
+        for (const t of times) {
+            const dt = new Date(t.replace(' ', 'T'));
+            const inWindow = !winStart || (dt >= winStart && dt <= winEnd);
+            if (inWindow && lastCounted && (dt - lastCounted) < 60 * 1000) continue; // double-tap
+            punches.push({ time: t, inWindow });
+            if (inWindow) lastCounted = dt;
+        }
+        const counted = punches.filter(p => p.inWindow);
+        counted.forEach((p, i) => { p.type = i % 2 === 0 ? 'in' : 'out'; });
+        punches.filter(p => !p.inWindow).forEach(p => { p.type = 'ignored'; });
+
+        const pairs = [];
+        let totalMinutes = 0;
+        for (let i = 0; i + 1 < counted.length; i += 2) {
+            const mins = Math.round((new Date(counted[i + 1].time.replace(' ', 'T')) - new Date(counted[i].time.replace(' ', 'T'))) / 60000);
+            pairs.push({ in: counted[i].time, out: counted[i + 1].time, minutes: mins });
+            totalMinutes += mins;
+        }
+        rows.push({
+            employee_id: emp.id, employee_name: emp.name, emp_code: emp.emp_code, date,
+            shift_name: shift ? shift.name : null, shift_start: shift ? shift.start_time : null, shift_end: shift ? shift.end_time : null,
+            ot_allowed: shift ? !!shift.ot_allowed : null,
+            punches, pairs,
+            punch_count: counted.length,
+            outside_window_count: punches.length - counted.length,
+            missing_out: counted.length % 2 === 1,
+            total_work_minutes: totalMinutes,
+        });
+    }
+    rows.sort((a, b) => (a.date === b.date ? a.employee_name.localeCompare(b.employee_name) : (a.date < b.date ? 1 : -1)));
+    return res.json(rows);
 }));
 
 module.exports = router;

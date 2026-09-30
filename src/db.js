@@ -47,7 +47,9 @@ const pool = mysql.createPool({
     // own callers) actually expects from a JSON API. Affects salary,
     // leave_balances.allocated/used, leave_applications.days_count - all
     // DECIMAL-typed in schema.sql.
-    decimalNumbers: true
+    decimalNumbers: true,
+    // See index.js: stored DATETIMEs are wall-clock values, never real UTC instants.
+    timezone: 'Z'
 });
 
 module.exports = pool;

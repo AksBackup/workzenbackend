@@ -1,4 +1,10 @@
 require('dotenv').config();
+// Wall-clock consistency: ZK devices have no timezone, MySQL DATETIME has none,
+// so the whole backend treats stored times as plain wall-clock values. Pinning
+// the process to UTC + mysql2 timezone 'Z' (db.js) makes Date<->DATETIME
+// round-trips lossless and makes `new Date('YYYY-MM-DDTHH:mm:ss')` comparisons
+// agree with values read from the DB no matter where the server is hosted.
+process.env.TZ = 'UTC';
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
@@ -42,6 +48,7 @@ const overtimeRoutes = require('./routes/overtime');
 const weeklyOffRoutes = require('./routes/weeklyOff');
 const payrollRoutes = require('./routes/payroll');
 const statutorySettingsRoutes = require('./routes/statutorySettings');
+const paymentWindowRoutes = require('./routes/paymentWindow');
 
 // --- Phase 5 parallel build pass (see docs/FROZEN_CONTRACT_V2.md) ---
 
@@ -141,6 +148,7 @@ app.use('/overtime', overtimeRoutes);
 app.use('/weekly-off', weeklyOffRoutes);
 app.use('/payroll', payrollRoutes);
 app.use('/statutory-settings', statutorySettingsRoutes);
+app.use('/payroll-payment-window', paymentWindowRoutes);
 
 // Agent A scope.
 app.use('/devices', deviceRoutes);

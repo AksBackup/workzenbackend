@@ -335,6 +335,12 @@ function derivePunchSpan(events, deductBreaks) {
 
     const firstIn = ins[0].punch_time;
     const lastOut = outs[outs.length - 1].punch_time;
+    if (new Date(lastOut) - new Date(firstIn) < 60 * 1000) {
+        // Single scan recorded as both in and out (or a double-tap) - not a
+        // real span. Returning 0 minutes here used to classify present
+        // employees as ABSENT. Treat as "no complete pair yet".
+        return { firstIn, lastOut: null, workMinutes: null };
+    }
     let workMinutes = Math.round((new Date(lastOut) - new Date(firstIn)) / 60000);
 
     if (deductBreaks) {
@@ -402,6 +408,7 @@ async function loadShiftPolicyIndex(companyId) {
     const [rows] = await pool.query(
         `SELECT ops.shift_id, p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences,
                 p.grace_late_coming_minutes, p.grace_early_going_minutes,
+<<<<<<< HEAD
                 p.absent_if_duration_less_than_minutes, p.half_day_if_duration_less_than_minutes,
                 p.mark_late_absent_enabled, p.mark_late_absent_status, p.mark_late_absent_after_minutes,
                 p.consider_only_first_last_punch, p.deduct_break_hours_from_work_duration,
@@ -412,6 +419,13 @@ async function loadShiftPolicyIndex(companyId) {
                 p.consider_early_coming_punch, p.consider_late_going_punch,
                 p.mark_absent_prefix_day, p.mark_absent_suffix_day, p.mark_absent_both_prefix_suffix_day,
                 p.punch_required_mode, p.present_weekly_off_count, p.check_duplicate_minute
+=======
+                p.deduct_break_hours_from_work_duration,
+                p.mark_absent_prefix_day, p.mark_absent_suffix_day, p.mark_absent_both_prefix_suffix_day,
+                p.absent_if_duration_less_than_minutes, p.half_day_if_duration_less_than_minutes,
+                p.half_day_if_late_by_enabled, p.half_day_if_late_by_minutes,
+                p.half_day_if_early_going_by_enabled, p.half_day_if_early_going_by_minutes
+>>>>>>> b066605 (payroll v2)
          FROM office_time_policy_shifts ops
          JOIN office_time_policies p ON p.id = ops.policy_id
          WHERE ops.company_id = ?`,
@@ -432,6 +446,17 @@ async function loadShiftPolicyIndex(companyId) {
                 prefix: !!(r && r.mark_absent_prefix_day),
                 suffix: !!(r && r.mark_absent_suffix_day),
                 both: !!(r && r.mark_absent_both_prefix_suffix_day),
+            };
+        },
+        /** Thresholds for classifyDay's `rules` param (null = no policy assigned -> company hours). */
+        rulesFor(shiftId) {
+            const r = shiftId == null ? null : byShiftId.get(shiftId);
+            if (!r) return null;
+            return {
+                absentMinutes: r.absent_if_duration_less_than_minutes,
+                halfDayMinutes: r.half_day_if_duration_less_than_minutes,
+                halfDayIfLateMinutes: r.half_day_if_late_by_enabled ? r.half_day_if_late_by_minutes : null,
+                halfDayIfEarlyMinutes: r.half_day_if_early_going_by_enabled ? r.half_day_if_early_going_by_minutes : null,
             };
         },
         graceFor(shiftId) {

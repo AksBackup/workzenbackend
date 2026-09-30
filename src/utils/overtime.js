@@ -18,6 +18,7 @@ const { pairPunchEvents } = require('./attendanceRules');
 async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOutValue) {
     if (!checkOutValue) return;
 
+<<<<<<< HEAD
     let employee;
     try {
         const [rows] = await pool.query(
@@ -58,6 +59,22 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
     }
 
     if (shift && shift.ot_allowed === false || shift && Number(shift.ot_allowed) === 0) {
+=======
+    // migration_015: per-shift OT eligibility gate. An employee with no
+    // shift assigned (shift_id NULL) keeps today's original behaviour
+    // (OT computed for everyone) - the join below only excludes someone
+    // when their *specific* assigned shift has ot_allowed = FALSE.
+    const [shiftRows] = await pool.query(
+        `SELECT s.ot_allowed, s.end_time FROM employees e
+         JOIN shifts s ON s.id = e.shift_id
+         WHERE e.id = ? AND e.company_id = ?`,
+        [employeeId, companyId]
+    );
+    if (shiftRows.length > 0 && !shiftRows[0].ot_allowed) {
+        // This employee's shift explicitly disallows OT - clear any
+        // stale pending record for consistency (e.g. their shift was
+        // just changed to an OT-disallowed one) and stop.
+>>>>>>> b066605 (payroll v2)
         await pool.query(
             "DELETE FROM overtime_records WHERE employee_id = ? AND date = ? AND status = 'pending'",
             [employeeId, dateStr]
@@ -68,7 +85,34 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
     const [policyRows] = await pool.query(
         'SELECT check_out_time, overtime_rate_per_hour, full_day_hours, max_ot_minutes FROM office_time_policy WHERE company_id = ?',
         [companyId]
+<<<<<<< HEAD
     ).catch(async err => {
+=======
+    );
+    if (policyRows.length === 0) return;
+    const { check_out_time: companyCheckOutTime, overtime_rate_per_hour, full_day_hours } = policyRows[0];
+    // Payroll v3: overtime starts after the EMPLOYEE'S SHIFT end time (the shift the
+    // attendance/late-early reports use). The company-wide office_time_policy
+    // check_out_time is only the fallback for employees with no shift - previously it
+    // was used for everyone, so a night/early shift got OT (or none) against the wrong
+    // clock time.
+    const check_out_time = shiftRows.length > 0 && shiftRows[0].end_time ? shiftRows[0].end_time : companyCheckOutTime;
+
+    // migration_035 - this employee's own OT rate override, if any.
+    // Defensive on the column set (ER_BAD_FIELD_ERROR) the same way the
+    // rest of this backend handles migrations that may not have been
+    // applied yet to an older DB.
+    let employeeOverride = null;
+    try {
+        const [empRows] = await pool.query(
+            'SELECT salary, ot_rate_type, ot_rate_value, statutory_override_active FROM employees WHERE id = ? AND company_id = ?',
+            [employeeId, companyId]
+        );
+        if (empRows.length > 0 && empRows[0].statutory_override_active && empRows[0].ot_rate_type) {
+            employeeOverride = empRows[0];
+        }
+    } catch (err) {
+>>>>>>> b066605 (payroll v2)
         if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
         return pool.query(
             'SELECT check_out_time, overtime_rate_per_hour, full_day_hours FROM office_time_policy WHERE company_id = ?',

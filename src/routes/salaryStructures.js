@@ -163,7 +163,11 @@ router.put('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
         });
     }
 
+<<<<<<< HEAD
     const recurringNet = additionTotal - deductionTotal;
+=======
+    const gross = additionTotal - deductionTotal; // net of heads only - informational, NOT stored as salary
+>>>>>>> b066605 (payroll v2)
 
     const conn = await pool.getConnection();
     try {
@@ -176,10 +180,18 @@ router.put('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
                 [req.user.companyId, req.params.employeeId, h.type, h.name, h.amount, h.sortOrder]
             );
         }
+<<<<<<< HEAD
         // IMPORTANT: Employee Details owns employees.salary. Payment Setup
         // owns recurring heads only, so saving this screen must never
         // overwrite the employee's base salary. This removes the legacy
         // salary-overwrite loop while preserving the endpoint contract.
+=======
+        // The one line that actually feeds payroll - same as
+        // migration_029's version of this file did.
+        // NOTE (payroll v3): employees.salary is the BASE SALARY set in Employee Details and is
+        // never written from here any more. Heads are separate fixed monthly additions /
+        // deductions layered on top of the earned amount (see routes/payroll.js).
+>>>>>>> b066605 (payroll v2)
         await conn.commit();
     } catch (err) {
         await conn.rollback();
