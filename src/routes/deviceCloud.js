@@ -72,7 +72,7 @@ function buildTimeCommands(y, mo, d, h, mi, s) {
     // time and look at the device's own clock.
     const iso = `${y}-${pad(mo)}-${pad(d)} ${pad(h)}:${pad(mi)}:${pad(s)}`;
     const all = { unix, zk: zkEncode(wall), iso };
-    const first = String(process.env.ADMS_TIME_FORMAT || 'unix').toLowerCase();
+    const first = String(process.env.ADMS_TIME_FORMAT || 'zk').toLowerCase();
     const order = [first, ...['unix', 'zk', 'iso'].filter((k) => k !== first)].filter((k) => k in all);
     const forms = order.map((k) => all[k]);
     // Some firmware spells the verb SET OPTION (singular), some SET OPTIONS.

@@ -85,6 +85,22 @@ async function findEnabledDevice(sn) {
 }
 
 
+// Encode a wall-clock time for the device. `wall` is "YYYY-MM-DD HH:MM:SS" (the
+// clock face the admin wants), `add` = seconds elapsed since they asked.
+//   zk   - ZKTeco's own encoding (seconds since 2000, 31-day months)  [default]
+//   unix - seconds since 1970 (wall clock treated as if it were UTC)
+//   iso  - "YYYY-MM-DD HH:MM:SS"
+function encodeDeviceTime(wall, add, fmt) {
+    const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(wall);
+    if (!m) return null;
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) + Math.max(0, add || 0) * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    if (fmt === 'iso') return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+    if (fmt === 'unix') return String(Math.floor(d.getTime() / 1000));
+    return String(((d.getUTCFullYear() - 2000) * 12 * 31 + d.getUTCMonth() * 31 + (d.getUTCDate() - 1)) * 86400
+        + d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds());
+}
+
 // Parse user rows the device sends (reply to DATA QUERY USERINFO, or USER lines
 // inside OPERLOG) and mirror them into device_cloud_users.
 async function ingestUsers(device, body) {
@@ -228,6 +244,13 @@ router.post('/cdata', asyncHandler(async (req, res) => {
     for (const p of parsed) {
         const employeeId = empByCode.get(p.pin);
         if (!employeeId || disabledPins.has(p.pin)) continue;
+        // A device whose clock is wrong (e.g. reset to 1970) must not write bogus
+        // attendance: the raw punch is kept above, attendance is skipped.
+        const tsMs = Date.parse(p.ts.replace(' ', 'T') + 'Z');
+        if (Number.isNaN(tsMs) || tsMs < Date.UTC(2020, 0, 1) || tsMs > Date.now() + 2 * 86400000) {
+            console.warn(`[adms] device ${device.id}: punch ${p.pin} @ ${p.ts} has an implausible date (device clock wrong?) - raw punch stored, NO attendance created`);
+            continue;
+        }
         const date = p.ts.slice(0, 10);
         const key = `${employeeId}|${date}`;
         if (!groups.has(key)) groups.set(key, { employeeId, date, times: [], verifyByTime: {} });
@@ -365,11 +388,14 @@ router.get('/rtdata', asyncHandler(async (req, res) => {
         let wall = null;
         try { wall = rows.length && rows[0].fallbacks ? (JSON.parse(rows[0].fallbacks).wall || null) : null; } catch (_) {}
         if (!wall) return ok(res);
-        const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(wall);
-        if (!m) return ok(res);
-        const unix = Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000) + Math.max(0, rows[0].age || 0);
-        console.log(`[adms] rtdata reply to device ${device.id}: DateTime=${unix} (wall ${wall} + ${rows[0].age}s)`);
-        return ok(res, `DateTime=${unix},ServerTZ=+0000`);
+        const fmt = String(process.env.ADMS_TIME_FORMAT || 'zk').toLowerCase();
+        const value = encodeDeviceTime(wall, rows[0].age, fmt);
+        if (!value) return ok(res);
+        // ADMS_RTDATA_TZ=off sends just DateTime=<value> (no ServerTZ field).
+        const body = String(process.env.ADMS_RTDATA_TZ || '').toLowerCase() === 'off'
+            ? `DateTime=${value}` : `DateTime=${value},ServerTZ=+0000`;
+        console.log(`[adms] rtdata reply to device ${device.id}: ${body} (format ${fmt}, wall ${wall} + ${rows[0].age}s)`);
+        return ok(res, body);
     } catch (err) {
         console.error('[adms] rtdata failed:', err.message);
         return ok(res);
