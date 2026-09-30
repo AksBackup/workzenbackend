@@ -2,6 +2,20 @@ const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
+const {
+    loadHolidayIndex,
+    loadEmployeeHolidayGroups,
+    loadWeeklyOffIndex,
+    loadShiftOffIndex,
+    effectiveOffDaysBitmask,
+    isAltSaturdayOff,
+    loadPunchEventsIndex,
+    loadShiftPolicyIndex,
+    loadShiftPolicyOffIndex,
+    classifyDay: classifyDayShared,
+    pairPunchEvents,
+    applyPrefixSuffixAbsent,
+} = require('../utils/attendanceRules');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -49,45 +63,115 @@ function round2(n) {
  * byte-for-byte identical in how a payslip is computed - the only
  * difference between them is which row(s) of `result` get returned.
  */
+async function loadPayrollShiftContext(companyId, monthStart, monthEnd) {
+    let shifts = [];
+    try {
+        [shifts] = await pool.query('SELECT * FROM shifts WHERE company_id = ?', [companyId]);
+    } catch (_) {
+        shifts = [];
+    }
+    const shiftById = new Map(shifts.map(s => [s.id, s]));
+    const defaultShift = shifts.find(s => s.is_default) || shifts[0] || null;
+
+    let assignments = [];
+    try {
+        [assignments] = await pool.query(
+            `SELECT sa.employee_id, sa.shift_id, sa.effective_from, sa.effective_to
+             FROM shift_assignments sa
+             WHERE sa.company_id = ? AND sa.effective_from <= ?
+               AND (sa.effective_to IS NULL OR sa.effective_to >= ?)`,
+            [companyId, monthEnd, monthStart]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    const byEmployee = new Map();
+    for (const row of assignments) {
+        if (!byEmployee.has(row.employee_id)) byEmployee.set(row.employee_id, []);
+        byEmployee.get(row.employee_id).push(row);
+    }
+    for (const list of byEmployee.values()) {
+        list.sort((a, b) => String(b.effective_from).localeCompare(String(a.effective_from)));
+    }
+
+    return {
+        resolve(employee, dateStr) {
+            const assigned = (byEmployee.get(employee.id) || []).find(a =>
+                String(a.effective_from) <= dateStr && (!a.effective_to || String(a.effective_to) >= dateStr));
+            if (assigned && shiftById.has(assigned.shift_id)) return shiftById.get(assigned.shift_id);
+            return shiftById.get(employee.shift_id) || defaultShift || null;
+        },
+    };
+}
+
+function minutesFromTime(value) {
+    if (value == null) return null;
+    const parts = String(value).split(':').map(Number);
+    if (parts.length < 2 || parts.some(Number.isNaN)) return null;
+    return parts[0] * 60 + parts[1] + (parts[2] || 0) / 60;
+}
+
+function dateTimeForShift(dateStr, timeValue) {
+    if (timeValue == null) return null;
+    const parsed = minutesFromTime(timeValue);
+    if (parsed == null) return null;
+    const d = new Date(`${dateStr}T00:00:00`);
+    d.setMinutes(parsed);
+    return d;
+}
+
+function lateEarlyMinutesForPunches(dateStr, shift, firstIn, lastOut, policy) {
+    if (!shift) return { lateByMinutes: 0, earlyByMinutes: 0 };
+    const lateGrace = policy ? Number(policy.grace_late_coming_minutes || 0) : Number(shift.late_grace_minutes || 0);
+    const earlyGrace = policy ? Number(policy.grace_early_going_minutes || 0) : Number(shift.early_grace_minutes || 0);
+    let lateByMinutes = 0;
+    let earlyByMinutes = 0;
+    if (firstIn) {
+        const scheduledStart = dateTimeForShift(dateStr, shift.start_time);
+        if (scheduledStart) {
+            scheduledStart.setMinutes(scheduledStart.getMinutes() + lateGrace);
+            const actual = new Date(firstIn);
+            if (!Number.isNaN(actual.getTime()) && actual > scheduledStart) {
+                lateByMinutes = Math.round((actual - scheduledStart) / 60000);
+            }
+        }
+    }
+    if (lastOut) {
+        const scheduledEnd = dateTimeForShift(dateStr, shift.end_time);
+        if (scheduledEnd) {
+            scheduledEnd.setMinutes(scheduledEnd.getMinutes() - earlyGrace);
+            const actual = new Date(lastOut);
+            if (!Number.isNaN(actual.getTime()) && actual < scheduledEnd) {
+                earlyByMinutes = Math.round((scheduledEnd - actual) / 60000);
+            }
+        }
+    }
+    return { lateByMinutes, earlyByMinutes };
+}
+
+/**
+ * Shared payroll calculation. Dynamic attendance values are derived from
+ * the same holiday/weekly-off/shift-policy/punch-event sources used by the
+ * reports. Employee `salary` remains the base-salary source and is NEVER
+ * overwritten by Payment Setup.
+ */
 async function computeMonthlyPayroll(companyId, year, month) {
     const daysInMonth = new Date(year, month, 0).getDate();
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
-    // BUG FIX (pass 2 - "mid-month payroll" complaint): the day loop
-    // below used to always run through daysInMonth regardless of
-    // today's actual date. For the CURRENT, still-in-progress month,
-    // every day after today has no attendance row yet (it hasn't
-    // happened) and no leave application either, and fell straight
-    // into the "no pay - no punch, no leave" branch - i.e. every
-    // remaining day of the month was silently treated as an unpaid
-    // ABSENCE. Checking payroll on, say, the 13th showed pay as if the
-    // employee were going to be absent for the other 17-18 days, which
-    // is exactly the "mid of the month" complaint. Now: for the
-    // current month only, the loop stops at today (inclusive - today's
-    // own attendance may already be in) and anything after that is
-    // simply not evaluated at all (not paid, not deducted) - the
-    // response reports how many days were actually counted so the UI
-    // can show "earned so far" instead of implying a final total.
     const now = new Date();
     const isCurrentMonth = year === now.getFullYear() && month === now.getMonth() + 1;
     const isFutureMonth = year > now.getFullYear() || (year === now.getFullYear() && month > now.getMonth() + 1);
     const daysToCount = isFutureMonth ? 0 : (isCurrentMonth ? now.getDate() : daysInMonth);
 
-    // pf_percent/epf_percent/esi_percent/pf_limit/tds_amount/tds_percent/
-    // statutory_override_active added by migration_035 - per-employee
-    // overrides of the company-wide Statutory Settings, applied below in
-    // computeStatutoryDeductions only when statutory_override_active is
-    // true (see that function's header comment). Wrapped in a try/catch
-    // with the same defensive fallback as the statutory_settings block
-    // further down, since migration_035 may not have been run yet on an
-    // older DB.
     let employees;
     try {
         [employees] = await pool.query(
-            `SELECT e.id, e.name, e.emp_code, e.salary, d.default_salary,
+            `SELECT e.id, e.name, e.emp_code, e.salary, e.department, e.shift_id, d.default_salary,
                     e.pf_percent, e.epf_percent, e.esi_percent, e.pf_limit,
-                    e.tds_amount, e.tds_percent, e.statutory_override_active
+                    e.ot_rate_type, e.ot_rate_value, e.tds_amount, e.tds_percent,
+                    e.statutory_override_active
              FROM employees e
              LEFT JOIN designations d ON d.id = e.designation_id
              WHERE e.company_id = ? AND e.status = 'active'`,
@@ -95,125 +179,86 @@ async function computeMonthlyPayroll(companyId, year, month) {
         );
     } catch (err) {
         if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
-        // migration_035 not applied yet - fall back to the pre-migration
-        // column set; every employee is simply treated as having no
-        // statutory/OT override (same as statutory_override_active being
-        // false for everyone).
         [employees] = await pool.query(
-            `SELECT e.id, e.name, e.emp_code, e.salary, d.default_salary
-             FROM employees e
-             LEFT JOIN designations d ON d.id = e.designation_id
+            `SELECT e.id, e.name, e.emp_code, e.salary, e.department, e.shift_id, d.default_salary
+             FROM employees e LEFT JOIN designations d ON d.id = e.designation_id
              WHERE e.company_id = ? AND e.status = 'active'`,
             [companyId]
         );
     }
 
-    // Payment Setup integration fix: this used to only ever read
-    // employees.salary/designations.default_salary, with no visibility
-    // into whether an employee actually has Payment Setup heads
-    // configured at all (routes/salaryStructures.js writes
-    // addition_total - deduction_total into employees.salary on every
-    // save, so the FLAT NUMBER was already correct - what was missing
-    // is any way for this screen to show the breakdown behind that
-    // number, or to tell "Payment Setup was used" apart from "nobody
-    // ever touched Payment Setup, this is just the raw employees.salary
-    // field"). Fetched once for the whole company, not per-employee.
-    let salaryHeadTotals = [];
+    let salaryHeadRows = [];
     try {
-        [salaryHeadTotals] = await pool.query(
-            `SELECT employee_id,
-                    SUM(CASE WHEN head_type = 'addition' THEN amount ELSE 0 END) AS addition_total,
-                    SUM(CASE WHEN head_type = 'deduction' THEN amount ELSE 0 END) AS deduction_total
-             FROM salary_heads
-             WHERE company_id = ?
-             GROUP BY employee_id`,
+        [salaryHeadRows] = await pool.query(
+            `SELECT employee_id, head_type, head_name, amount
+             FROM salary_heads WHERE company_id = ? ORDER BY sort_order ASC, id ASC`,
             [companyId]
         );
     } catch (err) {
         if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
-        // migration_035 not applied yet - every employee behaves as
-        // "no Payment Setup heads", same defensive fallback pattern
-        // salaryStructures.js itself already uses.
     }
-    const salaryHeadsByEmp = new Map(salaryHeadTotals.map(r => [r.employee_id, r]));
+    const headsByEmp = new Map();
+    for (const h of salaryHeadRows) {
+        if (!headsByEmp.has(h.employee_id)) headsByEmp.set(h.employee_id, { addition: [], deduction: [] });
+        const bucket = h.head_type === 'deduction' ? 'deduction' : 'addition';
+        headsByEmp.get(h.employee_id)[bucket].push({
+            head_name: h.head_name,
+            amount: round2(Number(h.amount) || 0),
+        });
+    }
 
-    const [policyRows] = await pool.query(
-        'SELECT full_day_hours, half_day_min_hours FROM office_time_policy WHERE company_id = ?',
+    let basePolicyRows = [];
+    [basePolicyRows] = await pool.query(
+        'SELECT full_day_hours, half_day_min_hours, overtime_rate_per_hour FROM office_time_policy WHERE company_id = ?',
         [companyId]
     );
-    const fullDayHours = policyRows.length ? Number(policyRows[0].full_day_hours) : 8.0;
-    const halfDayMinHours = policyRows.length ? Number(policyRows[0].half_day_min_hours) : 4.0;
+    const fullDayHours = basePolicyRows.length ? Number(basePolicyRows[0].full_day_hours) : 8.0;
+    const halfDayMinHours = basePolicyRows.length ? Number(basePolicyRows[0].half_day_min_hours) : 4.0;
+    const companyOtRate = basePolicyRows.length ? basePolicyRows[0].overtime_rate_per_hour : null;
 
     const [attendanceRows] = await pool.query(
-        `SELECT employee_id, date, check_in, check_out
-         FROM attendance
-         WHERE company_id = ? AND date BETWEEN ? AND ?`,
+        'SELECT employee_id, date, check_in, check_out FROM attendance WHERE company_id = ? AND date BETWEEN ? AND ?',
         [companyId, monthStart, monthEnd]
     );
     const attendanceByEmpDate = new Map();
-    for (const row of attendanceRows) {
-        const dateKey = row.date instanceof Date ? row.date.toISOString().slice(0, 10) : String(row.date);
-        attendanceByEmpDate.set(`${row.employee_id}|${dateKey}`, row);
-    }
+    for (const row of attendanceRows) attendanceByEmpDate.set(`${row.employee_id}|${String(row.date).slice(0, 10)}`, row);
 
-    // days_count/paid_days (migration_009, Part 4): paid_days is how
-    // many of this application's days count as paid leave, decided once
-    // at apply-time (see routes/leaves.js POST /) against that month's
-    // quota - the remainder is unpaid, i.e. no pay for those days,
-    // exactly like an unapproved absence. A NULL paid_days means this
-    // row predates the split (created before migration_009) and is
-    // treated as fully paid, matching the old behavior exactly.
     const [leaveRows] = await pool.query(
         `SELECT employee_id, from_date, to_date, days_count, paid_days
          FROM leave_applications
-         WHERE company_id = ? AND status = 'approved'
-           AND from_date <= ? AND to_date >= ?`,
+         WHERE company_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
         [companyId, monthEnd, monthStart]
     );
 
-    const [holidayRows] = await pool.query(
-        'SELECT date FROM holidays WHERE company_id = ? AND date BETWEEN ? AND ?',
-        [companyId, monthStart, monthEnd]
-    );
-    const holidayDates = new Set(
-        holidayRows.map(h => (h.date instanceof Date ? h.date.toISOString().slice(0, 10) : String(h.date)))
-    );
+    const holidayIndex = await loadHolidayIndex(companyId, monthStart, monthEnd);
+    const employeeGroups = await loadEmployeeHolidayGroups(companyId);
+    const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
+    let shiftOffIndex = { byId: new Map() };
+    let shiftPolicyOffIndex = { has: () => false, offDaysBitmaskFor: () => 0, isWeeklyOff2Date: () => false };
+    let shiftPolicyIndex = { has: () => false, policyFor: () => null, deductBreaksFor: () => false, graceFor: () => ({ lateGraceMinutes: 0, earlyGraceMinutes: 0 }) };
+    try { shiftOffIndex = await loadShiftOffIndex(companyId); } catch (err) { if (err.code !== 'ER_BAD_FIELD_ERROR' && err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    try { shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId); } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    try { shiftPolicyIndex = await loadShiftPolicyIndex(companyId); } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    const punchEventsIndex = await loadPunchEventsIndex(companyId, monthStart, monthEnd);
+    const shiftContext = await loadPayrollShiftContext(companyId, monthStart, monthEnd);
 
-    const [weeklyOffRows] = await pool.query(
-        'SELECT off_days_bitmask FROM weekly_off_config WHERE company_id = ? AND department IS NULL LIMIT 1',
-        [companyId]
-    );
-    const offDaysBitmask = weeklyOffRows.length ? weeklyOffRows[0].off_days_bitmask : 1; // default: Sunday only
-
-    const [existingPayroll] = await pool.query(
+    let existingPayroll = [];
+    [existingPayroll] = await pool.query(
         'SELECT employee_id, bonus, is_paid, paid_on FROM payroll_records WHERE company_id = ? AND year = ? AND month = ?',
         [companyId, year, month]
     );
     const payrollByEmp = new Map(existingPayroll.map(p => [p.employee_id, p]));
 
-    // migration_028 - active loans per employee, for the projected
-    // (not-yet-committed) monthly deduction shown here. 'salary_percent'
-    // loans get auto-deducted for real when payroll is marked paid (see
-    // POST /:employeeId/mark-paid below) - this function itself is
-    // read-only (called from both GET / and GET /me) and must never
-    // write a loan_payments row on its own, or simply viewing payroll
-    // twice would double-charge the loan. 'installments' loans are
-    // never auto-deducted - shown here purely so the list surfaces that
-    // an employee still has one outstanding.
     let loanRows = [];
     try {
         [loanRows] = await pool.query(
             `SELECT l.id, l.employee_id, l.principal_amount, l.repayment_mode, l.salary_deduction_percent,
                     COALESCE((SELECT SUM(amount) FROM loan_payments WHERE loan_id = l.id), 0) AS paid_so_far
-             FROM loans l
-             WHERE l.company_id = ? AND l.status != 'closed'`,
+             FROM loans l WHERE l.company_id = ? AND l.status != 'closed'`,
             [companyId]
         );
     } catch (err) {
         if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err;
-        // migration_028 not applied yet - proceed with no loan deductions,
-        // same defensive fallback pattern as the statutory settings block
-        // above.
     }
     const loansByEmp = new Map();
     for (const l of loanRows) {
@@ -221,26 +266,18 @@ async function computeMonthlyPayroll(companyId, year, month) {
         loansByEmp.get(l.employee_id).push(l);
     }
 
-    // Overtime (migration_008) - only APPROVED records count toward pay;
-    // pending ones are still awaiting admin sign-off and rejected ones
-    // never did, so neither should show up in what someone is actually
-    // paid.
-    const [overtimeRows] = await pool.query(
-        `SELECT employee_id, SUM(amount) AS overtime_pay, SUM(overtime_hours) AS overtime_hours
-         FROM overtime_records
-         WHERE company_id = ? AND status = 'approved' AND date BETWEEN ? AND ?
-         GROUP BY employee_id`,
-        [companyId, monthStart, monthEnd]
-    );
+    let overtimeRows = [];
+    try {
+        [overtimeRows] = await pool.query(
+            `SELECT employee_id, SUM(amount) AS overtime_pay, SUM(overtime_hours) AS overtime_hours
+             FROM overtime_records WHERE company_id = ? AND status = 'approved' AND date BETWEEN ? AND ? GROUP BY employee_id`,
+            [companyId, monthStart, monthEnd]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
     const overtimeByEmp = new Map(overtimeRows.map(r => [r.employee_id, r]));
 
-    // PF/ESI/PT (migration_021 / routes/statutorySettings.js). Fetched
-    // once here, not per-employee, then applied inside the map below by
-    // computeStatutoryDeductions(). Defensive on purpose: if
-    // migration_021 hasn't been run yet, this falls back to "nothing
-    // enabled" rather than throwing and breaking payroll entirely for
-    // every employee over a feature they may not even be using yet -
-    // same reasoning as the email-settings hardening in pass 2.
     let statutorySettings = { pf_enabled: false, esi_enabled: false, pt_enabled: false };
     let ptSlabs = [];
     try {
@@ -253,108 +290,167 @@ async function computeMonthlyPayroll(companyId, year, month) {
         ptSlabs = slabRows;
     } catch (err) {
         if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
-        // migration_021 not applied yet - proceed with PF/ESI/PT all off.
+    }
+
+    // Bonus Payroll is the source of truth for monthly bonus amounts.
+    // payroll_records.bonus remains a backwards-compatible fallback for
+    // installations where the bonus table has not been migrated yet.
+    let bonusByEmp = new Map();
+    try {
+        const [bonusRows] = await pool.query(
+            `SELECT employee_id, COALESCE(SUM(amount), 0) AS bonus
+             FROM bonuses
+             WHERE company_id = ? AND year = ? AND month = ?
+             GROUP BY employee_id`,
+            [companyId, year, month]
+        );
+        bonusByEmp = new Map(bonusRows.map(r => [Number(r.employee_id), Number(r.bonus || 0)]));
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
     }
 
     const result = employees.map(emp => {
-        const monthlySalary = Number(emp.salary ?? emp.default_salary ?? 0);
-        const perDayRate = monthlySalary / daysInMonth;
+        const baseSalary = round2(Number(emp.salary ?? emp.default_salary ?? 0));
+        const perDayRate = baseSalary / daysInMonth;
+        const empHeads = headsByEmp.get(emp.id) || { addition: [], deduction: [] };
+        const additionTotal = round2(empHeads.addition.reduce((sum, h) => sum + h.amount, 0));
+        const deductionTotal = round2(empHeads.deduction.reduce((sum, h) => sum + h.amount, 0));
 
-        // Returns 'paid', 'unpaid', or null (not on leave that day). The
-        // split's paid_days count from the front of the application (day
-        // 0, 1, 2... from from_date) - matches how routes/leaves.js POST
-        // / decided it: "first N days paid" where N is whatever quota
-        // was left when the employee applied.
-        const leavePayStatusFor = (dateStr) => {
+        const leavePayFractionFor = (dateStr) => {
             for (const l of leaveRows) {
                 if (l.employee_id !== emp.id) continue;
-                const from = l.from_date instanceof Date ? l.from_date.toISOString().slice(0, 10) : String(l.from_date);
-                const to = l.to_date instanceof Date ? l.to_date.toISOString().slice(0, 10) : String(l.to_date);
+                const from = String(l.from_date).slice(0, 10);
+                const to = String(l.to_date).slice(0, 10);
                 if (dateStr < from || dateStr > to) continue;
-
                 const paidDays = l.paid_days !== null && l.paid_days !== undefined
-                    ? Number(l.paid_days)
-                    : Number(l.days_count); // pre-migration_009 row: fully paid, unchanged from old behavior
-                const dayIndex = Math.round((new Date(dateStr) - new Date(from)) / (1000 * 60 * 60 * 24));
-                return dayIndex < paidDays ? 'paid' : 'unpaid';
+                    ? Number(l.paid_days) : Number(l.days_count || 0);
+                const dayIndex = Math.round((new Date(`${dateStr}T00:00:00`) - new Date(`${from}T00:00:00`)) / 86400000);
+                // Preserve fractional paid leave (for example 0.5 day) rather
+                // than forcing every covered calendar date into paid/unpaid.
+                return Math.max(0, Math.min(1, paidDays - dayIndex));
             }
             return null;
         };
 
-        let basePay = 0;
+        const dayResults = [];
         for (let day = 1; day <= daysToCount; day++) {
             const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-            const dayOfWeek = new Date(year, month - 1, day).getDay(); // 0=Sun..6=Sat, matches off_days_bitmask bit layout
+            const dayOfWeek = new Date(`${dateStr}T00:00:00`).getDay();
+            const shift = shiftContext.resolve(emp, dateStr);
+            const policy = shift ? shiftPolicyIndex.policyFor(shift.id) : null;
+            const shiftId = shift ? shift.id : emp.shift_id;
+            const empShift = shiftId != null ? (shiftOffIndex.byId.get(shiftId) || shift) : shift;
 
-            if (holidayDates.has(dateStr)) { basePay += perDayRate; continue; } // paid automatically
-            if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) { basePay += perDayRate; continue; } // weekly off, paid automatically
-
-            const leaveStatus = leavePayStatusFor(dateStr);
-            if (leaveStatus === 'paid') {
-                basePay += perDayRate;
-                continue;
-            }
-            if (leaveStatus === 'unpaid') {
-                continue; // unpaid leave day - no pay, counted as absence
-            }
-
-            const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
-            if (!attendance || !attendance.check_in) {
-                continue; // no pay - no punch, no leave
-            }
-
-            let hours = 0;
-            if (attendance.check_out) {
-                hours = (new Date(attendance.check_out) - new Date(attendance.check_in)) / (1000 * 60 * 60);
+            let offDaysBitmask = weeklyOffIndex.companyDefault;
+            let altSaturdays = empShift ? empShift.alt_saturdays : null;
+            let isWeeklyOff2 = () => false;
+            if (shiftId != null && shiftPolicyOffIndex.has(shiftId)) {
+                offDaysBitmask = shiftPolicyOffIndex.offDaysBitmaskFor(shiftId);
+                altSaturdays = null;
+                isWeeklyOff2 = d => shiftPolicyOffIndex.isWeeklyOff2Date(shiftId, d);
+            } else if (empShift && empShift.weekly_off_bitmask != null) {
+                offDaysBitmask = empShift.weekly_off_bitmask;
+            } else {
+                const dept = weeklyOffIndex.forDepartment(emp.department);
+                if (dept != null) offDaysBitmask = dept;
+                else offDaysBitmask = effectiveOffDaysBitmask(empShift, emp.department, weeklyOffIndex);
             }
 
-            if (hours >= fullDayHours) {
-                basePay += perDayRate;
-            } else if (hours >= halfDayMinHours) {
-                basePay += perDayRate / 2;
-            }
-            // else: no pay for that day
+            const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`) || null;
+            const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
+            const punchPair = pairPunchEvents(dayEvents, { considerOnlyFirstLastPunch: !!policy?.consider_only_first_last_punch });
+            const firstIn = punchPair.firstIn || (attendance ? attendance.check_in : null);
+            const lastOut = punchPair.lastOut || (attendance ? attendance.check_out : null);
+            const punchHasCompletePair = punchPair.intervals.length > 0;
+            const workMinutes = dayEvents.length > 0 && punchHasCompletePair
+                ? punchPair.totalWorkMinutes
+                : (attendance && attendance.check_in && attendance.check_out
+                    ? Math.max(0, Math.round((new Date(attendance.check_out) - new Date(attendance.check_in)) / 60000))
+                    : null);
+            const leavePaidFraction = leavePayFractionFor(dateStr);
+            const lateEarly = lateEarlyMinutesForPunches(dateStr, shift, firstIn, lastOut, policy);
+            const status = classifyDayShared({
+                dateStr, dayOfWeek,
+                isHoliday: d => holidayIndex.isHoliday(d, employeeGroups.get(emp.id) ?? null),
+                offDaysBitmask, altSaturdays, isWeeklyOff2,
+                isOnApprovedLeave: d => leavePayFractionFor(d) !== null,
+                attendance: attendance || (firstIn ? { check_in: firstIn, check_out: lastOut } : null),
+                fullDayHours, halfDayMinHours,
+                workMinutesOverride: workMinutes,
+                policy,
+                lateByMinutes: lateEarly.lateByMinutes,
+                earlyByMinutes: lateEarly.earlyByMinutes,
+            });
+            dayResults.push({ date: dateStr, status, leavePaidFraction, workMinutes, lateByMinutes: lateEarly.lateByMinutes, earlyByMinutes: lateEarly.earlyByMinutes });
         }
 
+        // Office Time Policy prefix/suffix rules are applied to the final
+        // per-day statuses before converting them to paid-day units.
+        if (dayResults.length && (dayResults.some(d => d.status === 'weekly_off' || d.status === 'holiday'))) {
+            // Apply only when the resolved policy is consistent across the
+            // period. For mixed-shift employees, day-level classification
+            // remains authoritative and no cross-shift block conversion is
+            // attempted.
+            const policies = new Set();
+            for (const d of dayResults) {
+                const shift = shiftContext.resolve(emp, d.date);
+                policies.add(shift ? shiftPolicyIndex.policyFor(shift.id) : null);
+            }
+            if (policies.size === 1) {
+                const policy = policies.values().next().value;
+                if (policy) applyPrefixSuffixAbsent(dayResults, {
+                    prefix: !!policy.mark_absent_prefix_day,
+                    suffix: !!policy.mark_absent_suffix_day,
+                    both: !!policy.mark_absent_both_prefix_suffix_day,
+                });
+            }
+        }
+
+        let earnedUnits = 0;
+        let presentUnits = 0;
+        for (const d of dayResults) {
+            if (d.status === 'holiday' || d.status === 'weekly_off') {
+                earnedUnits += 1;
+            } else if (d.leavePaidFraction != null) {
+                earnedUnits += d.leavePaidFraction;
+            } else if (d.status === 'present') {
+                earnedUnits += 1;
+                presentUnits += 1;
+            } else if (d.status === 'half_day') {
+                earnedUnits += 0.5;
+                presentUnits += 0.5;
+            }
+        }
+
+        const earnedHead = round2(perDayRate * earnedUnits);
         const existing = payrollByEmp.get(emp.id);
-        const bonus = existing ? Number(existing.bonus) : 0;
+        const bonus = round2(
+            bonusByEmp.has(emp.id)
+                ? Number(bonusByEmp.get(emp.id) || 0)
+                : (existing ? Number(existing.bonus || 0) : 0)
+        );
         const overtime = overtimeByEmp.get(emp.id);
-        const overtimePay = overtime ? Math.round(Number(overtime.overtime_pay) * 100) / 100 : 0;
-        const overtimeHours = overtime ? Number(overtime.overtime_hours) : 0;
-        const roundedBasePay = Math.round(basePay * 100) / 100;
-        const totalPay = Math.round((basePay + bonus + overtimePay) * 100) / 100;
+        const overtimePay = round2(overtime ? Number(overtime.overtime_pay || 0) : 0);
+        const overtimeHours = overtime ? Number(overtime.overtime_hours || 0) : 0;
+        const dynamicGross = round2(earnedHead + bonus + overtimePay);
 
-        // Payment Setup breakdown for this employee (see the batched
-        // query above) - hasSalaryStructure lets the UI say plainly
-        // "this figure came from Payment Setup" vs "nobody has
-        // configured Payment Setup for this employee yet, this is just
-        // the flat Salary field" instead of presenting both the same
-        // way and leaving the admin to guess which one they're looking
-        // at.
-        const headsSummary = salaryHeadsByEmp.get(emp.id);
-        const hasSalaryStructure = !!headsSummary;
-
-        // PF wages = the earned base pay for this period (already
-        // prorated for absences/LOP above) - PF is a wage-linked
-        // deduction, not charged on bonus/overtime. ESI and PT are
-        // conventionally checked against gross pay instead (basic +
-        // allowances + bonus + overtime), so they use totalPay.
         const employeeOverride = emp.statutory_override_active === undefined ? null : {
             active: !!emp.statutory_override_active,
             pfPercent: emp.pf_percent, epfPercent: emp.epf_percent, esiPercent: emp.esi_percent,
             pfLimit: emp.pf_limit, tdsAmount: emp.tds_amount, tdsPercent: emp.tds_percent,
         };
-        const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, roundedBasePay, totalPay, employeeOverride);
+        const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, earnedHead, dynamicGross, employeeOverride);
+        const fixedDeductionTotal = round2(statutory.pfEmployee + statutory.esiEmployee + statutory.ptAmount + statutory.tdsAmount);
+        const total1 = round2(dynamicGross - fixedDeductionTotal);
+        const total2 = round2(total1 + additionTotal);
 
-        // Projected loan deduction (migration_028) - see the loanRows
-        // comment above for why this is a preview only, not a write.
         let loanDeduction = 0;
         const empLoans = loansByEmp.get(emp.id) || [];
         const loanSummaries = empLoans.map(l => {
             const outstanding = Math.max(0, Number(l.principal_amount) - Number(l.paid_so_far));
             let projected = 0;
             if (l.repayment_mode === 'salary_percent' && l.salary_deduction_percent) {
-                projected = Math.min(outstanding, round2(roundedBasePay * Number(l.salary_deduction_percent) / 100));
+                projected = Math.min(outstanding, round2(Math.max(0, total2) * Number(l.salary_deduction_percent) / 100));
                 loanDeduction += projected;
             }
             return {
@@ -365,38 +461,49 @@ async function computeMonthlyPayroll(companyId, year, month) {
             };
         });
 
+        const grossTotal = round2(total2 - deductionTotal - loanDeduction);
+        const effectiveOvertimeRate = emp.statutory_override_active && emp.ot_rate_type && emp.ot_rate_value != null
+            ? { type: emp.ot_rate_type, value: Number(emp.ot_rate_value) }
+            : { type: 'fixed', value: companyOtRate == null ? null : Number(companyOtRate) };
+
         return {
             employee_id: emp.id,
             employee_name: emp.name,
             emp_code: emp.emp_code,
-            base_pay: roundedBasePay,
+            // Backward-compatible `base_pay` now means the earned base for
+            // this month; `base_salary` is the fixed Employee Details salary.
+            base_salary: baseSalary,
+            base_pay: earnedHead,
+            earned_head: earnedHead,
             bonus,
             overtime_pay: overtimePay,
             overtime_hours: overtimeHours,
-            total_pay: totalPay,
+            total_pay: dynamicGross,
+            total_1: total1,
+            addition_total: additionTotal,
+            total_2: total2,
+            deduction_total: deductionTotal,
+            fixed_deduction_total: fixedDeductionTotal,
+            gross_total: grossTotal,
             pf_employee: statutory.pfEmployee,
             pf_employer: statutory.pfEmployer,
             esi_employee: statutory.esiEmployee,
             esi_employer: statutory.esiEmployer,
             pt_amount: statutory.ptAmount,
-            // migration_035 - per-employee TDS, only nonzero when this
-            // employee has an active statutory override with a TDS
-            // amount/percent set (see computeStatutoryDeductions above).
             tds_amount: statutory.tdsAmount,
             loans: loanSummaries,
             loan_deduction: round2(loanDeduction),
-            net_pay: Math.round((totalPay - statutory.pfEmployee - statutory.esiEmployee - statutory.ptAmount - statutory.tdsAmount - loanDeduction) * 100) / 100,
-            has_salary_structure: hasSalaryStructure,
-            addition_total: hasSalaryStructure ? round2(Number(headsSummary.addition_total)) : null,
-            deduction_total: hasSalaryStructure ? round2(Number(headsSummary.deduction_total)) : null,
-            is_paid: existing ? !!existing.is_paid : false,
-            paid_on: existing ? existing.paid_on : null,
-            // New (pass 2, see daysToCount comment above): lets the UI
-            // show "earned through day X of Y" instead of a number that
-            // silently looks final when the month isn't over yet.
+            net_pay: grossTotal, // legacy consumer: final amount to be paid
+            has_salary_structure: !!headsByEmp.has(emp.id),
+            ot_rate_type: effectiveOvertimeRate.type,
+            ot_rate_value: effectiveOvertimeRate.value,
             days_counted: daysToCount,
             days_in_month: daysInMonth,
+            paid_day_units: presentUnits,
             month_in_progress: isCurrentMonth,
+            is_paid: existing ? !!existing.is_paid : false,
+            paid_on: existing ? existing.paid_on : null,
+            salary_heads: empHeads,
         };
     });
 
@@ -531,13 +638,69 @@ router.post('/:employeeId/bonus', requireAdmin, asyncHandler(async (req, res) =>
         return res.status(400).json({ error: 'year, month, and bonus are required' });
     }
 
-    await pool.query(
-        `INSERT INTO payroll_records (company_id, employee_id, year, month, bonus, total_pay)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE bonus = VALUES(bonus)`,
-        [req.user.companyId, req.params.employeeId, year, month, bonus, bonus]
-    );
-    return res.json({ message: 'Bonus updated' });
+    const companyId = req.user.companyId;
+    const employeeId = Number(req.params.employeeId);
+    const amount = Number(bonus);
+    if (!Number.isFinite(amount) || amount < 0) {
+        return res.status(400).json({ error: 'bonus must be a non-negative number' });
+    }
+
+    // Keep the existing endpoint/feature, but store the monthly inline payroll
+    // adjustment in the same `bonuses` source used by Bonus Payroll. This
+    // prevents the two screens from silently overwriting each other.
+    const adjustmentReason = '[SYSTEM:PayrollScreenBonusAdjustment]';
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        try {
+            const [existing] = await conn.query(
+                `SELECT id FROM bonuses
+                 WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ? AND reason = ?
+                 ORDER BY id DESC LIMIT 1`,
+                [companyId, employeeId, year, month, adjustmentReason]
+            );
+            if (existing.length) {
+                await conn.query('UPDATE bonuses SET amount = ? WHERE id = ?', [amount, existing[0].id]);
+            } else {
+                await conn.query(
+                    `INSERT INTO bonuses (company_id, employee_id, year, month, amount, reason)
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    [companyId, employeeId, year, month, amount, adjustmentReason]
+                );
+            }
+
+            const [totals] = await conn.query(
+                `SELECT COALESCE(SUM(amount), 0) AS bonus
+                 FROM bonuses WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?`,
+                [companyId, employeeId, year, month]
+            );
+            const totalBonus = Number(totals[0]?.bonus || 0);
+            await conn.query(
+                `INSERT INTO payroll_records (company_id, employee_id, year, month, bonus, total_pay)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE bonus = VALUES(bonus)`,
+                [companyId, employeeId, year, month, totalBonus, totalBonus]
+            );
+            await conn.commit();
+            return res.json({ message: 'Bonus updated', bonus: totalBonus });
+        } catch (err) {
+            if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+            await conn.rollback();
+            // Backward-compatible fallback for databases that predate Bonus Payroll.
+            await pool.query(
+                `INSERT INTO payroll_records (company_id, employee_id, year, month, bonus, total_pay)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE bonus = VALUES(bonus)`,
+                [companyId, employeeId, year, month, amount, amount]
+            );
+            return res.json({ message: 'Bonus updated', bonus: amount });
+        }
+    } catch (err) {
+        try { await conn.rollback(); } catch (_) {}
+        throw err;
+    } finally {
+        conn.release();
+    }
 }));
 
 router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res) => {
@@ -603,3 +766,4 @@ router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res
 }));
 
 module.exports = router;
+module.exports.computeMonthlyPayroll = computeMonthlyPayroll;

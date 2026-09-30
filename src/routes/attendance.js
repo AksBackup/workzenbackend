@@ -39,23 +39,51 @@ router.use(verifyFirebaseToken);
  * assumed safe.
  */
 async function recordPunchEventsAndDeriveAttendance({
-    companyId, employeeId, date, checkIn, checkOut, source, deviceId, verifyMode, syncedFromLocal,
+    companyId, employeeId, date, checkIn, checkOut, source, deviceId, verifyMode, syncedFromLocal, punchEvents = [],
 }) {
-    if (checkIn) {
-        await pool.query(
-            `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
-             VALUES (?, ?, ?, ?, 'in', ?, ?, ?)`,
-            [companyId, employeeId, date, checkIn, source || 'scanner', deviceId || null, verifyMode || 'unknown']
+    // When a caller has the full raw sequence, insert each event exactly once.
+    // The equality key is intentionally (time,type) so offline retries cannot
+    // inflate work duration by duplicating the same punch. Existing single
+    // check-in/check-out callers remain fully supported below.
+    if (Array.isArray(punchEvents) && punchEvents.length > 0) {
+        const [existingEvents] = await pool.query(
+            'SELECT punch_time, punch_type FROM punch_events WHERE company_id = ? AND employee_id = ? AND date = ?',
+            [companyId, employeeId, date]
         );
+        const seen = new Set(existingEvents.map(e => `${new Date(e.punch_time).getTime()}|${e.punch_type}`));
+        for (const event of punchEvents) {
+            if (!event || !event.punch_time || !['in', 'out'].includes(event.punch_type)) continue;
+            const ts = new Date(event.punch_time);
+            if (Number.isNaN(ts.getTime())) continue;
+            const key = `${ts.getTime()}|${event.punch_type}`;
+            if (seen.has(key)) continue;
+            await pool.query(
+                `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                [companyId, employeeId, date, event.punch_time, event.punch_type, source || 'scanner', deviceId || null, verifyMode || 'unknown']
+            );
+            seen.add(key);
+        }
+    }
+    if (checkIn) {
+        if (!(Array.isArray(punchEvents) && punchEvents.length > 0)) {
+            await pool.query(
+                `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
+                 VALUES (?, ?, ?, ?, 'in', ?, ?, ?)`,
+                [companyId, employeeId, date, checkIn, source || 'scanner', deviceId || null, verifyMode || 'unknown']
+            );
+        }
     }
     if (checkOut) {
-        await pool.query(
-            `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
-             VALUES (?, ?, ?, ?, 'out', ?, ?, ?)`,
-            [companyId, employeeId, date, checkOut, source || 'scanner', deviceId || null, verifyMode || 'unknown']
-        );
+        if (!(Array.isArray(punchEvents) && punchEvents.length > 0)) {
+            await pool.query(
+                `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
+                 VALUES (?, ?, ?, ?, 'out', ?, ?, ?)`,
+                [companyId, employeeId, date, checkOut, source || 'scanner', deviceId || null, verifyMode || 'unknown']
+            );
+        }
     }
-    if (!checkIn && !checkOut) return;
+    if (!checkIn && !checkOut && !(Array.isArray(punchEvents) && punchEvents.length > 0)) return;
 
     const [events] = await pool.query(
         'SELECT punch_time, punch_type FROM punch_events WHERE company_id = ? AND employee_id = ? AND date = ? ORDER BY punch_time ASC',
@@ -147,7 +175,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
     await recordPunchEventsAndDeriveAttendance({
         companyId: req.user.companyId, employeeId: employee_id, date,
-        checkIn: check_in || null, checkOut: check_out || null,
+        checkIn: check_in || null, checkOut: check_out || null, punchEvents: [],
         source: source || 'manual', deviceId: device_id || null, verifyMode: verify_mode || 'unknown',
     });
     if (check_out) {
@@ -207,7 +235,7 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
         try {
             await recordPunchEventsAndDeriveAttendance({
                 companyId: req.user.companyId, employeeId: r.employee_id, date: r.date,
-                checkIn: r.check_in || null, checkOut: r.check_out || null,
+                checkIn: r.check_in || null, checkOut: r.check_out || null, punchEvents: Array.isArray(r.punch_events) ? r.punch_events : [],
                 source, deviceId: r.device_id || null, verifyMode, syncedFromLocal: true,
             });
             succeeded.push(r);
@@ -220,8 +248,9 @@ router.post('/sync', requireAdmin, asyncHandler(async (req, res) => {
     // Overtime is best-effort and independent per row - a failure here
     // shouldn't affect the attendance rows that already committed above.
     for (const r of succeeded) {
-        if (r.check_out) {
-            await computeAndRecordOvertime(req.user.companyId, r.employee_id, r.date, r.check_out).catch(err =>
+        if (r.check_out || (Array.isArray(r.punch_events) && r.punch_events.some(e => e && e.punch_type === 'out'))) {
+            const latestOut = (Array.isArray(r.punch_events) ? r.punch_events.filter(e => e && e.punch_type === 'out' && e.punch_time).sort((a,b) => new Date(a.punch_time) - new Date(b.punch_time)).pop()?.punch_time : null) || r.check_out;
+            await computeAndRecordOvertime(req.user.companyId, r.employee_id, r.date, latestOut).catch(err =>
                 console.error('Overtime computation failed:', err)
             );
         }
