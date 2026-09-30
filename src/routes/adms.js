@@ -385,9 +385,19 @@ router.get('/rtdata', asyncHandler(async (req, res) => {
         const [rows] = await pool.query(
             "SELECT fallbacks, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age FROM device_commands WHERE device_id = ? AND cmd_type = 'set_time' AND created_at > NOW() - INTERVAL 15 MINUTE ORDER BY id DESC LIMIT 1",
             [device.id]);
-        let wall = null;
-        try { wall = rows.length && rows[0].fallbacks ? (JSON.parse(rows[0].fallbacks).wall || null) : null; } catch (_) {}
+        let wall = null, meta = {};
+        try { meta = rows.length && rows[0].fallbacks ? JSON.parse(rows[0].fallbacks) : {}; wall = meta.wall || null; } catch (_) {}
         if (!wall) return ok(res);
+        // Universal mode: true UTC epoch + the chosen zone's offset (DST-aware, computed
+        // by deviceCloud.js). No per-device correction needed.
+        if (String(process.env.ADMS_TIME_MODE || '').toLowerCase() === 'utc' && Number.isFinite(meta.utc)) {
+            const off = Number.isFinite(meta.off) ? meta.off : 0;
+            const sign = off < 0 ? '-' : '+';
+            const hhmm = String(Math.floor(Math.abs(off) / 60)).padStart(2, '0') + String(Math.abs(off) % 60).padStart(2, '0');
+            const body = `DateTime=${meta.utc + Math.max(0, rows[0].age || 0)},ServerTZ=${sign}${hhmm}`;
+            console.log(`[adms] rtdata reply to device ${device.id}: ${body} (utc mode, tz ${meta.tz})`);
+            return ok(res, body);
+        }
         const fmt = String(process.env.ADMS_TIME_FORMAT || 'zk').toLowerCase();
         const value = encodeDeviceTime(wall, rows[0].age, fmt);
         if (!value) return ok(res);

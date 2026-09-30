@@ -200,14 +200,62 @@ router.post('/admins/clear', requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 // ---- time -----------------------------------------------------------------
+// The app no longer works out the device's clock face itself. It sends the
+// real instant (utc_ms) plus the IANA time zone chosen in the Device Admin
+// dropdown, and THIS server calculates the wall-clock time for that zone.
+// (Legacy/custom-time callers may still send time = "YYYY-MM-DD HH:MM[:SS]",
+// which is treated as already being the wall clock in that zone.)
+function wallClockInZone(utcMs, tz) {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(utcMs));
+    const g = (t) => parts.find((x) => x.type === t).value;
+    return `${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}:${g('second')}`;
+}
+
+// Offset (minutes east of UTC) that `tz` has at the instant utcMs - DST-aware.
+function tzOffsetMin(utcMs, tz) {
+    const w = wallClockInZone(utcMs, tz);
+    const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(w);
+    return Math.round((Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) - Math.floor(utcMs / 1000) * 1000) / 60000);
+}
+// A wall-clock time typed in zone `tz` -> the real UTC instant.
+function wallToUtcMs(y, mo, d, h, mi, s, tz) {
+    const asUtc = Date.UTC(y, mo - 1, d, h, mi, s);
+    const guess = asUtc - tzOffsetMin(asUtc, tz) * 60000;
+    return asUtc - tzOffsetMin(guess, tz) * 60000;
+}
+
 router.post('/time', requireAdmin, asyncHandler(async (req, res) => {
     const device = await getDevice(req, res); if (!device) return;
-    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(clean(req.body.time));
-    if (!m) return res.status(400).json({ error: 'time must be "YYYY-MM-DD HH:MM[:SS]" (device wall-clock time)' });
-    const [primary, ...fallbacks] = buildTimeCommands(+m[1], +m[2], +m[3], +m[4], +m[5], +(m[6] || 0));
+    const tz = clean(req.body.tz) || 'Asia/Kolkata';
+    try { new Intl.DateTimeFormat('en-GB', { timeZone: tz }); }
+    catch (_) { return res.status(400).json({ error: `Unknown time zone "${tz}"` }); }
+
+    let text;
+    const utcMs = Number(req.body.utc_ms);
+    if (Number.isFinite(utcMs) && utcMs > 0) {
+        text = wallClockInZone(utcMs, tz);
+    } else {
+        text = clean(req.body.time);
+    }
+    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(text);
+    if (!m) return res.status(400).json({ error: 'send utc_ms (+ tz) or time "YYYY-MM-DD HH:MM[:SS]"' });
+    const utcInstant = Number.isFinite(utcMs) && utcMs > 0
+        ? utcMs : wallToUtcMs(+m[1], +m[2], +m[3], +m[4], +m[5], +(m[6] || 0), tz);
+    const offMin = tzOffsetMin(utcInstant, tz);
+    const [primary0, ...fallbacks] = buildTimeCommands(+m[1], +m[2], +m[3], +m[4], +m[5], +(m[6] || 0));
     const wallText = `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${pad(+(m[6] || 0))}`;
-    const id = await enqueue(device, 'set_time', primary, { alts: fallbacks, wall: wallText });
-    res.status(202).json({ id });
+    // ADMS_TIME_MODE=utc  -> send the true UTC instant + the zone's offset (universal).
+    // anything else       -> legacy: wall clock as if it were UTC (current behaviour).
+    const utcMode = String(process.env.ADMS_TIME_MODE || '').toLowerCase() === 'utc';
+    const primary = utcMode ? `SET OPTIONS DateTime=${Math.floor(utcInstant / 1000)}` : primary0;
+    console.log(`[cloud] set_time device ${device.id}: tz ${tz} (${offMin} min) -> wall ${wallText}, utc ${new Date(utcInstant).toISOString()}, mode ${utcMode ? 'utc' : 'legacy'}`);
+    const id = await enqueue(device, 'set_time', primary, {
+        alts: fallbacks, wall: wallText, tz, utc: Math.floor(utcInstant / 1000), off: offMin,
+    });
+    res.status(202).json({ id, wall: wallText, tz });
 }));
 
 module.exports = router;
