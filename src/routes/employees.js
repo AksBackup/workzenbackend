@@ -301,16 +301,9 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         && !['fixed', 'percentage'].includes(req.body.ot_rate_type)) {
         return res.status(400).json({ error: "ot_rate_type must be 'fixed' or 'percentage'" });
     }
-<<<<<<< HEAD
-    // Employee Details owns the base salary. Payment Setup only owns
-    // recurring addition/deduction heads, so salary remains editable here
-    // even when salary_heads already exist. Saving another employee field
-    // must never silently block or replace the base salary source.
-=======
     // payroll v3: employees.salary is the BASE salary and is always editable here.
     // Payment Setup heads no longer overwrite it (routes/salaryStructures.js).
     let salaryWarning = null;
->>>>>>> b066605 (payroll v2)
 
     const updates = [];
     const values = [];

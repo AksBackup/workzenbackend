@@ -1,65 +1,42 @@
 const pool = require('../db');
-const { pairPunchEvents } = require('./attendanceRules');
 
 /**
- * Auto-computes overtime for one employee/day whenever a checkout is
- * recorded. The function name and callers remain unchanged.
+ * Auto-computes overtime for one employee/day whenever a check-out is
+ * recorded, and upserts it into `overtime_records` as 'pending' - it
+ * always needs admin approval (Employee Details > Attendance & Leave)
+ * before it's confirmed, per the brief ("overtime will require admin
+ * approvement for the confirmation").
  *
- * Source-of-truth order for worked time:
- *   1. Raw punch_events, paired IN -> OUT -> IN -> OUT and summed.
- *   2. Legacy attendance/check-out policy fallback when raw punches are
- *      unavailable (keeps older records working).
+ * Rate resolution (migration_035 added the per-employee override):
+ *   1. If this employee has an active statutory/OT override
+ *      (employees.statutory_override_active) with an ot_rate_type set,
+ *      use THAT rate instead of the company-wide one:
+ *        - 'fixed'      -> ot_rate_value, a flat rupees-per-OT-hour figure.
+ *        - 'percentage' -> ot_rate_value% of this employee's derived
+ *          per-hour salary rate, i.e. employees.salary / (full_day_hours
+ *          * days in dateStr's month) - full_day_hours comes from
+ *          office_time_policy, the same figure payroll.js's
+ *          computeMonthlyPayroll uses to decide full/half day pay.
+ *   2. Otherwise, fall back to the original company-wide behaviour:
+ *      office_time_policy.overtime_rate_per_hour. A NULL rate there
+ *      still means "not configured", not "free overtime at ₹0/hour" -
+ *      nothing is computed until either an admin sets a company rate or
+ *      this employee has their own override.
  *
- * OT minutes are based on worked minutes beyond the employee's effective
- * shift duration. Employee OT fixed/percentage configuration is honored
- * when its override is active; otherwise the existing company policy rate
- * is used.
+ * Called from:
+ *   - attendance.js  POST /attendance        (single punch write)
+ *   - attendance.js  POST /attendance/sync   (offline queue batch)
+ *   - manualPunch.js POST /:id/approve       (approved manual punch)
+ * All three already upsert into `attendance` with the same
+ * (employee_id, date) unique key `overtime_records` also uses, so this
+ * is called right after that upsert succeeds, using whatever the
+ * resulting check_out value is (COALESCEd, so this always reflects the
+ * real stored value even for check-in-only writes that don't touch
+ * check_out at all).
  */
 async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOutValue) {
     if (!checkOutValue) return;
 
-<<<<<<< HEAD
-    let employee;
-    try {
-        const [rows] = await pool.query(
-            `SELECT e.id, e.salary, e.shift_id, e.ot_rate_type, e.ot_rate_value, e.statutory_override_active
-             FROM employees e WHERE e.id = ? AND e.company_id = ? LIMIT 1`,
-            [employeeId, companyId]
-        );
-        employee = rows[0] || null;
-    } catch (err) {
-        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
-        const [rows] = await pool.query(
-            `SELECT e.id, e.salary, e.shift_id FROM employees e WHERE e.id = ? AND e.company_id = ? LIMIT 1`,
-            [employeeId, companyId]
-        );
-        employee = rows[0] || null;
-    }
-    if (!employee) return;
-
-    const [shiftAssignmentRows] = await pool.query(
-        `SELECT s.* FROM shift_assignments sa
-         JOIN shifts s ON s.id = sa.shift_id
-         WHERE sa.company_id = ? AND sa.employee_id = ?
-           AND sa.effective_from <= ? AND (sa.effective_to IS NULL OR sa.effective_to >= ?)
-         ORDER BY sa.effective_from DESC LIMIT 1`,
-        [companyId, employeeId, dateStr, dateStr]
-    ).catch(err => {
-        if (err.code === 'ER_NO_SUCH_TABLE') return [[]];
-        throw err;
-    });
-    let shift = shiftAssignmentRows[0] || null;
-    if (!shift && employee.shift_id != null) {
-        const [rows] = await pool.query('SELECT * FROM shifts WHERE id = ? AND company_id = ? LIMIT 1', [employee.shift_id, companyId]);
-        shift = rows[0] || null;
-    }
-    if (!shift) {
-        const [rows] = await pool.query('SELECT * FROM shifts WHERE company_id = ? AND is_default = TRUE LIMIT 1', [companyId]);
-        shift = rows[0] || null;
-    }
-
-    if (shift && shift.ot_allowed === false || shift && Number(shift.ot_allowed) === 0) {
-=======
     // migration_015: per-shift OT eligibility gate. An employee with no
     // shift assigned (shift_id NULL) keeps today's original behaviour
     // (OT computed for everyone) - the join below only excludes someone
@@ -74,7 +51,6 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
         // This employee's shift explicitly disallows OT - clear any
         // stale pending record for consistency (e.g. their shift was
         // just changed to an OT-disallowed one) and stop.
->>>>>>> b066605 (payroll v2)
         await pool.query(
             "DELETE FROM overtime_records WHERE employee_id = ? AND date = ? AND status = 'pending'",
             [employeeId, dateStr]
@@ -83,11 +59,8 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
     }
 
     const [policyRows] = await pool.query(
-        'SELECT check_out_time, overtime_rate_per_hour, full_day_hours, max_ot_minutes FROM office_time_policy WHERE company_id = ?',
+        'SELECT check_out_time, overtime_rate_per_hour, full_day_hours FROM office_time_policy WHERE company_id = ?',
         [companyId]
-<<<<<<< HEAD
-    ).catch(async err => {
-=======
     );
     if (policyRows.length === 0) return;
     const { check_out_time: companyCheckOutTime, overtime_rate_per_hour, full_day_hours } = policyRows[0];
@@ -112,76 +85,52 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
             employeeOverride = empRows[0];
         }
     } catch (err) {
->>>>>>> b066605 (payroll v2)
         if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
-        return pool.query(
-            'SELECT check_out_time, overtime_rate_per_hour, full_day_hours FROM office_time_policy WHERE company_id = ?',
-            [companyId]
-        );
-    });
-    if (policyRows.length === 0) return;
-    const { check_out_time, overtime_rate_per_hour, full_day_hours, max_ot_minutes: officePolicyMaxOtMinutes } = policyRows[0];
-
-    let override = null;
-    if (employee.statutory_override_active && employee.ot_rate_type && employee.ot_rate_value != null) {
-        override = employee;
+        // migration_035 not applied yet - proceed with no OT override.
     }
 
     let rate;
-    if (override) {
-        if (override.ot_rate_type === 'fixed') {
-            rate = Number(override.ot_rate_value) || 0;
+    if (employeeOverride) {
+        if (employeeOverride.ot_rate_type === 'fixed') {
+            rate = parseFloat(employeeOverride.ot_rate_value) || 0;
         } else {
-            const daysInMonth = new Date(Number(dateStr.slice(0, 4)), Number(dateStr.slice(5, 7)), 0).getDate();
-            const fullDay = Number(full_day_hours) || 8;
-            const monthlySalary = Number(override.salary) || 0;
-            const hourlyRate = monthlySalary > 0 ? monthlySalary / (fullDay * daysInMonth) : 0;
-            rate = hourlyRate * (Number(override.ot_rate_value) || 0) / 100;
+            // 'percentage' - of this employee's derived per-hour salary
+            // rate. Falls back to a rate of 0 (not an error) if salary or
+            // full_day_hours isn't set - an OT % of an undefined base pay
+            // isn't computable, and silently skipping is safer than
+            // guessing.
+            const daysInMonth = new Date(
+                Number(dateStr.slice(0, 4)), Number(dateStr.slice(5, 7)), 0
+            ).getDate();
+            const fullDayHours = Number(full_day_hours) || 8.0;
+            const monthlySalary = Number(employeeOverride.salary) || 0;
+            const hourlyRate = monthlySalary > 0 ? monthlySalary / (fullDayHours * daysInMonth) : 0;
+            rate = round2(hourlyRate * (parseFloat(employeeOverride.ot_rate_value) || 0) / 100);
         }
     } else if (overtime_rate_per_hour !== null) {
-        rate = Number(overtime_rate_per_hour) || 0;
+        rate = parseFloat(overtime_rate_per_hour);
     } else {
+        // No employee override and no company-wide rate configured -
+        // same "not configured" no-op as before this migration.
         return;
     }
 
-    const [eventRows] = await pool.query(
-        `SELECT punch_time, punch_type FROM punch_events
-         WHERE company_id = ? AND employee_id = ? AND DATE(punch_time) = ?
-         ORDER BY punch_time ASC`,
-        [companyId, employeeId, dateStr]
-    ).catch(err => {
-        if (err.code === 'ER_NO_SUCH_TABLE') return [[]];
-        throw err;
-    });
+    const checkOut = new Date(checkOutValue);
+    if (Number.isNaN(checkOut.getTime())) return;
 
-    let overtimeHours = 0;
-    const pair = pairPunchEvents(eventRows);
-    if (pair.intervals.length > 0 && shift && shift.start_time != null && shift.end_time != null) {
-        const [sh, sm] = String(shift.start_time).split(':').map(Number);
-        const [eh, em] = String(shift.end_time).split(':').map(Number);
-        const start = new Date(`${dateStr}T00:00:00`);
-        start.setHours(sh || 0, sm || 0, 0, 0);
-        const end = new Date(`${dateStr}T00:00:00`);
-        end.setHours(eh || 0, em || 0, 0, 0);
-        if (end <= start) end.setDate(end.getDate() + 1);
-        const scheduledMinutes = Math.max(0, Math.round((end - start) / 60000));
-        const maxOtMinutes = Number.isFinite(Number(officePolicyMaxOtMinutes))
-            ? Number(officePolicyMaxOtMinutes)
-            : (Number.isFinite(Number(shift.max_ot_minutes)) ? Number(shift.max_ot_minutes) : null);
-        const rawOtMinutes = Math.max(0, pair.totalWorkMinutes - scheduledMinutes);
-        const otMinutes = maxOtMinutes != null && maxOtMinutes > 0 ? Math.min(rawOtMinutes, maxOtMinutes) : rawOtMinutes;
-        overtimeHours = otMinutes / 60;
-    } else {
-        // Legacy fallback for old attendance rows that have no raw punch events.
-        const checkOut = new Date(checkOutValue);
-        if (Number.isNaN(checkOut.getTime()) || check_out_time == null) return;
-        const parts = String(check_out_time).split(':').map(Number);
-        const scheduled = new Date(checkOut);
-        scheduled.setHours(parts[0] || 0, parts[1] || 0, parts[2] || 0, 0);
-        overtimeHours = Math.max(0, (checkOut.getTime() - scheduled.getTime()) / 3600000);
-    }
+    const [h, m, s] = String(check_out_time).split(':').map(Number);
+    const scheduled = new Date(checkOut);
+    scheduled.setHours(h || 0, m || 0, s || 0, 0);
 
-    if (overtimeHours <= 0 || rate <= 0) {
+    const diffMs = checkOut.getTime() - scheduled.getTime();
+    const overtimeHours = diffMs > 0 ? diffMs / (1000 * 60 * 60) : 0;
+
+    if (overtimeHours <= 0) {
+        // Not staying late (or checked out earlier than before, e.g. a
+        // corrected punch) - remove any stale PENDING record for this
+        // day rather than leaving a now-wrong approval request sitting
+        // around. An already-approved record is left alone; unwinding a
+        // real approval isn't this function's call to make.
         await pool.query(
             "DELETE FROM overtime_records WHERE employee_id = ? AND date = ? AND status = 'pending'",
             [employeeId, dateStr]
@@ -190,6 +139,7 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
     }
 
     const amount = overtimeHours * rate;
+
     await pool.query(
         `INSERT INTO overtime_records (company_id, employee_id, date, checkout_time, overtime_hours, rate_per_hour, amount, status)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
@@ -198,9 +148,21 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
            overtime_hours = VALUES(overtime_hours),
            rate_per_hour = VALUES(rate_per_hour),
            amount = VALUES(amount),
+           -- Recalculating shouldn't silently undo a real approval - only
+           -- downgrade back to 'pending' if it wasn't already approved.
+           -- This also happens to protect migration_017's manual entries
+           -- (always inserted 'approved') from being knocked back to
+           -- 'pending' if a real late check-out also lands on the same
+           -- day - hours/amount still get refreshed to match the actual
+           -- punch, but the approval and 'manual' source (untouched
+           -- above) survive.
            status = IF(status = 'approved', status, 'pending')`,
         [companyId, employeeId, dateStr, checkOutValue, overtimeHours.toFixed(2), rate.toFixed(2), amount.toFixed(2)]
     );
+}
+
+function round2(n) {
+    return Math.round(n * 100) / 100;
 }
 
 module.exports = { computeAndRecordOvertime };

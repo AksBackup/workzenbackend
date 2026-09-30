@@ -2,7 +2,6 @@ const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
-const payrollRoute = require('./payroll');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -91,45 +90,15 @@ router.get('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
         if (err.code !== 'ER_NO_SUCH_TABLE') throw err; // bonuses table not migrated yet - treat as zero, same defensive fallback as the heads query above
     }
 
-    const baseSalary = empRows[0].salary === null ? null : Number(empRows[0].salary);
-    let payroll = null;
-    try {
-        const rows = await payrollRoute.computeMonthlyPayroll(req.user.companyId, bonusYear, bonusMonth);
-        payroll = rows.find(r => Number(r.employee_id) === Number(req.params.employeeId)) || null;
-    } catch (err) {
-        // Payment Setup must remain usable while a legacy payroll dependency
-        // is being migrated; recurring heads themselves are still returned.
-        console.warn('Unable to load fixed payroll heads:', err.message);
-    }
-    const recurringNet = round2(addition.reduce((s, h) => s + Number(h.amount || 0), 0) - deduction.reduce((s, h) => s + Number(h.amount || 0), 0));
+    const grossSalary = empRows[0].salary === null ? null : Number(empRows[0].salary);
     return res.json({
         addition,
         deduction,
-        // Backward-compatible field: this is now the recurring head net,
-        // NOT the employee master salary and never feeds employees.salary.
-        gross_salary: recurringNet,
-        base_salary: baseSalary,
+        gross_salary: grossSalary,
         current_month_bonus: currentMonthBonus,
         current_month_bonus_year: bonusYear,
         current_month_bonus_month: bonusMonth,
-        gross_salary_with_bonus: baseSalary === null ? null : round2(baseSalary + currentMonthBonus),
-        fixed_heads: payroll ? {
-            base_salary: payroll.base_salary,
-            earned_head: payroll.earned_head,
-            overtime: payroll.overtime_pay,
-            overtime_hours: payroll.overtime_hours,
-            ot_rate_type: payroll.ot_rate_type,
-            ot_rate_value: payroll.ot_rate_value,
-            bonus: payroll.bonus,
-            statutory: payroll.statutory,
-            fixed_deduction_total: payroll.fixed_deduction_total,
-            total_1: payroll.total_1,
-            addition_total: payroll.addition_total,
-            total_2: payroll.total_2,
-            deduction_total: payroll.deduction_total,
-            loan_deduction: payroll.loan_deduction,
-            gross_total: payroll.gross_total,
-        } : null,
+        gross_salary_with_bonus: grossSalary === null ? null : grossSalary + currentMonthBonus,
     });
 }));
 
@@ -163,11 +132,7 @@ router.put('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
         });
     }
 
-<<<<<<< HEAD
-    const recurringNet = additionTotal - deductionTotal;
-=======
     const gross = additionTotal - deductionTotal; // net of heads only - informational, NOT stored as salary
->>>>>>> b066605 (payroll v2)
 
     const conn = await pool.getConnection();
     try {
@@ -180,18 +145,11 @@ router.put('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
                 [req.user.companyId, req.params.employeeId, h.type, h.name, h.amount, h.sortOrder]
             );
         }
-<<<<<<< HEAD
-        // IMPORTANT: Employee Details owns employees.salary. Payment Setup
-        // owns recurring heads only, so saving this screen must never
-        // overwrite the employee's base salary. This removes the legacy
-        // salary-overwrite loop while preserving the endpoint contract.
-=======
         // The one line that actually feeds payroll - same as
         // migration_029's version of this file did.
         // NOTE (payroll v3): employees.salary is the BASE SALARY set in Employee Details and is
         // never written from here any more. Heads are separate fixed monthly additions /
         // deductions layered on top of the earned amount (see routes/payroll.js).
->>>>>>> b066605 (payroll v2)
         await conn.commit();
     } catch (err) {
         await conn.rollback();
@@ -200,8 +158,7 @@ router.put('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
     } finally {
         conn.release();
     }
-    const [freshEmpRows] = await pool.query('SELECT salary FROM employees WHERE id = ? AND company_id = ?', [req.params.employeeId, req.user.companyId]);
-    return res.json({ message: 'Salary heads saved', gross_salary: recurringNet, addition_total: additionTotal, deduction_total: deductionTotal, base_salary: freshEmpRows.length ? Number(freshEmpRows[0].salary) : null });
+    return res.json({ message: 'Salary heads saved', gross_salary: gross, addition_total: additionTotal, deduction_total: deductionTotal });
 }));
 
 module.exports = router;

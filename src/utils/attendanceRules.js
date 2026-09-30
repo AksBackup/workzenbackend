@@ -205,8 +205,6 @@ module.exports = {
     // effectiveOffDaysBitmask/isAltSaturdayOff and keeps working
     // exactly as before.
     derivePunchSpan,
-    pairPunchEvents,
-    classifyDay,
     loadPunchEventsForDay,
     loadPunchEventsIndex,
     loadShiftPolicyIndex,
@@ -214,99 +212,6 @@ module.exports = {
     resolveShiftGrace,
     isNthWeekdayOfMonthOff,
 };
-
-/**
- * Deterministically pairs punch_events as IN -> OUT -> IN -> OUT.
- * Duplicate IN punches while waiting for an OUT are ignored, as are
- * stray leading OUT punches. Completed interval durations are summed.
- * This is the attendance/payroll work-hour source of truth for multiple
- * punches; the legacy derivePunchSpan() remains available for callers
- * that intentionally need the old full-span behaviour.
- */
-function pairPunchEvents(events, { considerOnlyFirstLastPunch = false } = {}) {
-    if (!events || events.length === 0) {
-        return { firstIn: null, lastOut: null, totalWorkMinutes: 0, intervals: [], unmatchedIn: null };
-    }
-    const sorted = [...events]
-        .filter(e => e && (e.punch_type === 'in' || e.punch_type === 'out'))
-        .sort((a, b) => new Date(a.punch_time) - new Date(b.punch_time));
-    const source = considerOnlyFirstLastPunch && sorted.length > 1
-        ? [sorted.find(e => e.punch_type === 'in') || sorted[0], [...sorted].reverse().find(e => e.punch_type === 'out') || sorted[sorted.length - 1]]
-        : sorted;
-    const intervals = [];
-    let openIn = null;
-    for (const event of source) {
-        const ts = new Date(event.punch_time);
-        if (Number.isNaN(ts.getTime())) continue;
-        if (event.punch_type === 'in') {
-            if (!openIn) openIn = event;
-            continue;
-        }
-        if (event.punch_type === 'out' && openIn) {
-            const start = new Date(openIn.punch_time);
-            const minutes = Math.round((ts - start) / 60000);
-            if (minutes >= 0) {
-                intervals.push({ in: openIn.punch_time, out: event.punch_time, durationMinutes: minutes });
-            }
-            openIn = null;
-        }
-    }
-    return {
-        firstIn: intervals.length ? intervals[0].in : (openIn ? openIn.punch_time : null),
-        lastOut: intervals.length ? intervals[intervals.length - 1].out : null,
-        totalWorkMinutes: intervals.reduce((sum, x) => sum + x.durationMinutes, 0),
-        intervals,
-        unmatchedIn: openIn ? openIn.punch_time : null,
-    };
-}
-
-/**
- * Shared employee-day classification. Optional policy/late/early inputs
- * extend the original duration rules without changing existing call sites.
- */
-function classifyDay({
-    dateStr, dayOfWeek, isHoliday, offDaysBitmask, altSaturdays,
-    isWeeklyOff2 = () => false, isOnApprovedLeave, attendance,
-    fullDayHours, halfDayMinHours, workMinutesOverride = undefined,
-    policy = null, lateByMinutes = 0, earlyByMinutes = 0,
-}) {
-    if (isHoliday(dateStr)) return 'holiday';
-    if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) return 'weekly_off';
-    if (isAltSaturdayOff(dateStr, altSaturdays)) return 'weekly_off';
-    if (isWeeklyOff2(dateStr)) return 'weekly_off';
-    if (isOnApprovedLeave(dateStr)) return 'leave';
-    if (!attendance || !attendance.check_in) return 'absent';
-    if (!attendance.check_out) return 'present';
-
-    const minutes = workMinutesOverride != null
-        ? Number(workMinutesOverride)
-        : Math.max(0, Math.round((new Date(attendance.check_out) - new Date(attendance.check_in)) / 60000));
-    const fullMinutes = Math.max(1, Math.round(Number(fullDayHours || 8) * 60));
-    const halfMinutes = Math.max(0, Math.round(Number(halfDayMinHours || 4) * 60));
-    const absentThreshold = policy?.absent_if_duration_less_than_minutes != null
-        ? Number(policy.absent_if_duration_less_than_minutes)
-        : halfMinutes;
-    const halfThreshold = policy?.half_day_if_duration_less_than_minutes != null
-        ? Number(policy.half_day_if_duration_less_than_minutes)
-        : fullMinutes;
-
-    let status = minutes >= halfThreshold ? 'present' : (minutes >= absentThreshold ? 'half_day' : 'absent');
-
-    if (policy) {
-        const lateTrigger = policy.half_day_if_late_by_enabled &&
-            policy.half_day_if_late_by_minutes != null &&
-            lateByMinutes >= Number(policy.half_day_if_late_by_minutes);
-        const earlyTrigger = policy.half_day_if_early_going_by_enabled &&
-            policy.half_day_if_early_going_by_minutes != null &&
-            earlyByMinutes >= Number(policy.half_day_if_early_going_by_minutes);
-        const lateAbsent = policy.mark_late_absent_enabled &&
-            policy.mark_late_absent_after_minutes != null &&
-            lateByMinutes >= Number(policy.mark_late_absent_after_minutes);
-        if (lateAbsent) status = policy.mark_late_absent_status || 'absent';
-        else if (lateTrigger || earlyTrigger) status = 'half_day';
-    }
-    return status;
-}
 
 /**
  * Task 3: derives {firstIn, lastOut, workMinutes} from one day's raw
@@ -408,24 +313,11 @@ async function loadShiftPolicyIndex(companyId) {
     const [rows] = await pool.query(
         `SELECT ops.shift_id, p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences,
                 p.grace_late_coming_minutes, p.grace_early_going_minutes,
-<<<<<<< HEAD
-                p.absent_if_duration_less_than_minutes, p.half_day_if_duration_less_than_minutes,
-                p.mark_late_absent_enabled, p.mark_late_absent_status, p.mark_late_absent_after_minutes,
-                p.consider_only_first_last_punch, p.deduct_break_hours_from_work_duration,
-                p.ot_deduction_from_holiday_minutes, p.ot_deduction_from_weekly_off_minutes,
-                p.partial_day_half_day_if_duration_less_than_minutes, p.partial_day_absent_if_duration_less_than_minutes,
-                p.ot_formula, p.max_ot_minutes, p.half_day_if_late_by_enabled, p.half_day_if_late_by_minutes,
-                p.half_day_if_early_going_by_enabled, p.half_day_if_early_going_by_minutes,
-                p.consider_early_coming_punch, p.consider_late_going_punch,
-                p.mark_absent_prefix_day, p.mark_absent_suffix_day, p.mark_absent_both_prefix_suffix_day,
-                p.punch_required_mode, p.present_weekly_off_count, p.check_duplicate_minute
-=======
                 p.deduct_break_hours_from_work_duration,
                 p.mark_absent_prefix_day, p.mark_absent_suffix_day, p.mark_absent_both_prefix_suffix_day,
                 p.absent_if_duration_less_than_minutes, p.half_day_if_duration_less_than_minutes,
                 p.half_day_if_late_by_enabled, p.half_day_if_late_by_minutes,
                 p.half_day_if_early_going_by_enabled, p.half_day_if_early_going_by_minutes
->>>>>>> b066605 (payroll v2)
          FROM office_time_policy_shifts ops
          JOIN office_time_policies p ON p.id = ops.policy_id
          WHERE ops.company_id = ?`,
@@ -462,12 +354,9 @@ async function loadShiftPolicyIndex(companyId) {
         graceFor(shiftId) {
             const r = byShiftId.get(shiftId);
             return {
-                lateGraceMinutes: r ? Number(r.grace_late_coming_minutes || 0) : 0,
-                earlyGraceMinutes: r ? Number(r.grace_early_going_minutes || 0) : 0,
+                lateGraceMinutes: r ? r.grace_late_coming_minutes || 0 : 0,
+                earlyGraceMinutes: r ? r.grace_early_going_minutes || 0 : 0,
             };
-        },
-        policyFor(shiftId) {
-            return byShiftId.get(shiftId) || null;
         },
     };
 }
