@@ -250,15 +250,32 @@ router.post('/time', requireAdmin, asyncHandler(async (req, res) => {
     // ADMS_TIME_MODE=utc  -> send the true UTC instant + the zone's offset (universal).
     // anything else       -> legacy: wall clock as if it were UTC (current behaviour).
     const utcMode = String(process.env.ADMS_TIME_MODE || '').toLowerCase() === 'utc';
-    const utcWall = wallClockInZone(utcInstant, 'UTC');
+    // The device adds ITS OWN built-in zone (device_tz, as shown in its Date/Time menu)
+    // on top of the value it receives and ignores ServerTZ. So send
+    //   UTC + target offset - device offset
+    // and the device ends up showing the target zone's wall clock. Any zone pair works.
+    let devTz = clean(req.body.device_tz) || 'UTC';
+    try { new Intl.DateTimeFormat('en-GB', { timeZone: devTz }); } catch (_) { devTz = 'UTC'; }
+    const devOffMin = tzOffsetMin(utcInstant, devTz);
+    const sentMs = utcInstant + (offMin - devOffMin) * 60000;
+    const utcWall = wallClockInZone(sentMs, 'UTC');
     const um = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(utcWall);
     // Device firmware reads DateTime in ZK encoding (not unix) - encode the true UTC moment.
     const primary = utcMode
         ? `SET OPTIONS DateTime=${zkEncode(new Date(+um[1], +um[2] - 1, +um[3], +um[4], +um[5], +um[6]))}`
         : primary0;
-    console.log(`[cloud] set_time device ${device.id}: tz ${tz} (${offMin} min) -> wall ${wallText}, utc ${new Date(utcInstant).toISOString()}, mode ${utcMode ? 'utc' : 'legacy'}`);
+    console.log(`[cloud] set_time device ${device.id}: tz ${tz} (${offMin} min) -> wall ${wallText}, utc ${new Date(utcInstant).toISOString()}, mode ${utcMode ? 'utc' : 'legacy'}, device zone ${devTz} (${devOffMin} min), sent value = ${wallClockInZone(sentMs, 'UTC')}`);
+    // The device converts the UTC value into ITS OWN zone (ignores ServerTZ), so first
+    // tell it which zone to use. Unit differs by firmware: ADMS_TZ_UNIT=min (default,
+    // e.g. 330) or hour (e.g. 5.5). Queued before the time so it is applied first.
+    if (utcMode) {
+        const hourUnit = String(process.env.ADMS_TZ_UNIT || 'min').toLowerCase() === 'hour';
+        const tzVal = hourUnit ? String(offMin / 60) : String(offMin);
+        await enqueue(device, 'set_tz', `SET OPTIONS TimeZone=${tzVal}`, null);
+        console.log(`[cloud] set_tz device ${device.id}: TimeZone=${tzVal} (${hourUnit ? 'hours' : 'minutes'})`);
+    }
     const id = await enqueue(device, 'set_time', primary, {
-        alts: fallbacks, wall: wallText, tz, utc: Math.floor(utcInstant / 1000), off: offMin,
+        alts: fallbacks, wall: wallText, tz, utc: Math.floor(sentMs / 1000), off: offMin, devTz, devOff: devOffMin,
     });
     res.status(202).json({ id, wall: wallText, tz });
 }));
