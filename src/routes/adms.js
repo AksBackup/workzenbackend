@@ -82,6 +82,45 @@ async function findEnabledDevice(sn) {
     return rows[0] || null;
 }
 
+
+// Parse user rows the device sends (reply to DATA QUERY USERINFO, or USER lines
+// inside OPERLOG) and mirror them into device_cloud_users.
+async function ingestUsers(device, body) {
+    if (typeof body !== 'string' || !body) return 0;
+    let n = 0;
+    for (const raw of body.split(/\r\n|\r|\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        const m = /^(?:USERINFO|USER)\s+(.*)$/i.exec(line);
+        const rest = m ? m[1] : line;
+        if (!/(^|[\s\t])PIN=/i.test(rest) && !/^pin=/i.test(rest)) continue;
+        const kv = {};
+        for (const part of rest.split(/\t|\s(?=[A-Za-z]+=)/)) {
+            const i = part.indexOf('=');
+            if (i > 0) kv[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim();
+        }
+        const pin = kv.pin;
+        if (!pin || !/^[0-9]{1,9}$/.test(pin)) continue;
+        const pri = parseInt(kv.pri !== undefined ? kv.pri : kv.privilege, 10);
+        let card = kv.card !== undefined ? kv.card : kv.cardno;
+        if (card === '0' || card === '') card = null;
+        await pool.query(
+            `INSERT INTO device_cloud_users (company_id, device_id, pin, name, privilege, card) VALUES (?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE name = VALUES(name), privilege = VALUES(privilege), card = VALUES(card)`,
+            [device.company_id, device.id, pin, (kv.name || '').slice(0, 100) || null, Number.isNaN(pri) ? 0 : pri, card]
+        );
+        n++;
+    }
+    if (n > 0) {
+        await pool.query(
+            "UPDATE device_commands SET status = 'acked', done_at = NOW() WHERE device_id = ? AND cmd_type = 'query_users' AND status IN ('sent','acked')",
+            [device.id]
+        );
+        console.log(`[adms] device ${device.id}: ingested ${n} user row(s)`);
+    }
+    return n;
+}
+
 const ok = (res, body = 'OK') => res.status(200).type('text/plain').send(body);
 
 // Handshake - the device asks how to behave when it boots / reconnects.
@@ -122,7 +161,12 @@ router.post('/cdata', asyncHandler(async (req, res) => {
     }
     await pool.query('UPDATE devices SET adms_last_seen = NOW(), status = ? WHERE id = ?', ['online', device.id]);
 
-    if (table !== 'ATTLOG') return ok(res); // OPERLOG / user data etc: acknowledged, not stored
+    if (table === 'USERINFO' || table === 'USER' || table === 'OPERLOG') {
+        await ingestUsers(device, typeof req.body === 'string' ? req.body : '')
+            .catch((err) => console.error('[adms] user ingest failed:', err.message));
+        return ok(res);
+    }
+    if (table !== 'ATTLOG') return ok(res); // other tables: acknowledged, not stored
 
     const body = typeof req.body === 'string' ? req.body : '';
     const parsed = [];
@@ -143,7 +187,20 @@ router.post('/cdata', asyncHandler(async (req, res) => {
 
     const companyId = device.company_id;
     const [empRows] = await pool.query('SELECT id, emp_code FROM employees WHERE company_id = ?', [companyId]);
-    const empByCode = new Map(empRows.map((e) => [String(e.emp_code), e.id]));
+    // Exact match only: the device's User ID is numeric, and "001" vs "1" are
+    // deliberately treated as two different IDs.
+    const empByCode = new Map(empRows.map((e) => [String(e.emp_code).trim(), e.id]));
+    // PINs an admin switched off in Device Users: keep their raw punches but
+    // create no attendance (the device itself has no reliable "disabled").
+    let disabledPins = new Set();
+    try {
+        const [dis] = await pool.query('SELECT pin FROM device_cloud_users WHERE device_id = ? AND disabled = 1', [device.id]);
+        disabledPins = new Set(dis.map((r) => String(r.pin)));
+    } catch (_) { /* table not migrated yet - nothing disabled */ }
+    const unmatched = [...new Set(parsed.map((p) => p.pin).filter((pin) => !empByCode.get(pin)))];
+    if (unmatched.length) {
+        console.warn(`[adms] SN ${sn}: PIN(s) ${unmatched.join(', ')} match no employee emp_code in company ${companyId} - stored in raw_punches only, NO attendance created`);
+    }
 
     // 1) raw_punches (browsable log) - same dedup as POST /raw-punches/bulk.
     let stored = 0;
@@ -168,7 +225,7 @@ router.post('/cdata', asyncHandler(async (req, res) => {
     const groups = new Map(); // "empId|date" -> { employeeId, date, times[], verify }
     for (const p of parsed) {
         const employeeId = empByCode.get(p.pin);
-        if (!employeeId) continue;
+        if (!employeeId || disabledPins.has(p.pin)) continue;
         const date = p.ts.slice(0, 10);
         const key = `${employeeId}|${date}`;
         if (!groups.has(key)) groups.set(key, { employeeId, date, times: [], verify: p.verify });
@@ -217,13 +274,75 @@ router.post('/cdata', asyncHandler(async (req, res) => {
     return ok(res, `OK: ${parsed.length}`);
 }));
 
-// Command poll (we never queue commands for devices) and command result.
+// Command poll: hand the device its queued commands (see routes/deviceCloud.js).
 router.get('/getrequest', asyncHandler(async (req, res) => {
     const device = await findEnabledDevice(String(req.query.SN || ''));
-    if (device) await pool.query('UPDATE devices SET adms_last_seen = NOW() WHERE id = ?', [device.id]);
+    if (!device) return ok(res);
+    await pool.query('UPDATE devices SET adms_last_seen = NOW() WHERE id = ?', [device.id]);
+    try {
+        // A command handed out but never answered: retry it, give up after 3 sends.
+        await pool.query("UPDATE device_commands SET status = 'failed', done_at = NOW(), result_text = 'No reply from device' WHERE device_id = ? AND status = 'sent' AND sent_at < NOW() - INTERVAL 120 SECOND AND attempt >= 3", [device.id]);
+        await pool.query("UPDATE device_commands SET status = 'pending' WHERE device_id = ? AND status = 'sent' AND sent_at < NOW() - INTERVAL 120 SECOND AND attempt < 3", [device.id]);
+        const [cmds] = await pool.query("SELECT id, cmd_text FROM device_commands WHERE device_id = ? AND status = 'pending' ORDER BY id ASC LIMIT 10", [device.id]);
+        if (cmds.length === 0) return ok(res);
+        await pool.query("UPDATE device_commands SET status = 'sent', sent_at = NOW(), attempt = attempt + 1 WHERE id IN (?)", [cmds.map((c) => c.id)]);
+        console.log(`[adms] SN ${device.id}: sending ${cmds.length} command(s): ${cmds.map((c) => c.cmd_text.split('\t')[0]).join(' | ')}`);
+        return ok(res, cmds.map((c) => `C:${c.id}:${c.cmd_text}`).join('\n'));
+    } catch (err) {
+        console.error('[adms] command delivery failed (is migration_039 applied?):', err.message);
+        return ok(res);
+    }
+}));
+
+// Command result: "ID=<id>&Return=<code>&CMD=<...>" (one or more lines).
+async function handleCmdResult(req, res) {
+    const device = await findEnabledDevice(String(req.query.SN || ''));
+    if (!device) return ok(res);
+    try {
+        const lines = (typeof req.body === 'string' ? req.body : '').split(/\r\n|\r|\n/).map((l) => l.trim()).filter(Boolean);
+        if (!lines.length && req.query.ID) lines.push(new URLSearchParams(req.query).toString());
+        for (const line of lines) {
+            const q = new URLSearchParams(line);
+            const id = parseInt(q.get('ID'), 10);
+            if (Number.isNaN(id)) continue;
+            const rc = parseInt(q.get('Return'), 10);
+            const [rows] = await pool.query('SELECT id, cmd_type, fallbacks, attempt FROM device_commands WHERE id = ? AND device_id = ?', [id, device.id]);
+            if (!rows.length) continue;
+            const c = rows[0];
+            console.log(`[adms] device ${device.id} result cmd ${id} (${c.cmd_type}): ${line.slice(0, 120)}`);
+            if (rc === 0) {
+                await pool.query('UPDATE device_commands SET status = ?, return_code = 0, result_text = ?, done_at = NOW() WHERE id = ?',
+                    [c.cmd_type === 'query_users' ? 'acked' : 'done', line.slice(0, 500), id]);
+                continue;
+            }
+            let fb = [];
+            try { fb = c.fallbacks ? JSON.parse(c.fallbacks) : []; } catch (_) { fb = []; }
+            if (fb.length) {
+                const [next, ...rest] = fb;
+                await pool.query("UPDATE device_commands SET cmd_text = ?, fallbacks = ?, status = 'pending', return_code = ?, result_text = ? WHERE id = ?",
+                    [next, rest.length ? JSON.stringify(rest) : null, Number.isNaN(rc) ? null : rc, `First form rejected (${line.slice(0, 200)}); retrying alternate form`, id]);
+            } else {
+                await pool.query("UPDATE device_commands SET status = 'failed', return_code = ?, result_text = ?, done_at = NOW() WHERE id = ?",
+                    [Number.isNaN(rc) ? null : rc, line.slice(0, 500), id]);
+            }
+        }
+    } catch (err) {
+        console.error('[adms] devicecmd handling failed:', err.message);
+    }
+    return ok(res);
+}
+router.post('/devicecmd', asyncHandler(handleCmdResult));
+router.get('/devicecmd', asyncHandler(handleCmdResult));
+
+// Table rows the device returns for DATA QUERY (alternate form).
+router.post('/querydata', asyncHandler(async (req, res) => {
+    const device = await findEnabledDevice(String(req.query.SN || ''));
+    if (device) {
+        await ingestUsers(device, typeof req.body === 'string' ? req.body : '')
+            .catch((err) => console.error('[adms] querydata ingest failed:', err.message));
+    }
     return ok(res);
 }));
-router.post('/devicecmd', (req, res) => ok(res));
 router.get('/ping', (req, res) => ok(res));
 
 module.exports = router;

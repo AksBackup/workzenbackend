@@ -24,11 +24,21 @@ router.use(verifyFirebaseToken);
 // automatically on a timer.
 
 router.get('/', asyncHandler(async (req, res) => {
+    // For Cloud-Server (ADMS) devices the stored `status` is only ever set to
+    // 'online' by a handshake and never flips back. So derive it from
+    // adms_last_seen: online only if the device contacted us in the last 3 min.
     const [rows] = await pool.query(
-        'SELECT * FROM devices WHERE company_id = ? ORDER BY device_name ASC',
+        `SELECT *,
+                CASE WHEN adms_last_seen IS NULL THEN NULL
+                     ELSE TIMESTAMPDIFF(SECOND, adms_last_seen, NOW()) END AS adms_age_sec
+           FROM devices WHERE company_id = ? ORDER BY device_name ASC`,
         [req.user.companyId]
     );
-    return res.json(rows);
+    return res.json(rows.map((r) => {
+        if (!r.adms_enabled) return r;
+        const fresh = r.adms_age_sec !== null && r.adms_age_sec <= 180;
+        return { ...r, status: fresh ? 'online' : 'offline' };
+    }));
 }));
 
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
@@ -119,5 +129,8 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
     await pool.query('DELETE FROM devices WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
     return res.json({ message: 'Deleted' });
 }));
+
+// Cloud Server (ADMS) control: queue commands to a device that can't be reached over TCP.
+router.use('/:id/cloud', require('./deviceCloud'));
 
 module.exports = router;
