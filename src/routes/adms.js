@@ -394,7 +394,11 @@ router.get('/rtdata', asyncHandler(async (req, res) => {
             const off = Number.isFinite(meta.off) ? meta.off : 0;
             const sign = off < 0 ? '-' : '+';
             const hhmm = String(Math.floor(Math.abs(off) / 60)).padStart(2, '0') + String(Math.abs(off) % 60).padStart(2, '0');
-            const body = `DateTime=${meta.utc + Math.max(0, rows[0].age || 0)},ServerTZ=${sign}${hhmm}`;
+            const u = new Date((meta.utc + Math.max(0, rows[0].age || 0)) * 1000);
+            const p2 = (n) => String(n).padStart(2, '0');
+            const utcWall = `${u.getUTCFullYear()}-${p2(u.getUTCMonth() + 1)}-${p2(u.getUTCDate())} ${p2(u.getUTCHours())}:${p2(u.getUTCMinutes())}:${p2(u.getUTCSeconds())}`;
+            // ZK encoding of the true UTC moment (this firmware does not read unix).
+            const body = `DateTime=${encodeDeviceTime(utcWall, 0, 'zk')},ServerTZ=${sign}${hhmm}`;
             console.log(`[adms] rtdata reply to device ${device.id}: ${body} (utc mode, tz ${meta.tz})`);
             return ok(res, body);
         }

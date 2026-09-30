@@ -250,7 +250,12 @@ router.post('/time', requireAdmin, asyncHandler(async (req, res) => {
     // ADMS_TIME_MODE=utc  -> send the true UTC instant + the zone's offset (universal).
     // anything else       -> legacy: wall clock as if it were UTC (current behaviour).
     const utcMode = String(process.env.ADMS_TIME_MODE || '').toLowerCase() === 'utc';
-    const primary = utcMode ? `SET OPTIONS DateTime=${Math.floor(utcInstant / 1000)}` : primary0;
+    const utcWall = wallClockInZone(utcInstant, 'UTC');
+    const um = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(utcWall);
+    // Device firmware reads DateTime in ZK encoding (not unix) - encode the true UTC moment.
+    const primary = utcMode
+        ? `SET OPTIONS DateTime=${zkEncode(new Date(+um[1], +um[2] - 1, +um[3], +um[4], +um[5], +um[6]))}`
+        : primary0;
     console.log(`[cloud] set_time device ${device.id}: tz ${tz} (${offMin} min) -> wall ${wallText}, utc ${new Date(utcInstant).toISOString()}, mode ${utcMode ? 'utc' : 'legacy'}`);
     const id = await enqueue(device, 'set_time', primary, {
         alts: fallbacks, wall: wallText, tz, utc: Math.floor(utcInstant / 1000), off: offMin,
