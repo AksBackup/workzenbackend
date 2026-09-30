@@ -41,7 +41,7 @@ async function getDevice(req, res) {
 async function enqueue(device, type, text, fallbacks) {
     const [r] = await pool.query(
         'INSERT INTO device_commands (company_id, device_id, cmd_type, cmd_text, fallbacks) VALUES (?, ?, ?, ?, ?)',
-        [device.company_id, device.id, type, text, fallbacks && fallbacks.length ? JSON.stringify(fallbacks) : null]
+        [device.company_id, device.id, type, text, fallbacks && (Array.isArray(fallbacks) ? fallbacks.length : true) ? JSON.stringify(fallbacks) : null]
     );
     return r.insertId;
 }
@@ -57,6 +57,8 @@ const zkEncode = (d) =>
     ((d.getFullYear() - 2000) * 12 * 31 + d.getMonth() * 31 + (d.getDate() - 1)) * 86400 +
     d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
 
+const pad = (n) => String(n).padStart(2, '0');
+
 // The device stores wall-clock time. The admin's chosen wall-clock is sent as
 // "seconds" with no timezone shift. Which numeric encoding firmware 8.0.4.2
 // wants is NOT verified - default unix; set ADMS_TIME_FORMAT=zk to flip. The
@@ -64,9 +66,20 @@ const zkEncode = (d) =>
 function buildTimeCommands(y, mo, d, h, mi, s) {
     const wall = new Date(y, mo - 1, d, h, mi, s);
     const unix = Math.floor(Date.UTC(y, mo - 1, d, h, mi, s) / 1000);
-    const a = `SET OPTIONS DateTime=${unix}`;
-    const b = `SET OPTIONS DateTime=${zkEncode(wall)}`;
-    return (process.env.ADMS_TIME_FORMAT || 'unix') === 'zk' ? [b, a] : [a, b];
+    // ADMS_TIME_FORMAT picks which encoding is tried FIRST: unix | zk | iso.
+    // Devices often answer Return=0 to a time they did not actually apply, so the
+    // only way to find the right one for your firmware is to try them one at a
+    // time and look at the device's own clock.
+    const iso = `${y}-${pad(mo)}-${pad(d)} ${pad(h)}:${pad(mi)}:${pad(s)}`;
+    const all = { unix, zk: zkEncode(wall), iso };
+    const first = String(process.env.ADMS_TIME_FORMAT || 'unix').toLowerCase();
+    const order = [first, ...['unix', 'zk', 'iso'].filter((k) => k !== first)].filter((k) => k in all);
+    const forms = order.map((k) => all[k]);
+    // Some firmware spells the verb SET OPTION (singular), some SET OPTIONS.
+    // A rejected form (non-zero Return) automatically moves on to the next one.
+    const out = [];
+    for (const f of forms) for (const verb of ['SET OPTIONS', 'SET OPTION']) out.push(`${verb} DateTime=${f}`);
+    return out;
 }
 
 // ---- status / polling ------------------------------------------------------
@@ -192,7 +205,8 @@ router.post('/time', requireAdmin, asyncHandler(async (req, res) => {
     const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/.exec(clean(req.body.time));
     if (!m) return res.status(400).json({ error: 'time must be "YYYY-MM-DD HH:MM[:SS]" (device wall-clock time)' });
     const [primary, ...fallbacks] = buildTimeCommands(+m[1], +m[2], +m[3], +m[4], +m[5], +(m[6] || 0));
-    const id = await enqueue(device, 'set_time', primary, fallbacks);
+    const wallText = `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${pad(+(m[6] || 0))}`;
+    const id = await enqueue(device, 'set_time', primary, { alts: fallbacks, wall: wallText });
     res.status(202).json({ id });
 }));
 

@@ -71,7 +71,9 @@ router.use((req, res, next) => {
 });
 
 const SN_PATTERN = /^[A-Za-z0-9_-]{4,40}$/;
-const VERIFY_LABELS = { 0: 'password', 1: 'fingerprint', 2: 'card', 15: 'face' };
+// Same table the desktop app uses (models/punch_mode.dart), confirmed against
+// this F22's real logs: 3 = password, 4 = card (plus the classic 0/1/2 and 15).
+const VERIFY_LABELS = { 0: 'password', 1: 'fingerprint', 2: 'card', 3: 'password', 4: 'card', 15: 'face' };
 
 async function findEnabledDevice(sn) {
     if (!sn || !SN_PATTERN.test(sn)) return null;
@@ -228,8 +230,9 @@ router.post('/cdata', asyncHandler(async (req, res) => {
         if (!employeeId || disabledPins.has(p.pin)) continue;
         const date = p.ts.slice(0, 10);
         const key = `${employeeId}|${date}`;
-        if (!groups.has(key)) groups.set(key, { employeeId, date, times: [], verify: p.verify });
+        if (!groups.has(key)) groups.set(key, { employeeId, date, times: [], verifyByTime: {} });
         groups.get(key).times.push(p.ts);
+        groups.get(key).verifyByTime[p.ts] = p.verify;
     }
     for (const g of groups.values()) {
         try {
@@ -256,7 +259,9 @@ router.post('/cdata', asyncHandler(async (req, res) => {
             await recordPunchEventsAndDeriveAttendance({
                 companyId, employeeId: g.employeeId, date: g.date, checkIn, checkOut,
                 source: 'scanner', deviceId: device.id,
-                verifyMode: VERIFY_LABELS[g.verify] || 'unknown', syncedFromLocal: false,
+                // A check-in is labelled with the earliest punch's method, a
+                // check-out-only update with the latest punch's method.
+                verifyMode: VERIFY_LABELS[g.verifyByTime[checkIn ? first : last]] || 'unknown', syncedFromLocal: false,
             });
             if (checkOut) {
                 await computeAndRecordOvertime(companyId, g.employeeId, g.date, checkOut)
@@ -315,12 +320,15 @@ async function handleCmdResult(req, res) {
                     [c.cmd_type === 'query_users' ? 'acked' : 'done', line.slice(0, 500), id]);
                 continue;
             }
-            let fb = [];
-            try { fb = c.fallbacks ? JSON.parse(c.fallbacks) : []; } catch (_) { fb = []; }
-            if (fb.length) {
-                const [next, ...rest] = fb;
+            let meta = {};
+            try { meta = c.fallbacks ? JSON.parse(c.fallbacks) : {}; } catch (_) { meta = {}; }
+            const alts = Array.isArray(meta) ? meta : (meta.alts || []);
+            if (alts.length) {
+                const [next, ...rest] = alts;
+                const newMeta = Array.isArray(meta) ? rest : { ...meta, alts: rest };
                 await pool.query("UPDATE device_commands SET cmd_text = ?, fallbacks = ?, status = 'pending', return_code = ?, result_text = ? WHERE id = ?",
-                    [next, rest.length ? JSON.stringify(rest) : null, Number.isNaN(rc) ? null : rc, `First form rejected (${line.slice(0, 200)}); retrying alternate form`, id]);
+                    [next, (Array.isArray(newMeta) ? newMeta.length : (newMeta.alts.length || newMeta.wall)) ? JSON.stringify(newMeta) : null,
+                     Number.isNaN(rc) ? null : rc, `Form rejected (${line.slice(0, 200)}); retrying alternate form`, id]);
             } else {
                 await pool.query("UPDATE device_commands SET status = 'failed', return_code = ?, result_text = ?, done_at = NOW() WHERE id = ?",
                     [Number.isNaN(rc) ? null : rc, line.slice(0, 500), id]);
@@ -343,6 +351,31 @@ router.post('/querydata', asyncHandler(async (req, res) => {
     }
     return ok(res);
 }));
+// Newer push firmware answers "SET OPTIONS DateTime" by asking the server for the
+// time: GET /iclock/rtdata?SN=..&type=time. Reply with the wall-clock time the
+// admin chose in the app (advanced by the seconds elapsed since they asked).
+router.get('/rtdata', asyncHandler(async (req, res) => {
+    const device = await findEnabledDevice(String(req.query.SN || ''));
+    console.log(`[adms] rtdata request from SN ${req.query.SN}: type=${req.query.type}`);
+    if (!device || String(req.query.type) !== 'time') return ok(res);
+    try {
+        const [rows] = await pool.query(
+            "SELECT fallbacks, TIMESTAMPDIFF(SECOND, created_at, NOW()) AS age FROM device_commands WHERE device_id = ? AND cmd_type = 'set_time' AND created_at > NOW() - INTERVAL 15 MINUTE ORDER BY id DESC LIMIT 1",
+            [device.id]);
+        let wall = null;
+        try { wall = rows.length && rows[0].fallbacks ? (JSON.parse(rows[0].fallbacks).wall || null) : null; } catch (_) {}
+        if (!wall) return ok(res);
+        const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(wall);
+        if (!m) return ok(res);
+        const unix = Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000) + Math.max(0, rows[0].age || 0);
+        console.log(`[adms] rtdata reply to device ${device.id}: DateTime=${unix} (wall ${wall} + ${rows[0].age}s)`);
+        return ok(res, `DateTime=${unix},ServerTZ=+0000`);
+    } catch (err) {
+        console.error('[adms] rtdata failed:', err.message);
+        return ok(res);
+    }
+}));
+
 router.get('/ping', (req, res) => ok(res));
 
 module.exports = router;

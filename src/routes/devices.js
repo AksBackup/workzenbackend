@@ -130,6 +130,30 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
     return res.json({ message: 'Deleted' });
 }));
 
+// Feed for the desktop app's "X punched in at ..." toast, for CLOUD devices only
+// (TCP devices already toast from the app's own pull, so they are excluded to
+// avoid double toasts). First call (no since_id) just returns a baseline cursor.
+router.get('/cloud-punches', asyncHandler(async (req, res) => {
+    try {
+        const [[cd]] = await pool.query('SELECT COUNT(*) AS n FROM devices WHERE company_id = ? AND adms_enabled = 1', [req.user.companyId]);
+        if (!cd.n) return res.json({ cloud_devices: 0, latest_id: 0, punches: [] });
+        const since = parseInt(req.query.since_id, 10);
+        const scope = 'pe.company_id = ? AND pe.device_id IN (SELECT id FROM devices WHERE company_id = ? AND adms_enabled = 1)';
+        if (Number.isNaN(since)) {
+            const [[m]] = await pool.query(`SELECT COALESCE(MAX(pe.id), 0) AS id FROM punch_events pe WHERE ${scope}`, [req.user.companyId, req.user.companyId]);
+            return res.json({ cloud_devices: cd.n, latest_id: m.id, punches: [] });
+        }
+        const [rows] = await pool.query(
+            `SELECT pe.id, e.name AS employee_name, pe.punch_type, TIME_FORMAT(pe.punch_time, '%H:%i:%s') AS t
+               FROM punch_events pe JOIN employees e ON e.id = pe.employee_id
+              WHERE ${scope} AND pe.id > ? ORDER BY pe.id ASC LIMIT 20`,
+            [req.user.companyId, req.user.companyId, since]);
+        return res.json({ cloud_devices: cd.n, latest_id: rows.length ? rows[rows.length - 1].id : since, punches: rows });
+    } catch (err) {
+        return res.json({ cloud_devices: 0, latest_id: 0, punches: [] }); // never break the app over a toast
+    }
+}));
+
 // Cloud Server (ADMS) control: queue commands to a device that can't be reached over TCP.
 router.use('/:id/cloud', require('./deviceCloud'));
 
