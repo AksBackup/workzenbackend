@@ -23,6 +23,18 @@ router.use(verifyFirebaseToken);
 // guard on create (so Leave Opening Entry's "add a type on the fly"
 // flow can't silently create two "Casual Leave" rows for one company).
 
+const COUNT_MODES = ['no', 'between', 'yes'];
+/** is_paid + how holidays / weekly offs inside a leave are counted (migration_043). */
+function validateLeavePolicy(body) {
+    for (const f of ['count_holidays', 'count_weekly_offs']) {
+        if (body[f] !== undefined && !COUNT_MODES.includes(body[f])) return `${f} must be one of: no, between, yes`;
+    }
+    for (const f of ['monthly_quota', 'yearly_quota']) {
+        if (body[f] !== undefined && body[f] !== null && !(Number(body[f]) >= 0)) return `${f} must be 0 or more`;
+    }
+    return null;
+}
+
 router.get('/', asyncHandler(async (req, res) => {
     const [rows] = await pool.query(
         'SELECT * FROM leave_types WHERE company_id = ? ORDER BY name ASC',
@@ -34,6 +46,11 @@ router.get('/', asyncHandler(async (req, res) => {
 router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     const { name, yearly_quota, monthly_quota, carry_forward } = req.body;
     if (!name) return res.status(400).json({ error: 'name required' });
+    const policyError = validateLeavePolicy(req.body);
+    if (policyError) return res.status(400).json({ error: policyError });
+    const isPaid = req.body.is_paid === undefined ? true : !!req.body.is_paid;
+    const countHolidays = req.body.count_holidays || 'no';
+    const countWeeklyOffs = req.body.count_weekly_offs || 'no';
 
     const [existing] = await pool.query(
         'SELECT id FROM leave_types WHERE company_id = ? AND name = ?',
@@ -52,16 +69,20 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     // reverted to this monthly-reset model by explicit request - see
     // computeMonthlyPaidUsage's header comment for that history).
     const [result] = await pool.query(
-        'INSERT INTO leave_types (company_id, name, yearly_quota, monthly_quota, carry_forward) VALUES (?, ?, ?, ?, ?)',
-        [req.user.companyId, name, yearly_quota || 0, monthly_quota || 0, !!carry_forward]
+        `INSERT INTO leave_types (company_id, name, yearly_quota, monthly_quota, carry_forward, is_paid, count_holidays, count_weekly_offs)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, name, yearly_quota || 0, isPaid ? (monthly_quota || 0) : 0, !!carry_forward, isPaid, countHolidays, countWeeklyOffs]
     );
     return res.status(201).json({
-        id: result.insertId, name, yearly_quota: yearly_quota || 0, monthly_quota: monthly_quota || 0, carry_forward: !!carry_forward
+        id: result.insertId, name, yearly_quota: yearly_quota || 0, monthly_quota: isPaid ? (monthly_quota || 0) : 0,
+        carry_forward: !!carry_forward, is_paid: isPaid, count_holidays: countHolidays, count_weekly_offs: countWeeklyOffs,
     });
 }));
 
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
-    const fields = ['name', 'yearly_quota', 'monthly_quota', 'carry_forward'];
+    const policyError = validateLeavePolicy(req.body);
+    if (policyError) return res.status(400).json({ error: policyError });
+    const fields = ['name', 'yearly_quota', 'monthly_quota', 'carry_forward', 'is_paid', 'count_holidays', 'count_weekly_offs'];
     const updates = [];
     const values = [];
     fields.forEach(f => {

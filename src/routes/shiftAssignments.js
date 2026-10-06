@@ -55,7 +55,7 @@ router.get('/', asyncHandler(async (req, res) => {
         sql += ' AND sa.effective_from <= ?';
         params.push(to);
     }
-    sql += ' ORDER BY sa.effective_from DESC, e.name ASC';
+    sql += ' ORDER BY sa.effective_from DESC, sa.id DESC, e.name ASC';
 
     const [rows] = await pool.query(sql, params);
     return res.json(rows);
@@ -83,6 +83,42 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         [req.user.companyId, employee_id, shift_id, effective_from, effective_to || null]
     );
     return res.status(201).json({ id: result.insertId });
+}));
+
+// POST /shift-assignments/bulk - Shift Roster grid save.
+// body: { cells: [{ employee_id, date: 'YYYY-MM-DD', shift_id: number|null }, ...] }
+// One single-day row per (employee, date). A single-day row replaces any earlier single-day
+// row for that cell; shift_id null just removes the single-day override (the employee falls
+// back to their range assignment / their own shift).
+router.post('/bulk', requireAdmin, asyncHandler(async (req, res) => {
+    const cells = Array.isArray(req.body.cells) ? req.body.cells : null;
+    if (!cells) return res.status(400).json({ error: 'cells (array) required' });
+    if (cells.length > 20000) return res.status(400).json({ error: 'Too many cells in one save (max 20000)' });
+    const companyId = req.user.companyId;
+    const [emps] = await pool.query('SELECT id FROM employees WHERE company_id = ?', [companyId]);
+    const [shifts] = await pool.query('SELECT id FROM shifts WHERE company_id = ?', [companyId]);
+    const okEmp = new Set(emps.map((e) => e.id)), okShift = new Set(shifts.map((x) => x.id));
+    const conn = await pool.getConnection();
+    let saved = 0, cleared = 0;
+    try {
+        await conn.beginTransaction();
+        for (const c of cells) {
+            const eid = Number(c.employee_id), date = String(c.date || '');
+            if (!okEmp.has(eid) || !/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+            await conn.query(
+                'DELETE FROM shift_assignments WHERE company_id = ? AND employee_id = ? AND effective_from = ? AND effective_to = ?',
+                [companyId, eid, date, date]);
+            if (c.shift_id == null) { cleared++; continue; }
+            const sid = Number(c.shift_id);
+            if (!okShift.has(sid)) continue;
+            await conn.query(
+                'INSERT INTO shift_assignments (company_id, employee_id, shift_id, effective_from, effective_to) VALUES (?, ?, ?, ?, ?)',
+                [companyId, eid, sid, date, date]);
+            saved++;
+        }
+        await conn.commit();
+    } catch (e) { await conn.rollback(); throw e; } finally { conn.release(); }
+    return res.json({ saved, cleared });
 }));
 
 router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {

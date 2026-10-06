@@ -30,6 +30,22 @@ async function syncPayrollBonus(conn, companyId, employeeId, year, month) {
     );
 }
 
+/**
+ * A paid month is LOCKED (its payslip is frozen). Adding / changing / deleting a bonus for that month
+ * would silently change nothing on the payslip, so it is refused. Industry practice: revert the month
+ * to Pending first, or give the bonus in a later (open) month.
+ */
+async function assertMonthOpen(conn, companyId, employeeId, year, month) {
+    try {
+        const [rows] = await conn.query(
+            'SELECT is_paid FROM payroll_records WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?',
+            [companyId, employeeId, year, month]);
+        if (rows.length && rows[0].is_paid) {
+            throw Object.assign(new Error('This employee\'s payroll for that month is already paid and locked. Revert it to Pending in Monthly Pay Process first, or add the bonus to a later month.'), { status: 409 });
+        }
+    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+}
+
 router.get('/', requireAdmin, asyncHandler(async (req, res) => {
     const { year, month } = req.query;
     let sql = `SELECT b.*, e.name AS employee_name, e.emp_code AS employee_code
@@ -51,8 +67,12 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     if (!employee_id || !year || !month || amount === undefined) {
         return res.status(400).json({ error: 'employee_id, year, month, amount required' });
     }
+    if (!(Number(amount) > 0) || !Number.isFinite(Number(amount))) {
+        return res.status(400).json({ error: 'Bonus amount must be a number greater than 0.' });
+    }
     const conn = await pool.getConnection();
     try {
+        await assertMonthOpen(conn, req.user.companyId, employee_id, year, month);
         await conn.beginTransaction();
         const [result] = await conn.query(
             `INSERT INTO bonuses (company_id, employee_id, year, month, amount, reason)
@@ -64,6 +84,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         return res.status(201).json({ id: result.insertId });
     } catch (err) {
         await conn.rollback();
+        if (err.status === 409) return res.status(409).json({ error: err.message });
         console.error('Bonus creation failed:', err);
         return res.status(500).json({ error: 'Failed to create bonus', detail: err.message });
     } finally {
@@ -89,9 +110,13 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         }
     });
     if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+    if (req.body.amount !== undefined && (!(Number(req.body.amount) > 0) || !Number.isFinite(Number(req.body.amount)))) {
+        return res.status(400).json({ error: 'Bonus amount must be a number greater than 0.' });
+    }
 
     const conn = await pool.getConnection();
     try {
+        await assertMonthOpen(conn, req.user.companyId, existing.employee_id, existing.year, existing.month);
         await conn.beginTransaction();
         values.push(req.params.id, req.user.companyId);
         await conn.query(`UPDATE bonuses SET ${updates.join(', ')} WHERE id = ? AND company_id = ?`, values);
@@ -100,6 +125,7 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         return res.json({ message: 'Updated' });
     } catch (err) {
         await conn.rollback();
+        if (err.status === 409) return res.status(409).json({ error: err.message });
         console.error('Bonus update failed:', err);
         return res.status(500).json({ error: 'Failed to update bonus', detail: err.message });
     } finally {
@@ -117,6 +143,7 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
 
     const conn = await pool.getConnection();
     try {
+        await assertMonthOpen(conn, req.user.companyId, existing.employee_id, existing.year, existing.month);
         await conn.beginTransaction();
         await conn.query('DELETE FROM bonuses WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
         await syncPayrollBonus(conn, req.user.companyId, existing.employee_id, existing.year, existing.month);
@@ -124,6 +151,7 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
         return res.json({ message: 'Deleted' });
     } catch (err) {
         await conn.rollback();
+        if (err.status === 409) return res.status(409).json({ error: err.message });
         console.error('Bonus delete failed:', err);
         return res.status(500).json({ error: 'Failed to delete bonus', detail: err.message });
     } finally {

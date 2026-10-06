@@ -42,7 +42,12 @@ function classifyDay({
     fullDayHours, halfDayMinHours,
     workMinutesOverride = undefined,
     rules = null, lateMinutes = 0, earlyMinutes = 0,
+    thresholdScale = 1,
 }) {
+    // thresholdScale (<1): the person has a part-day leave (half / quarter / hours), so only the
+    // remaining share of the day was expected - the duration thresholds shrink by that share.
+    fullDayHours = fullDayHours * thresholdScale;
+    halfDayMinHours = halfDayMinHours * thresholdScale;
     if (isHoliday(dateStr)) return 'holiday';
     if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) return 'weekly_off';
     if (isAltSaturdayOff(dateStr, altSaturdays)) return 'weekly_off';
@@ -59,8 +64,8 @@ function classifyDay({
         : (new Date(attendance.check_out) - new Date(attendance.check_in)) / 60000;
 
     // Policy thresholds are "duration LESS THAN x minutes => ..." (policy screen wording).
-    const absentBelow = rules && rules.absentMinutes != null ? Number(rules.absentMinutes) : null;
-    const halfBelow = rules && rules.halfDayMinutes != null ? Number(rules.halfDayMinutes) : null;
+    const absentBelow = rules && rules.absentMinutes != null ? Number(rules.absentMinutes) * thresholdScale : null;
+    const halfBelow = rules && rules.halfDayMinutes != null ? Number(rules.halfDayMinutes) * thresholdScale : null;
 
     let status;
     if (absentBelow != null || halfBelow != null) {

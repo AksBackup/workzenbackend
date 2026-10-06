@@ -279,6 +279,20 @@ router.post('/cdata', asyncHandler(async (req, res) => {
                 if (new Date(last.replace(' ', 'T')).getTime() > latest) checkOut = last; // later than anything recorded
             }
             if (!checkIn && !checkOut) continue; // nothing new for this day
+            // A batch can hold several punches (device offline / catching up). Only first/last used
+            // to be stored, so in-between IN/OUT sessions were lost from punch_events. Store the
+            // rest too - punch_type is re-labelled IN, OUT, IN, OUT by time order on every write.
+            const known = new Set(existing.map((e) => new Date(e.punch_time).getTime()));
+            for (const t of g.times) {
+                if (t === checkIn || t === checkOut) continue;
+                const ms = new Date(t.replace(' ', 'T') + 'Z').getTime();
+                if (known.has(ms) || known.has(new Date(t.replace(' ', 'T')).getTime())) continue;
+                await pool.query(
+                    `INSERT INTO punch_events (company_id, employee_id, date, punch_time, punch_type, source, device_id, verify_mode)
+                     VALUES (?, ?, ?, ?, 'out', 'scanner', ?, ?)`,
+                    [companyId, g.employeeId, g.date, t, device.id, VERIFY_LABELS[g.verifyByTime[t]] || 'unknown']);
+                known.add(ms);
+            }
             await recordPunchEventsAndDeriveAttendance({
                 companyId, employeeId: g.employeeId, date: g.date, checkIn, checkOut,
                 source: 'scanner', deviceId: device.id,

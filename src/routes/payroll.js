@@ -7,9 +7,12 @@ const {
     loadPunchEventsIndex, loadShiftPolicyIndex, loadShiftPolicyOffIndex,
     derivePunchSpan, applyPrefixSuffixAbsent,
 } = require('../utils/attendanceRules');
+const { windowForShift } = require('../utils/punchPairing');
 const { resolvePaymentWindow } = require('../utils/paymentWindow');
 const { classifyDay, resolveEmployeeOffDays, computeLateEarly } = require('../utils/dayClassifier');
+const { loadLeaveIndex } = require('../utils/leaveIndex');
 
+const { loadDayShiftResolver } = require('../utils/dayShift');
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
@@ -84,7 +87,8 @@ function round2(n) {
  *                      OT / bonus); PT & TDS on total gross earnings.
  *  TOTAL 1 = earned + overtime + bonus - statutory
  *  6. ADDITION HEADS   Payment Setup addition heads (flat monthly amounts).
- *  TOTAL 2 = total 1 + addition heads
+ *     + APPROVED CONVEYANCE claims dated in the month (reimbursement; not subject to PF/ESI/PT/TDS)
+ *  TOTAL 2 = total 1 + addition heads + approved conveyance
  *  7. DEDUCTION HEADS  Payment Setup deduction heads + auto loan deduction.
  *  GROSS TOTAL = total 2 - deduction heads - loan deduction   <- amount to pay
  *
@@ -151,10 +155,9 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
     const attendanceByEmpDate = new Map();
     for (const row of attendanceRows) attendanceByEmpDate.set(`${row.employee_id}|${dateKey(row.date)}`, row);
 
-    const [leaveRows] = await pool.query(
-        `SELECT employee_id, from_date, to_date, days_count, paid_days FROM leave_applications
-         WHERE company_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
-        [companyId, monthEnd, monthStart]);
+    // Approved leave, per day (Leave v2): holidays / weekly offs inside a leave are only here when the
+    // leave type counts them; paid vs unpaid is decided per day; half / quarter / hours leave is a fraction.
+    const leaveIdx = await loadLeaveIndex(companyId, monthStart, monthEnd, { statuses: ['approved'] });
 
     // Shared attendance context (same loaders the reports use).
     const holidayIndex = await loadHolidayIndex(companyId, monthStart, monthEnd);
@@ -165,8 +168,9 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
     const shiftPolicyIndex = await loadShiftPolicyIndex(companyId);
     const punchEventsIndex = await loadPunchEventsIndex(companyId, monthStart, monthEnd);
     const [shiftRowsAll] = await pool.query(
-        'SELECT id, name, start_time, end_time, late_grace_minutes, early_grace_minutes, is_default FROM shifts WHERE company_id = ?', [companyId]);
+        'SELECT id, name, start_time, end_time, ot_allowed, late_grace_minutes, early_grace_minutes, is_default FROM shifts WHERE company_id = ?', [companyId]);
     const shiftsById = new Map(shiftRowsAll.map(x => [x.id, x]));
+    const dayShiftResolver = await loadDayShiftResolver(companyId, monthStart, monthEnd, shiftsById);
     const defaultShift = shiftRowsAll.find(x => x.is_default) || null;
 
     // ---- existing payroll rows (paid flag, frozen snapshot, legacy bonus) ----
@@ -208,6 +212,37 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
     for (const l of loanRows) {
         if (!loansByEmp.has(l.employee_id)) loansByEmp.set(l.employee_id, []);
         loansByEmp.get(l.employee_id).push(l);
+    }
+
+    // ---- approved conveyance claims (reimbursements) ----
+    // Industry practice: a reimbursement is paid in the FIRST payroll run after it is approved and
+    // is then settled (never paid twice). So a claim is on this payslip when it was approved on or
+    // before the end of this month and has not been paid in another month yet. A claim approved after
+    // the month was paid simply rolls into the next open month instead of being lost.
+    // Added after Total 1 (like addition heads) and NOT part of the PF / ESI / PT / TDS wage bases.
+    let conveyanceRows = [];
+    try {
+        [conveyanceRows] = await pool.query(
+            `SELECT id, employee_id, amount, reason, date FROM conveyance_claims
+             WHERE company_id = ? AND status = 'approved'
+               AND ((paid_year = ? AND paid_month = ?)
+                    OR (paid_year IS NULL AND COALESCE(approved_on, CONCAT(date, ' 00:00:00')) <= ?))
+             ORDER BY date ASC, id ASC`,
+            [companyId, year, month, `${monthEnd} 23:59:59`]);
+    } catch (err) {
+        if (err.code === 'ER_BAD_FIELD_ERROR') {
+            // migration_043 not applied yet: old behaviour (claim date inside the month).
+            [conveyanceRows] = await pool.query(
+                `SELECT id, employee_id, amount, reason, date FROM conveyance_claims
+                 WHERE company_id = ? AND status = 'approved' AND date BETWEEN ? AND ? ORDER BY date ASC, id ASC`,
+                [companyId, monthStart, monthEnd]);
+        } else if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    const conveyanceByEmp = new Map();
+    for (const c of conveyanceRows) {
+        if (!conveyanceByEmp.has(c.employee_id)) conveyanceByEmp.set(c.employee_id, []);
+        const reasonText = c.reason && String(c.reason).trim() ? ` (${String(c.reason).trim()})` : '';
+        conveyanceByEmp.get(c.employee_id).push({ claim_id: c.id, name: `Conveyance ${dateKey(c.date)}${reasonText}`, amount: round2(Number(c.amount)) });
     }
 
     // ---- overtime: approved is paid, pending is shown only ----
@@ -255,19 +290,6 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
         const rules = shiftPolicyIndex.rulesFor(emp.shift_id);
         const dojStr = emp.doj ? dateKey(emp.doj) : null;
 
-        // Which approved leave (if any) covers `dateStr`, and is that day paid or unpaid?
-        const leaveFor = (dateStr) => {
-            for (const l of leaveRows) {
-                if (l.employee_id !== emp.id) continue;
-                const from = dateKey(l.from_date), to = dateKey(l.to_date);
-                if (dateStr < from || dateStr > to) continue;
-                const paidDays = l.paid_days !== null && l.paid_days !== undefined ? Number(l.paid_days) : Number(l.days_count);
-                const dayIndex = Math.round((new Date(`${dateStr}T00:00:00`) - new Date(`${from}T00:00:00`)) / 86400000);
-                return dayIndex < paidDays ? 'paid' : 'unpaid';
-            }
-            return null;
-        };
-
         // 1) classify every counted day with the shared classifier
         const dayList = [];
         for (let day = 1; day <= daysToCount; day++) {
@@ -276,18 +298,32 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
             const dayOfWeek = new Date(year, month - 1, day).getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
-            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks) : null;
-            const le = computeLateEarly(dateStr, attendance, shiftForDay, grace);
-            const status = classifyDay({
+            // Roster / multi-shift aware shift for THIS day (falls back to the primary shift).
+            const dayShift = dayShiftResolver.resolve(emp, dateStr, attendance && attendance.check_in) || shiftForDay;
+            const dayShiftId = dayShift && dayShift.id != null ? dayShift.id : emp.shift_id;
+            const dayDeductBreaks = dayShiftId != null ? shiftPolicyIndex.deductBreaksFor(dayShiftId) : deductBreaks;
+            const dayGrace = dayShiftId != null && shiftPolicyIndex.has(dayShiftId) ? shiftPolicyIndex.graceFor(dayShiftId) : grace;
+            const dayRules = dayShiftId != null ? shiftPolicyIndex.rulesFor(dayShiftId) : rules;
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, dayDeductBreaks, windowForShift(dateStr, dayShift)) : null;
+            const le = computeLateEarly(dateStr, attendance, dayShift, dayGrace);
+            const li = leaveIdx.get(emp.id, dateStr);
+            const partialF = li && li.fraction < 0.999 ? li.fraction : 0;
+            const fullLeave = !!li && !partialF;
+            let status = classifyDay({
                 dateStr, dayOfWeek,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask, altSaturdays, isWeeklyOff2,
-                isOnApprovedLeave: (d) => leaveFor(d) !== null,
+                isOnApprovedLeave: () => fullLeave,
+                thresholdScale: partialF ? 1 - partialF : 1,
                 attendance, fullDayHours, halfDayMinHours,
                 workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
-                rules, lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
+                rules: dayRules, lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
             });
-            dayList.push({ status, dateStr, lateHalf: status === 'half_day' && le.lateMinutes > 0 });
+            // Holiday / weekly off that the leave type COUNTS as leave: if any of that day is unpaid
+            // (unpaid leave type, or paid quota used up) it is loss of pay, not a free holiday.
+            if (fullLeave && (li.kind === 'holiday' || li.kind === 'weekly_off') && li.paidFraction < 0.999
+                && (status === 'holiday' || status === 'weekly_off')) status = 'leave';
+            dayList.push({ status, dateStr, li, partialF, lateHalf: status === 'half_day' && le.lateMinutes > 0 });
         }
         // 2) Office-policy prefix/suffix rule (weekly off / holiday next to an absence becomes absent)
         applyPrefixSuffixAbsent(
@@ -298,19 +334,29 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
         const counts = { present: 0, half_day: 0, absent: 0, paid_leave: 0, unpaid_leave: 0, holiday: 0, weekly_off: 0 };
         let payableUnits = 0;
         for (const d of dayList) {
+            const w = 1 - (d.partialF || 0);           // share of the day the person was expected to work
             switch (d.status) {
-                case 'present': counts.present++; payableUnits += 1; break;
-                case 'half_day': counts.half_day++; payableUnits += 0.5; break;
+                case 'present': counts.present += w; payableUnits += w; break;
+                case 'half_day': counts.half_day += w; payableUnits += 0.5 * w; break;
                 case 'holiday': counts.holiday++; payableUnits += 1; break;
                 case 'weekly_off': counts.weekly_off++; payableUnits += 1; break;
-                case 'leave':
-                    if (leaveFor(d.dateStr) === 'paid') { counts.paid_leave++; payableUnits += 1; }
-                    else { counts.unpaid_leave++; }
+                case 'leave': {
+                    const paid = d.li ? d.li.paidFraction : 0;
+                    counts.paid_leave += paid; counts.unpaid_leave += 1 - paid; payableUnits += paid;
                     break;
-                case 'absent': counts.absent++; break;
+                }
+                case 'absent': counts.absent += w; break;
                 default: break; // not_joined
             }
+            // The leave part of a half / quarter / hours leave day.
+            if (d.partialF && ['present', 'half_day', 'absent'].includes(d.status)) {
+                counts.paid_leave += d.li.paidFraction;
+                counts.unpaid_leave += d.partialF - d.li.paidFraction;
+                payableUnits += d.li.paidFraction;
+            }
         }
+        for (const k of Object.keys(counts)) counts[k] = Math.round(counts[k] * 100) / 100;
+        payableUnits = Math.round(payableUnits * 100) / 100;
         const earned = round2(perDayRate * payableUnits);
 
         // 4) overtime / bonus
@@ -346,7 +392,9 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
         // 6) addition heads -> total 2
         const heads = headsByEmp.get(emp.id) || { addition: [], deduction: [] };
         const additionTotal = round2(heads.addition.reduce((a, h) => a + h.amount, 0));
-        const total2 = round2(total1 + additionTotal);
+        const conveyanceItems = conveyanceByEmp.get(emp.id) || [];
+        const conveyanceTotal = round2(conveyanceItems.reduce((a, c) => a + c.amount, 0));
+        const total2 = round2(total1 + additionTotal + conveyanceTotal);
 
         // 7) deduction heads + loan -> gross total
         const deductionTotal = round2(heads.deduction.reduce((a, h) => a + h.amount, 0));
@@ -378,6 +426,7 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
             statutory_total: statutoryTotal,
             total_1: total1,
             addition_heads: heads.addition, addition_total: additionTotal,
+            conveyance_items: conveyanceItems, conveyance_total: conveyanceTotal,
             total_2: total2,
             deduction_heads: heads.deduction, deduction_total: deductionTotal,
             loans: loanSummaries, loan_deduction: loanDeduction,
@@ -557,6 +606,17 @@ router.post('/:employeeId/bonus', requireAdmin, asyncHandler(async (req, res) =>
     return res.json({ message: 'Bonus updated' });
 }));
 
+/** Marks the conveyance claims on a payslip as paid in this payroll month (so they are never paid twice). */
+async function settleConveyance(conn, companyId, own, year, month) {
+    const ids = (own.conveyance_items || []).map(c => c.claim_id).filter(Boolean);
+    if (!ids.length) return;
+    try {
+        await conn.query(
+            'UPDATE conveyance_claims SET paid_year = ?, paid_month = ? WHERE company_id = ? AND id IN (?) AND paid_year IS NULL',
+            [year, month, companyId, ids]);
+    } catch (err) { if (err.code !== 'ER_BAD_FIELD_ERROR' && err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+}
+
 /** Writes the auto salary-percent loan deductions for a payroll that was just paid (idempotent). */
 async function commitLoanDeductions(companyId, own, year, month) {
     if (!own || !own.loans || !own.loans.length) return;
@@ -577,6 +637,85 @@ async function commitLoanDeductions(companyId, own, year, month) {
         }
     } catch (err) {
         if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+    }
+}
+
+/**
+ * Reverses the auto salary-percent loan deductions that /pay wrote for this employee + month:
+ * deletes the 'payroll_auto' ledger rows and re-opens a loan that /pay had closed because it
+ * reached zero. Manually closed loans that still carry a balance are left closed.
+ * Runs on the caller's connection so it commits/rolls back together with the un-mark.
+ * Returns how many ledger rows were removed.
+ */
+async function revertLoanDeductions(conn, companyId, employeeId, year, month) {
+    try {
+        const [rows] = await conn.query(
+            `SELECT lp.id, lp.loan_id FROM loan_payments lp
+             JOIN loans l ON l.id = lp.loan_id
+             WHERE lp.company_id = ? AND l.company_id = ? AND l.employee_id = ?
+               AND lp.source = 'payroll_auto' AND lp.payroll_year = ? AND lp.payroll_month = ?`,
+            [companyId, companyId, employeeId, year, month]);
+        if (!rows.length) return 0;
+        const loanIds = [...new Set(rows.map(r => r.loan_id))];
+        const paidOf = async (loanId) => {
+            const [r] = await conn.query('SELECT COALESCE(SUM(amount), 0) AS paid FROM loan_payments WHERE loan_id = ?', [loanId]);
+            return Number(r[0].paid);
+        };
+        const principalOf = async (loanId) => {
+            const [r] = await conn.query('SELECT principal_amount, status FROM loans WHERE id = ? AND company_id = ?', [loanId, companyId]);
+            return r.length ? { principal: Number(r[0].principal_amount), status: r[0].status } : null;
+        };
+        const before = new Map();
+        for (const id of loanIds) before.set(id, { paid: await paidOf(id), loan: await principalOf(id) });
+
+        await conn.query('DELETE FROM loan_payments WHERE id IN (?)', [rows.map(r => r.id)]);
+
+        for (const id of loanIds) {
+            const b = before.get(id);
+            if (!b.loan || b.loan.status !== 'closed') continue;
+            const outstandingBefore = b.loan.principal - b.paid;
+            const outstandingAfter = b.loan.principal - await paidOf(id);
+            if (outstandingBefore <= 0.01 && outstandingAfter > 0.01) {
+                await conn.query("UPDATE loans SET status = 'active' WHERE id = ? AND company_id = ?", [id, companyId]);
+            }
+        }
+        return rows.length;
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+        return 0;
+    }
+}
+
+/** Reverts a paid month to Pending: clears the frozen payslip AND restores auto loan deductions, atomically. */
+async function revertPayment(companyId, employeeId, year, month) {
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        try {
+            await conn.query(
+                `UPDATE payroll_records SET is_paid = FALSE, paid_on = NULL, paid_amount = NULL, paid_snapshot = NULL, paid_by = NULL
+                 WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?`,
+                [companyId, employeeId, year, month]);
+        } catch (err) {
+            if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+            await conn.query(
+                'UPDATE payroll_records SET is_paid = FALSE, paid_on = NULL WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?',
+                [companyId, employeeId, year, month]);
+        }
+        const restored = await revertLoanDeductions(conn, companyId, employeeId, year, month);
+        try {
+            // conveyance paid in this month goes back to "approved, unpaid" (it re-appears on the payslip)
+            await conn.query(
+                'UPDATE conveyance_claims SET paid_year = NULL, paid_month = NULL WHERE company_id = ? AND employee_id = ? AND paid_year = ? AND paid_month = ?',
+                [companyId, employeeId, year, month]);
+        } catch (err) { if (err.code !== 'ER_BAD_FIELD_ERROR' && err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+        await conn.commit();
+        return restored;
+    } catch (err) {
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
     }
 }
 
@@ -620,6 +759,7 @@ router.post('/:employeeId/pay', requireAdmin, asyncHandler(async (req, res) => {
             [req.user.companyId, employeeId, year, month]
         );
     }
+    await settleConveyance(pool, req.user.companyId, own, year, month);
     await commitLoanDeductions(req.user.companyId, own, year, month);
     return res.json({ message: 'Payment recorded', gross_total: own.gross_total });
 }));
@@ -628,7 +768,7 @@ router.post('/:employeeId/pay', requireAdmin, asyncHandler(async (req, res) => {
  * POST /payroll/:employeeId/mark-paid  body: { year, month, is_paid }
  * Kept for the old toggle + un-marking. is_paid=true delegates to the same
  * freeze-and-commit logic as /pay; is_paid=false reverts to Pending and
- * discards the frozen snapshot (un-marking does not reverse loan deductions).
+ * discards the frozen snapshot AND reverses the month's auto loan deductions (see revertPayment).
  */
 router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res) => {
     const { year, month, is_paid } = req.body;
@@ -636,18 +776,8 @@ router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res
         return res.status(400).json({ error: 'year, month, and is_paid are required' });
     }
     if (!is_paid) {
-        try {
-            await pool.query(
-                `UPDATE payroll_records SET is_paid = FALSE, paid_on = NULL, paid_amount = NULL, paid_snapshot = NULL, paid_by = NULL
-                 WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?`,
-                [req.user.companyId, req.params.employeeId, year, month]);
-        } catch (err) {
-            if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
-            await pool.query(
-                'UPDATE payroll_records SET is_paid = FALSE, paid_on = NULL WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?',
-                [req.user.companyId, req.params.employeeId, year, month]);
-        }
-        return res.json({ message: 'Paid status updated' });
+        const loanPaymentsRestored = await revertPayment(req.user.companyId, Number(req.params.employeeId), Number(year), Number(month));
+        return res.json({ message: 'Paid status updated', loan_payments_restored: loanPaymentsRestored });
     }
     req.body = { year, month };
     // Re-enter the /pay handler logic directly.
@@ -671,6 +801,7 @@ router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res
                  ON DUPLICATE KEY UPDATE is_paid = TRUE, paid_on = NOW()`,
                 [req.user.companyId, req.params.employeeId, year, month]);
         }
+        await settleConveyance(pool, req.user.companyId, own, Number(year), Number(month));
         await commitLoanDeductions(req.user.companyId, own, Number(year), Number(month));
     }
     return res.json({ message: 'Paid status updated' });
@@ -678,3 +809,4 @@ router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res
 
 module.exports = router;
 module.exports.computeMonthlyPayroll = computeMonthlyPayroll;
+module.exports.revertLoanDeductions = revertLoanDeductions;

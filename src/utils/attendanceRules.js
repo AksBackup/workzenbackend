@@ -72,13 +72,27 @@ async function loadHolidayIndex(companyId, fromDateStr, toDateStr) {
  * a per-employee query.
  */
 async function loadEmployeeHolidayGroups(companyId) {
-    const [rows] = await pool.query(
-        `SELECT e.id AS employee_id, b.holiday_group_id
-         FROM employees e
-         LEFT JOIN branches b ON b.id = e.branch_id
-         WHERE e.company_id = ?`,
-        [companyId]
-    );
+    // An employee's own holiday_group_id (migration_044, set on the Holiday Group
+    // screen) wins; otherwise the group of their branch; otherwise none.
+    let rows;
+    try {
+        [rows] = await pool.query(
+            `SELECT e.id AS employee_id, COALESCE(e.holiday_group_id, b.holiday_group_id) AS holiday_group_id
+             FROM employees e
+             LEFT JOIN branches b ON b.id = e.branch_id
+             WHERE e.company_id = ?`,
+            [companyId]
+        );
+    } catch (err) {
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; // migration_044 not run yet
+        [rows] = await pool.query(
+            `SELECT e.id AS employee_id, b.holiday_group_id
+             FROM employees e
+             LEFT JOIN branches b ON b.id = e.branch_id
+             WHERE e.company_id = ?`,
+            [companyId]
+        );
+    }
     const map = new Map();
     for (const row of rows) map.set(row.employee_id, row.holiday_group_id ?? null);
     return map;
@@ -222,45 +236,27 @@ module.exports = {
  * Office Time Policy has deduct_break_hours_from_work_duration ON),
  * every punch-out -> next punch-in gap is subtracted instead.
  */
-function derivePunchSpan(events, deductBreaks) {
+function derivePunchSpan(events, deductBreaks, window = null) {
     if (!events || events.length === 0) return { firstIn: null, lastOut: null, workMinutes: null };
-    const sorted = [...events].sort((a, b) => new Date(a.punch_time) - new Date(b.punch_time));
-    const ins = sorted.filter((e) => e.punch_type === 'in');
-    const outs = sorted.filter((e) => e.punch_type === 'out');
-    if (ins.length === 0 || outs.length === 0) {
-        // No complete in+out pair yet today (e.g. only a check-in so
-        // far) - nothing to span, matches classifyDay's existing
-        // "no checkout yet -> present, no hours check" behavior.
-        return {
-            firstIn: ins.length ? ins[0].punch_time : null,
-            lastOut: outs.length ? outs[outs.length - 1].punch_time : null,
-            workMinutes: null,
-        };
-    }
-
-    const firstIn = ins[0].punch_time;
-    const lastOut = outs[outs.length - 1].punch_time;
-    if (new Date(lastOut) - new Date(firstIn) < 60 * 1000) {
-        // Single scan recorded as both in and out (or a double-tap) - not a
-        // real span. Returning 0 minutes here used to classify present
-        // employees as ABSENT. Treat as "no complete pair yet".
+    // The stored punch_type is NOT trusted: older code labelled the 1st punch "in" and every
+    // later punch "out". Punches alternate IN, OUT, IN, OUT by time order; only punches inside
+    // the office window (when given) take part. See utils/punchPairing.js.
+    const { pairPunches } = require('./punchPairing');
+    const r = pairPunches(events.map((e) => e.punch_time), window);
+    if (r.counted.length === 0) return { firstIn: null, lastOut: null, workMinutes: null };
+    const firstIn = r.counted[0].raw;
+    if (r.pairs.length === 0) {
+        // Only a check-in so far (or a single scan) - nothing to span; classifyDay treats it as
+        // "present, no hours check".
         return { firstIn, lastOut: null, workMinutes: null };
     }
-    let workMinutes = Math.round((new Date(lastOut) - new Date(firstIn)) / 60000);
-
-    if (deductBreaks) {
-        for (let i = 0; i < sorted.length - 1; i++) {
-            const cur = sorted[i];
-            const next = sorted[i + 1];
-            if (cur.punch_type === 'out' && next.punch_type === 'in' && new Date(next.punch_time) < new Date(lastOut)) {
-                const gapMinutes = Math.round((new Date(next.punch_time) - new Date(cur.punch_time)) / 60000);
-                if (gapMinutes > 0) workMinutes -= gapMinutes;
-            }
-        }
-        if (workMinutes < 0) workMinutes = 0;
-    }
-
-    return { firstIn, lastOut, workMinutes };
+    const lastOut = r.pairs[r.pairs.length - 1].out.raw;
+    // Full elapsed span (every gap counts) by default; with "Deduct Break Hours" ON only the
+    // IN->OUT sessions are summed, i.e. every OUT->next IN gap is deducted.
+    const workMinutes = deductBreaks
+        ? r.totalMinutes
+        : Math.round((r.pairs[r.pairs.length - 1].out.dt - r.counted[0].dt) / 60000);
+    return { firstIn, lastOut, workMinutes: Math.max(0, workMinutes) };
 }
 
 function toDateStrLocal(d) {

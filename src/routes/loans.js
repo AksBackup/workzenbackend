@@ -95,11 +95,14 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     if (!employee_id || !principal_amount || !start_month || !start_year) {
         return res.status(400).json({ error: 'employee_id, principal_amount, start_month, start_year required' });
     }
+    if (!(Number(principal_amount) > 0) || !Number.isFinite(Number(principal_amount))) {
+        return res.status(400).json({ error: 'Loan amount must be a number greater than 0.' });
+    }
     if (!['installments', 'salary_percent'].includes(repayment_mode)) {
         return res.status(400).json({ error: "repayment_mode must be 'installments' or 'salary_percent'" });
     }
-    if (repayment_mode === 'salary_percent' && !(salary_deduction_percent > 0)) {
-        return res.status(400).json({ error: 'salary_deduction_percent (> 0) is required when repayment_mode is salary_percent' });
+    if (repayment_mode === 'salary_percent' && !(salary_deduction_percent > 0 && salary_deduction_percent <= 100)) {
+        return res.status(400).json({ error: 'salary_deduction_percent (> 0 and <= 100) is required when repayment_mode is salary_percent' });
     }
     const [result] = await pool.query(
         `INSERT INTO loans (company_id, employee_id, principal_amount, monthly_deduction, repayment_mode, salary_deduction_percent, interest_rate, start_month, start_year)
@@ -121,6 +124,13 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         }
     });
     if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
+    if (req.body.principal_amount !== undefined && (!(Number(req.body.principal_amount) > 0) || !Number.isFinite(Number(req.body.principal_amount)))) {
+        return res.status(400).json({ error: 'Loan amount must be a number greater than 0.' });
+    }
+    if (req.body.salary_deduction_percent !== undefined && req.body.salary_deduction_percent !== null
+        && !(Number(req.body.salary_deduction_percent) > 0 && Number(req.body.salary_deduction_percent) <= 100)) {
+        return res.status(400).json({ error: 'salary_deduction_percent must be greater than 0 and at most 100.' });
+    }
     values.push(req.params.id, req.user.companyId);
     await pool.query(`UPDATE loans SET ${updates.join(', ')} WHERE id = ? AND company_id = ?`, values);
     return res.json({ message: 'Updated' });

@@ -96,18 +96,23 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 // DELETE /leave-balances?employee_id=&year= - "Clear All Leave Balance"
 // from the mockup: wipes every leave-type balance for one employee/year
 // in one call rather than requiring N individual deletes client-side.
+// Also accepts employee_ids=1,2,3 to clear several employees at once (checkbox selection on the
+// Leave Opening Entry list).
 router.delete('/', requireAdmin, asyncHandler(async (req, res) => {
-    const { employee_id, year } = req.query;
-    if (!employee_id || !year) return res.status(400).json({ error: 'employee_id and year required' });
+    const { employee_id, employee_ids, year } = req.query;
+    const ids = (employee_ids ? String(employee_ids).split(',') : (employee_id ? [employee_id] : []))
+        .map(x => Number(x)).filter(x => Number.isInteger(x) && x > 0);
+    if (!ids.length || !year) return res.status(400).json({ error: 'employee_id (or employee_ids) and year required' });
 
     const [empRows] = await pool.query(
-        'SELECT id FROM employees WHERE id = ? AND company_id = ?',
-        [employee_id, req.user.companyId]
+        'SELECT id FROM employees WHERE id IN (?) AND company_id = ?',
+        [ids, req.user.companyId]
     );
     if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
 
-    await pool.query('DELETE FROM leave_balances WHERE employee_id = ? AND year = ?', [employee_id, year]);
-    return res.json({ message: 'Cleared' });
+    // Only employees of THIS company are touched (leave_balances has no company_id of its own).
+    const [result] = await pool.query('DELETE FROM leave_balances WHERE employee_id IN (?) AND year = ?', [empRows.map(r => r.id), year]);
+    return res.json({ message: 'Cleared', employees: empRows.length, rows_deleted: result.affectedRows });
 }));
 
 module.exports = router;

@@ -57,14 +57,23 @@ async function recordPunchEventsAndDeriveAttendance({
     }
     if (!checkIn && !checkOut) return;
 
+    // Stored punch_type used to be 'in' for the first punch and 'out' for EVERY later one.
+    // Re-label the whole day by time order so the sequence is IN, OUT, IN, OUT ...
+    // (Real-Time Logs, cloud toast feed and the reports all read this column.)
+    const [dayEvents] = await pool.query(
+        'SELECT id FROM punch_events WHERE company_id = ? AND employee_id = ? AND date = ? ORDER BY punch_time ASC, id ASC',
+        [companyId, employeeId, date]);
+    for (let i = 0; i < dayEvents.length; i++) {
+        await pool.query('UPDATE punch_events SET punch_type = ? WHERE id = ?', [i % 2 === 0 ? 'in' : 'out', dayEvents[i].id]);
+    }
+
     const [events] = await pool.query(
         'SELECT punch_time, punch_type FROM punch_events WHERE company_id = ? AND employee_id = ? AND date = ? ORDER BY punch_time ASC',
         [companyId, employeeId, date]
     );
-    const ins = events.filter((e) => e.punch_type === 'in');
-    const outs = events.filter((e) => e.punch_type === 'out');
-    const derivedCheckIn = ins.length ? ins[0].punch_time : null;
-    const derivedCheckOut = outs.length ? outs[outs.length - 1].punch_time : null;
+    // attendance.check_in/check_out stay first punch / last punch of the day.
+    const derivedCheckIn = events.length ? events[0].punch_time : null;
+    const derivedCheckOut = events.length > 1 ? events[events.length - 1].punch_time : null;
 
     await pool.query(
         `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, device_id, verify_mode, synced_from_local)

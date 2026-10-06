@@ -113,6 +113,7 @@ const fieldTrackingRoutes = require('./routes/fieldTracking');
 const rawPunchRoutes = require('./routes/rawPunches');
 
 const pool = require('./db');
+const { classifyError, areaFor, withCode, STATUS_MESSAGES } = require('./utils/errorCatalog');
 
 const app = express();
 // Render terminates TLS at its proxy. Without this, req.ip is the proxy's
@@ -121,6 +122,24 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
+
+// Friendly errors + codes for EVERY failed response (see utils/errorCatalog.js, ERROR_CODES.md):
+// any JSON body with an `error` string and HTTP >= 400 gets a `code` and the code appended to the
+// text the user sees: "<message> (Code: WZ-DEV-404)". Routes need no changes.
+app.use((req, res, next) => {
+    const origJson = res.json.bind(res);
+    res.json = (body) => {
+        try {
+            if (res.statusCode >= 400 && body && typeof body === 'object' && !Array.isArray(body) && typeof body.error === 'string' && !body.code) {
+                const code = `WZ-${areaFor(req.originalUrl)}-${res.statusCode}`;
+                const msg = body.error && body.error !== 'Internal server error' ? body.error : (STATUS_MESSAGES[res.statusCode] || STATUS_MESSAGES[500]);
+                body = { ...body, message: msg, code, error: withCode(msg, code) };
+            }
+        } catch (_) { /* never break a response over decoration */ }
+        return origJson(body);
+    };
+    next();
+});
 
 // Internal license admin panel (public/index.html) - protected route-by-route
 // inside routes/license.js via adminPanelAuth, not by this static mount.
@@ -217,16 +236,18 @@ app.use((req, res) => {
 // Error Logs screen (see errorLogs.js) and from Backup export/restore
 // (see backup.js).
 app.use(async (err, req, res, next) => {
-    console.error('Unhandled error:', err);
+    const c = classifyError(err);
+    console.error(`Unhandled error [${c.code}] ${req.method} ${req.originalUrl}:`, err);
     try {
         await pool.query(
             'INSERT INTO error_logs (company_id, route, message, stack) VALUES (?, ?, ?, ?)',
-            [req.user?.companyId || null, req.originalUrl || null, err.message || String(err), err.stack || null]
+            [req.user?.companyId || null, req.originalUrl || null, `[${c.code}] ${err.sqlMessage || err.message || String(err)}`, err.stack || null]
         );
     } catch (logErr) {
         console.error('Failed to write to error_logs (DB may be unreachable):', logErr);
     }
-    res.status(500).json({ error: 'Internal server error' });
+    if (res.headersSent) return;
+    res.status(c.status || 500).json({ error: withCode(c.message, c.code), message: c.message, code: c.code });
 });
 
 // Belt-and-braces: catch anything that still somehow slips through

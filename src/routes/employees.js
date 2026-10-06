@@ -5,21 +5,104 @@ const { verifyFirebaseToken, requireAdmin, isStaff } = require('../middleware/ve
 const asyncHandler = require('../utils/asyncHandler');
 const { loadWeeklyOffIndex, effectiveOffDaysBitmask, isAltSaturdayOff } = require('../utils/attendanceRules');
 const { computeMonthlyPaidUsage } = require('../utils/leaveQuota');
+const { loadLeaveIndex } = require('../utils/leaveIndex');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
+
+
+// ---- Multi-shift (migration_044) ------------------------------------------
+// An employee can work in several shifts. employee_shifts holds the full list;
+// employees.shift_id always mirrors the FIRST one (primary) so every screen that
+// only understands a single shift keeps working.
+function normaliseShiftIds(body) {
+    let ids = body.shift_ids;
+    if (ids === undefined) return null; // not sent -> leave as is
+    if (!Array.isArray(ids)) ids = [];
+    const seen = new Set();
+    return ids.map(Number).filter((n) => Number.isInteger(n) && n > 0 && !seen.has(n) && seen.add(n));
+}
+async function saveEmployeeShifts(db, companyId, employeeId, shiftIds) {
+    try {
+        await db.query('DELETE FROM employee_shifts WHERE employee_id = ? AND company_id = ?', [employeeId, companyId]);
+        for (let i = 0; i < shiftIds.length; i++) {
+            await db.query('INSERT INTO employee_shifts (employee_id, shift_id, company_id, sort_order) VALUES (?, ?, ?, ?)',
+                [employeeId, shiftIds[i], companyId, i]);
+        }
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err; // migration_044 not run - single shift only
+    }
+    await db.query('UPDATE employees SET shift_id = ? WHERE id = ? AND company_id = ?',
+        [shiftIds.length ? shiftIds[0] : null, employeeId, companyId]);
+}
+async function attachShiftIds(rows, companyId) {
+    if (!rows.length) return rows;
+    let links = [];
+    try {
+        [links] = await pool.query('SELECT employee_id, shift_id FROM employee_shifts WHERE company_id = ? ORDER BY sort_order, shift_id', [companyId]);
+    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    const byEmp = new Map();
+    for (const l of links) { if (!byEmp.has(l.employee_id)) byEmp.set(l.employee_id, []); byEmp.get(l.employee_id).push(l.shift_id); }
+    return rows.map((r) => ({ ...r, shift_ids: byEmp.get(r.id) || (r.shift_id != null ? [r.shift_id] : []) }));
+}
 
 // Admin: all employees in their company. Employee: only their own record.
 router.get('/', asyncHandler(async (req, res) => {
     if (isStaff(req.user)) {
         const [rows] = await pool.query('SELECT * FROM employees WHERE company_id = ?', [req.user.companyId]);
-        return res.json(rows);
+        return res.json(await attachShiftIds(rows, req.user.companyId));
     }
     const [rows] = await pool.query(
         'SELECT * FROM employees WHERE company_id = ? AND firebase_uid = ?',
         [req.user.companyId, req.user.uid]
     );
-    return res.json(rows);
+    return res.json(await attachShiftIds(rows, req.user.companyId));
+}));
+
+/**
+ * GET /employees/diagnose/:code   (admin)
+ * Checks, in one call, every condition that makes an employee "not fetch from the
+ * device / not push to the device / not appear in payroll". Built for the
+ * "emp id 9999" report: run it with the code and read the `problems` list.
+ */
+router.get('/diagnose/:code', requireAdmin, asyncHandler(async (req, res) => {
+    const code = String(req.params.code || '').trim();
+    const companyId = req.user.companyId;
+    const problems = [];
+    const [rows] = await pool.query(
+        'SELECT id, emp_code, name, status, salary, doj, shift_id FROM employees WHERE company_id = ? AND TRIM(emp_code) = ?',
+        [companyId, code]);
+    if (rows.length === 0) problems.push('No employee has this emp_code in this company (the device punch/push cannot match anyone).');
+    if (rows.length > 1) problems.push('More than one employee has this emp_code - matching is ambiguous.');
+    const emp = rows[0] || null;
+    if (emp) {
+        if (String(emp.status || '').toLowerCase() !== 'active') problems.push(`Status is "${emp.status}" - payroll only includes "active" employees.`);
+        if (emp.doj && new Date(emp.doj) > new Date()) problems.push('Date of joining is in the future - payroll skips months before joining.');
+        if (!emp.salary || Number(emp.salary) <= 0) problems.push('Base salary is empty/0 - payroll will compute 0.');
+    }
+    // Same code stored with different spacing / leading zeros (device sends exact digits).
+    const [alike] = await pool.query(
+        "SELECT id, emp_code FROM employees WHERE company_id = ? AND TRIM(emp_code) <> ? AND CAST(TRIM(emp_code) AS UNSIGNED) = CAST(? AS UNSIGNED)",
+        [companyId, code, code]);
+    if (alike.length) problems.push(`Look-alike codes exist (${alike.map((a) => `"${a.emp_code}"`).join(', ')}) - device matching is exact, so "0${code}" and "${code}" are different IDs.`);
+    let deviceUsers = [], punches = 0, attendance = 0;
+    try {
+        [deviceUsers] = await pool.query(
+            'SELECT d.id AS device_id, d.name AS device_name, u.pin, u.name FROM device_cloud_users u JOIN devices d ON d.id = u.device_id WHERE u.company_id = ? AND u.pin = ?', [companyId, code]);
+    } catch (_) {}
+    try {
+        const [[p]] = await pool.query('SELECT COUNT(*) AS c FROM raw_punches WHERE company_id = ? AND device_user_id = ?', [companyId, code]);
+        punches = p.c;
+    } catch (_) {}
+    if (emp) {
+        try {
+            const [[a]] = await pool.query('SELECT COUNT(*) AS c FROM attendance WHERE company_id = ? AND employee_id = ?', [companyId, emp.id]);
+            attendance = a.c;
+        } catch (_) {}
+        if (punches > 0 && attendance === 0) problems.push('Raw punches exist but no attendance rows were created for this employee.');
+    }
+    if (!/^[0-9]{1,9}$/.test(code)) problems.push('Code is not numeric (device User ID must be digits only).');
+    return res.json({ emp_code: code, employee: emp, device_users: deviceUsers, raw_punch_count: punches, attendance_rows: attendance, problems });
 }));
 
 /**
@@ -118,6 +201,10 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
                 ot_rate_type || null, ot_rate_value ?? null, tds_amount ?? null, tds_percent ?? null,
                 !!statutory_override_active, card_no || null]
         );
+
+        const newShiftIds = normaliseShiftIds(req.body);
+        if (newShiftIds && newShiftIds.length) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, newShiftIds);
+        else if (shift_id) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, [Number(shift_id)]);
 
         await conn.commit();
         return res.status(201).json({
@@ -332,6 +419,18 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         empCodeChanging = true;
     }
 
+    const putShiftIds = normaliseShiftIds(req.body);
+    if (putShiftIds) {
+        // shift_ids owns shift_id: drop a plain shift_id from this update, it is re-derived below.
+        const i = updates.indexOf('shift_id = ?');
+        if (i !== -1) { updates.splice(i, 1); values.splice(i, 1); }
+    }
+
+    if (updates.length === 0 && putShiftIds) {
+        await saveEmployeeShifts(pool, req.user.companyId, req.params.id, putShiftIds);
+        return res.json({ message: 'Updated' });
+    }
+
     if (updates.length === 0) {
         // Only reachable with nothing left to update if `salary` was the
         // ONLY field sent and the guard above just dropped it - that's a
@@ -354,6 +453,7 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         `UPDATE employees SET ${updates.join(', ')} WHERE id = ? AND company_id = ?`,
         values
     );
+    if (putShiftIds) await saveEmployeeShifts(pool, req.user.companyId, req.params.id, putShiftIds);
     return res.json(salaryWarning ? { message: 'Updated', warnings: [salaryWarning] } : { message: 'Updated' });
 }));
 
@@ -502,7 +602,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     const month = parseInt(req.query.month, 10) || (new Date().getMonth() + 1); // 1-12
 
     const [empRows] = await pool.query(
-        'SELECT id, name, emp_code, dob, department, branch_id, shift_id FROM employees WHERE id = ? AND company_id = ?',
+        'SELECT * FROM employees WHERE id = ? AND company_id = ?',
         [employeeId, req.user.companyId]
     );
     if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
@@ -528,8 +628,8 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     // This employee's own holiday group (via their branch, migration_016)
     // - NULL group means "only company-wide (ungrouped) holidays", same
     // as before this employee has a branch assigned.
-    let employeeHolidayGroupId = null;
-    if (employee.branch_id) {
+    let employeeHolidayGroupId = employee.holiday_group_id != null ? employee.holiday_group_id : null; // explicit group (migration_044) wins
+    if (employeeHolidayGroupId == null && employee.branch_id) {
         const [branchRows] = await pool.query('SELECT holiday_group_id FROM branches WHERE id = ? AND company_id = ?', [employee.branch_id, req.user.companyId]);
         employeeHolidayGroupId = branchRows.length > 0 ? branchRows[0].holiday_group_id : null;
     }
@@ -560,11 +660,9 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     }
     const offBitmask = effectiveOffDaysBitmask(empShift, employee.department, weeklyOffIndex);
     const altSaturdays = empShift ? empShift.alt_saturdays : null;
-    const [leaveRows] = await pool.query(
-        `SELECT from_date, to_date FROM leave_applications
-         WHERE employee_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
-        [employeeId, monthEnd, monthStart]
-    );
+    // Leave v2: whole-day leave only (half / quarter / hours leave days are normal working days
+    // here); holidays / weekly offs inside a leave only show as leave if the leave type counts them.
+    const leaveIdx = await loadLeaveIndex(req.user.companyId, monthStart, monthEnd, { employeeId });
 
     // Shares computeMonthlyPaidUsage with routes/leaves.js so this
     // screen and Apply Leave/Payroll always agree - see that function's
@@ -616,7 +714,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         const dow = new Date(year, month - 1, d).getDay(); // 0=Sun..6=Sat
         const isWeeklyOff = ((offBitmask >> dow) & 1) === 1 || isAltSaturdayOff(dateStr, altSaturdays);
         const holidayName = holidayByDate.get(dateStr);
-        const onLeave = leaveRows.some(l => toDateStr(l.from_date) <= dateStr && toDateStr(l.to_date) >= dateStr);
+        const onLeave = leaveIdx.isFullLeave(Number(employeeId), dateStr);
         const att = attendanceByDate.get(dateStr);
         const isFuture = dateStr > today;
 

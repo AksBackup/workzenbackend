@@ -35,7 +35,10 @@ const pool = require('../db');
  * separate, informational figure only (not part of this calculation),
  * matching the monthly-reset model this now implements.
  */
-async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year, month) {
+async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year, month, opts = {}) {
+    // opts.includePending: also count PENDING applications as "used" (reserve the balance).
+    // Apply Leave uses this so two pending requests cannot both claim the same paid days.
+    const statuses = opts.includePending ? ['approved', 'pending'] : ['approved'];
     const daysInMonth = new Date(year, month, 0).getDate();
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
@@ -56,14 +59,32 @@ async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year,
         quota = typeRows.length > 0 ? parseFloat(typeRows[0].monthly_quota) || 0 : 0;
     }
 
+    // Leave v2 (migration_043): paid usage is summed from the per-day rows, so a leave that
+    // spans two months only uses each month's own quota. Applications created before the
+    // migration have no day rows and are counted the old way (whole application, paid_days).
+    let used = 0;
+    let haveDayTable = true;
+    try {
+        const [dayRows] = await pool.query(
+            `SELECT COALESCE(SUM(d.paid_fraction), 0) AS used
+             FROM leave_application_days d JOIN leave_applications a ON a.id = d.application_id
+             WHERE d.employee_id = ? AND d.leave_type_id = ? AND a.status IN (?) AND d.leave_date BETWEEN ? AND ?`,
+            [employeeId, leaveTypeId, statuses, monthStart, monthEnd]
+        );
+        used += Number(dayRows[0].used) || 0;
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+        haveDayTable = false;
+    }
     const [leaveRows] = await pool.query(
-        `SELECT days_count, paid_days FROM leave_applications
-         WHERE employee_id = ? AND leave_type_id = ? AND status = 'approved' AND from_date <= ? AND to_date >= ?`,
-        [employeeId, leaveTypeId, monthEnd, monthStart]
+        `SELECT a.days_count, a.paid_days FROM leave_applications a
+         WHERE a.employee_id = ? AND a.leave_type_id = ? AND a.status IN (?) AND a.from_date <= ? AND a.to_date >= ?
+         ${haveDayTable ? 'AND NOT EXISTS (SELECT 1 FROM leave_application_days d WHERE d.application_id = a.id)' : ''}`,
+        [employeeId, leaveTypeId, statuses, monthEnd, monthStart]
     );
-    const used = leaveRows.reduce((sum, r) => sum + (r.paid_days !== null ? Number(r.paid_days) : Number(r.days_count)), 0);
+    used += leaveRows.reduce((sum, r) => sum + (r.paid_days !== null ? Number(r.paid_days) : Number(r.days_count)), 0);
 
-    return { quota, used };
+    return { quota, used: Math.round(used * 100) / 100 };
 }
 
 module.exports = { computeMonthlyPaidUsage };

@@ -32,6 +32,9 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
     if (!employee_id || !date || amount === undefined) {
         return res.status(400).json({ error: 'employee_id, date, amount required' });
     }
+    if (!(Number(amount) > 0) || !Number.isFinite(Number(amount))) {
+        return res.status(400).json({ error: 'Claim amount must be a number greater than 0.' });
+    }
     const [result] = await pool.query(
         `INSERT INTO conveyance_claims (company_id, employee_id, date, amount, reason)
          VALUES (?, ?, ?, ?, ?)`,

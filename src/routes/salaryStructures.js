@@ -121,15 +121,26 @@ router.put('/:employeeId', requireAdmin, asyncHandler(async (req, res) => {
     const cleanHeads = [];
     let additionTotal = 0;
     let deductionTotal = 0;
+    try {
     for (const [type, list, addTo] of [['addition', addition, v => (additionTotal += v)], ['deduction', deduction, v => (deductionTotal += v)]]) {
         list.forEach((h, idx) => {
             const name = String(h?.head_name ?? '').trim();
             const amount = Number(h?.amount) || 0;
-            if (!name) return; // silently skip blank rows (e.g. an empty "add new head" row not filled in)
+            if (!name) {
+                // A completely empty row (no name, no amount) is harmless - skip it. A row that has an
+                // amount but no name is a mistake: reject it instead of silently dropping the money.
+                if (amount !== 0) throw Object.assign(new Error(`An ${type} head with amount ${amount} has no name. Enter a name or remove the row.`), { status: 400 });
+                return;
+            }
             if (amount < 0) throw Object.assign(new Error(`${type} head "${name}" amount must not be negative`), { status: 400 });
             addTo(amount);
             cleanHeads.push({ type, name, amount, sortOrder: idx });
         });
+    }
+
+    } catch (err) {
+        if (err.status === 400) return res.status(400).json({ error: err.message });
+        throw err;
     }
 
     const gross = additionTotal - deductionTotal; // net of heads only - informational, NOT stored as salary

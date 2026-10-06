@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "verify-schema": "node -r dotenv/config scripts/verify_schema.js"
+    "verify-schema": "node -r dotenv/config scripts/verify_schema.js",
+    "error-codes": "node scripts/genErrorCodes.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
