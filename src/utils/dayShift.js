@@ -64,4 +64,32 @@ async function loadDayShiftResolver(companyId, fromStr, toStr, shiftsById) {
     };
 }
 
-module.exports = { loadDayShiftResolver, pickClosestShift };
+/** A roster entry whose shift is named OFF (any case) means Week Off / Holiday for that day. */
+const isOffShiftName = (name) => String(name || '').trim().toUpperCase() === 'OFF';
+
+/** In-memory index: is this employee on a roster "OFF" on this date? One query per report run. */
+async function loadRosterOffIndex(companyId, fromStr, toStr) {
+    let rows = [];
+    try {
+        [rows] = await pool.query(
+            `SELECT sa.employee_id, sa.effective_from, sa.effective_to, sa.id, s.name
+             FROM shift_assignments sa JOIN shifts s ON s.id = sa.shift_id
+             WHERE sa.company_id = ? AND sa.effective_from <= ? AND (sa.effective_to IS NULL OR sa.effective_to >= ?)
+             ORDER BY sa.effective_from ASC, sa.id ASC`, [companyId, toStr, fromStr]);
+    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    const byEmp = new Map();
+    for (const r of rows) { if (!byEmp.has(r.employee_id)) byEmp.set(r.employee_id, []); byEmp.get(r.employee_id).push(r); }
+    return {
+        isOff(employeeId, dateStr) {
+            const list = byEmp.get(employeeId);
+            if (!list) return false;
+            let hit = null; // latest-starting applicable row wins (same rule as the report shift lookup)
+            for (const r of list) {
+                if (dKey(r.effective_from) <= dateStr && (!r.effective_to || dKey(r.effective_to) >= dateStr)) hit = r;
+            }
+            return !!hit && isOffShiftName(hit.name);
+        },
+    };
+}
+
+module.exports = { loadDayShiftResolver, pickClosestShift, isOffShiftName, loadRosterOffIndex };

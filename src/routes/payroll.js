@@ -12,7 +12,7 @@ const { resolvePaymentWindow } = require('../utils/paymentWindow');
 const { classifyDay, resolveEmployeeOffDays, computeLateEarly } = require('../utils/dayClassifier');
 const { loadLeaveIndex } = require('../utils/leaveIndex');
 
-const { loadDayShiftResolver } = require('../utils/dayShift');
+const { loadDayShiftResolver, isOffShiftName } = require('../utils/dayShift');
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
@@ -310,6 +310,7 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
             const partialF = li && li.fraction < 0.999 ? li.fraction : 0;
             const fullLeave = !!li && !partialF;
             let status = classifyDay({
+                isRosterOff: isOffShiftName(dayShift && dayShift.name),
                 dateStr, dayOfWeek,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask, altSaturdays, isWeeklyOff2,

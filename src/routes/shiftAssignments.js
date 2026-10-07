@@ -121,6 +121,18 @@ router.post('/bulk', requireAdmin, asyncHandler(async (req, res) => {
     return res.json({ saved, cleared });
 }));
 
+// GET /shift-assignments/off-shift - the roster's "OFF" (week off / holiday) entry. It is stored as a
+// shift named OFF so it fits shift_assignments as-is; created on first use. Reports and payroll treat
+// a roster OFF as WO (paid), see utils/dayShift.js.
+router.get('/off-shift', requireAdmin, asyncHandler(async (req, res) => {
+    const [rows] = await pool.query("SELECT id, name FROM shifts WHERE company_id = ? AND UPPER(TRIM(name)) = 'OFF' LIMIT 1", [req.user.companyId]);
+    if (rows.length) return res.json(rows[0]);
+    const [r] = await pool.query(
+        "INSERT INTO shifts (company_id, name, start_time, end_time, ot_allowed, single_punch_policy, is_half_day_shift) VALUES (?, 'OFF', '00:00:00', '00:00:00', FALSE, 'none', FALSE)",
+        [req.user.companyId]);
+    return res.status(201).json({ id: r.insertId, name: 'OFF' });
+}));
+
 router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
     await pool.query('DELETE FROM shift_assignments WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
     return res.json({ message: 'Deleted' });

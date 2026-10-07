@@ -43,12 +43,15 @@ function classifyDay({
     workMinutesOverride = undefined,
     rules = null, lateMinutes = 0, earlyMinutes = 0,
     thresholdScale = 1,
+    isRosterOff = false, // Shift Roster says OFF (week off / holiday) for this day
 }) {
     // thresholdScale (<1): the person has a part-day leave (half / quarter / hours), so only the
     // remaining share of the day was expected - the duration thresholds shrink by that share.
     fullDayHours = fullDayHours * thresholdScale;
     halfDayMinHours = halfDayMinHours * thresholdScale;
     if (isHoliday(dateStr)) return 'holiday';
+    // Roster OFF: a rostered week-off. If the person punched anyway, fall through and count the work.
+    if (isRosterOff && (!attendance || !attendance.check_in)) return 'weekly_off';
     if ((offDaysBitmask & (1 << dayOfWeek)) !== 0) return 'weekly_off';
     if (isAltSaturdayOff(dateStr, altSaturdays)) return 'weekly_off';
     if (isWeeklyOff2(dateStr)) return 'weekly_off';
