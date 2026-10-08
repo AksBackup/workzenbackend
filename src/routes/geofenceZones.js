@@ -77,6 +77,28 @@ async function checkAgainstZones(companyId, latitude, longitude) {
     };
 }
 
+/**
+ * Checks a coordinate against ONE specific zone (the zone an employee is assigned to,
+ * employees.geofence_zone_id - migration_047). Same return shape as checkAgainstZones().
+ * If the zone no longer exists / is switched off, falls back to "any active zone" so a
+ * deleted zone never silently locks an employee out or lets them punch from anywhere.
+ */
+async function checkAgainstZone(companyId, zoneId, latitude, longitude) {
+    const [zones] = await pool.query(
+        'SELECT name, latitude, longitude, radius_meters FROM geofence_zones WHERE id = ? AND company_id = ? AND is_active = 1',
+        [zoneId, companyId]
+    );
+    if (zones.length === 0) return checkAgainstZones(companyId, latitude, longitude);
+    const zone = zones[0];
+    const distance = haversineMeters(latitude, longitude, parseFloat(zone.latitude), parseFloat(zone.longitude));
+    return {
+        inside: distance <= zone.radius_meters,
+        nearestZoneName: zone.name,
+        nearestDistanceMeters: Math.round(distance),
+        zonesConfigured: true,
+    };
+}
+
 router.get('/', asyncHandler(async (req, res) => {
     const [rows] = await pool.query(
         'SELECT * FROM geofence_zones WHERE company_id = ? ORDER BY name ASC',
@@ -117,7 +139,11 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
 
 router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
     await pool.query('DELETE FROM geofence_zones WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
+    // Employees assigned to this zone fall back to "any active zone" (migration_047).
+    if (await require('../utils/columnCache').hasColumn('employees', 'geofence_zone_id')) {
+        await pool.query('UPDATE employees SET geofence_zone_id = NULL WHERE geofence_zone_id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
+    }
     return res.json({ message: 'Deleted' });
 }));
 
-module.exports = { router, checkAgainstZones };
+module.exports = { router, checkAgainstZones, checkAgainstZone };

@@ -49,6 +49,25 @@ async function attachShiftIds(rows, companyId) {
 }
 
 // Admin: all employees in their company. Employee: only their own record.
+// ---- Geofence zone assignment (migration_047) -----------------------------
+// Returns an error string when `zoneId` is not a zone of this company, else null.
+async function validateGeofenceZone(companyId, zoneId) {
+    if (zoneId === undefined || zoneId === null || zoneId === '') return null;
+    const [rows] = await pool.query('SELECT id FROM geofence_zones WHERE id = ? AND company_id = ?', [zoneId, companyId]);
+    return rows.length ? null : 'The selected geofence location does not exist. Pick one from Set Geo Location.';
+}
+
+// Next free numeric Emp Code. Starts at (employee count + 1) like before but SKIPS codes already
+// taken - the old `COUNT(*) + 1` handed out a duplicate (-> database error on Add Employee) as soon
+// as any employee had been deleted or a code had been typed in by hand.
+async function nextEmpCode(conn, companyId) {
+    const [rows] = await conn.query('SELECT emp_code FROM employees WHERE company_id = ?', [companyId]);
+    const used = new Set(rows.map((r) => String(r.emp_code).trim()));
+    let n = rows.length + 1;
+    while (used.has(String(n))) n++;
+    return String(n);
+}
+
 router.get('/', asyncHandler(async (req, res) => {
     if (isStaff(req.user)) {
         const [rows] = await pool.query('SELECT * FROM employees WHERE company_id = ?', [req.user.companyId]);
@@ -160,6 +179,11 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         }
     }
 
+    if (req.body.geofence_enabled && req.body.geofence_zone_id) {
+        const zoneErr = await validateGeofenceZone(req.user.companyId, req.body.geofence_zone_id);
+        if (zoneErr) return res.status(400).json({ error: zoneErr });
+    }
+
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
@@ -179,11 +203,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
             // Plain sequential digits, unique per company - NOT slug-prefixed.
             // Uniqueness is still guaranteed per company via the employees
             // table's UNIQUE(company_id, emp_code) constraint.
-            const [countRows] = await conn.query(
-                'SELECT COUNT(*) AS cnt FROM employees WHERE company_id = ?',
-                [req.user.companyId]
-            );
-            empCode = String(countRows[0].cnt + 1);
+            empCode = await nextEmpCode(conn, req.user.companyId);
         }
 
         const [result] = await conn.query(
@@ -206,6 +226,9 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 
         if (req.body.geofence_enabled !== undefined && (await require('../utils/columnCache').hasColumn('employees', 'geofence_enabled'))) {
             await conn.query('UPDATE employees SET geofence_enabled = ? WHERE id = ?', [req.body.geofence_enabled ? 1 : 0, result.insertId]);
+        }
+        if (req.body.geofence_enabled && req.body.geofence_zone_id && (await require('../utils/columnCache').hasColumn('employees', 'geofence_zone_id'))) {
+            await conn.query('UPDATE employees SET geofence_zone_id = ? WHERE id = ?', [req.body.geofence_zone_id, result.insertId]);
         }
         const newShiftIds = normaliseShiftIds(req.body);
         if (newShiftIds && newShiftIds.length) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, newShiftIds);
@@ -387,6 +410,15 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         'pf_percent', 'epf_percent', 'esi_percent', 'pf_limit', 'ot_rate_type', 'ot_rate_value', 'tds_amount', 'tds_percent', 'statutory_override_active', 'card_no', 'geofence_enabled'];
     if (!(await require('../utils/columnCache').hasColumn('employees', 'geofence_enabled'))) {
         fields.splice(fields.indexOf('geofence_enabled'), 1); // migration_046 not run yet
+    }
+    // migration_047: the zone this employee is tied to. Turning geofencing OFF clears it.
+    if (await require('../utils/columnCache').hasColumn('employees', 'geofence_zone_id')) {
+        fields.push('geofence_zone_id');
+        if (req.body.geofence_enabled !== undefined && !req.body.geofence_enabled) req.body.geofence_zone_id = null;
+        if (req.body.geofence_zone_id) {
+            const zoneErr = await validateGeofenceZone(req.user.companyId, req.body.geofence_zone_id);
+            if (zoneErr) return res.status(400).json({ error: zoneErr });
+        }
     }
     if (req.body.id_proof_type !== undefined && req.body.id_proof_type !== null
         && !['aadhaar', 'pan', 'voter_id'].includes(req.body.id_proof_type)) {

@@ -3,7 +3,7 @@ const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
 const { computeAndRecordOvertime } = require('../utils/overtime');
-const { checkAgainstZones } = require('./geofenceZones');
+const { checkAgainstZones, checkAgainstZone } = require('./geofenceZones');
 const { hasColumn } = require('../utils/columnCache');
 
 const router = express.Router();
@@ -56,7 +56,8 @@ router.get('/', asyncHandler(async (req, res) => {
     const { status, employee_id } = req.query;
     const params = [req.user.companyId];
     const hasGeo = await hasColumn('employees', 'geofence_enabled');
-    let sql = `SELECT mp.*, e.name AS employee_name, e.emp_code AS employee_code, e.remote_location_enabled${hasGeo ? ', e.geofence_enabled' : ''}
+    const hasZone = await hasColumn('employees', 'geofence_zone_id');
+    let sql = `SELECT mp.*, e.name AS employee_name, e.emp_code AS employee_code, e.remote_location_enabled${hasGeo ? ', e.geofence_enabled' : ''}${hasZone ? ', e.geofence_zone_id' : ''}
                FROM mobile_punches mp
                JOIN employees e ON e.id = mp.employee_id
                WHERE mp.company_id = ?`;
@@ -94,7 +95,10 @@ router.get('/', asyncHandler(async (req, res) => {
         if (row.latitude == null || row.longitude == null) {
             return { ...row, geofence: { exempt: false, hasLocation: false } };
         }
-        const check = await checkAgainstZones(req.user.companyId, parseFloat(row.latitude), parseFloat(row.longitude));
+        // Assigned to one specific zone (migration_047) -> judge against THAT zone only.
+        const check = row.geofence_zone_id
+            ? await checkAgainstZone(req.user.companyId, row.geofence_zone_id, parseFloat(row.latitude), parseFloat(row.longitude))
+            : await checkAgainstZones(req.user.companyId, parseFloat(row.latitude), parseFloat(row.longitude));
         return { ...row, geofence: { exempt: false, hasLocation: true, ...check } };
     }));
 
@@ -136,7 +140,8 @@ router.post('/', asyncHandler(async (req, res) => {
     // Employees without geofencing may punch from anywhere (location and photo stay optional).
     // Admin-submitted punches are not restricted.
     if (req.user.role === 'employee' && await hasColumn('employees', 'geofence_enabled')) {
-        const [[emp]] = await pool.query('SELECT geofence_enabled FROM employees WHERE id = ?', [employeeId]);
+        const hasZoneCol = await hasColumn('employees', 'geofence_zone_id');
+        const [[emp]] = await pool.query(`SELECT geofence_enabled${hasZoneCol ? ', geofence_zone_id' : ''} FROM employees WHERE id = ?`, [employeeId]);
         if (emp && emp.geofence_enabled) {
             if (!photo_base64) {
                 return res.status(400).json({ error: 'A photo is required for this punch. Capture and confirm your photo, then punch again.', code: 'photo_required' });
@@ -144,7 +149,10 @@ router.post('/', asyncHandler(async (req, res) => {
             if (latitude == null || longitude == null) {
                 return res.status(400).json({ error: 'Your location could not be read. Turn on location and try again.', code: 'location_required' });
             }
-            const zone = await checkAgainstZones(req.user.companyId, parseFloat(latitude), parseFloat(longitude));
+            // Tied to a specific zone (migration_047) -> only THAT zone counts; otherwise any active zone.
+            const zone = emp.geofence_zone_id
+                ? await checkAgainstZone(req.user.companyId, emp.geofence_zone_id, parseFloat(latitude), parseFloat(longitude))
+                : await checkAgainstZones(req.user.companyId, parseFloat(latitude), parseFloat(longitude));
             if (!zone.inside) {
                 return res.status(403).json({
                     error: `You are outside the allowed location${zone.nearestZoneName ? ` (nearest: ${zone.nearestZoneName}, ${zone.nearestDistanceMeters} m away)` : ''}. Move inside the geofence to punch.`,
