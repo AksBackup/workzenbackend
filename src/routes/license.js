@@ -255,6 +255,33 @@ router.get('/my-company/feature-flags', asyncHandler(async (req, res) => {
     });
 }));
 
+/**
+ * GET /license/my-company/info?license_key=
+ * What the "Other > License" screen shows: status, validity date and days left, seats, company.
+ * Same "just the license key" auth model as /verify and /my-company/feature-flags.
+ */
+router.get('/my-company/info', asyncHandler(async (req, res) => {
+    const { license_key } = req.query;
+    if (!license_key) return res.status(400).json({ error: 'license_key required' });
+    const [rows] = await pool.query(
+        `SELECT l.status, l.expires_at, l.max_employees, c.name AS company_name
+         FROM licenses l LEFT JOIN companies c ON c.id = l.company_id WHERE l.license_key = ?`,
+        [license_key]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    const r = rows[0];
+    let daysRemaining = null;
+    if (r.expires_at) daysRemaining = Math.ceil((new Date(r.expires_at).getTime() - Date.now()) / 86400000);
+    return res.json({
+        company_name: r.company_name,
+        status: r.status,
+        max_employees: r.max_employees,
+        expires_at: r.expires_at,
+        days_remaining: daysRemaining,
+        expired: daysRemaining !== null && daysRemaining < 0,
+        key_masked: license_key.length > 8 ? `${license_key.slice(0, 4)}${'*'.repeat(Math.max(0, license_key.length - 8))}${license_key.slice(-4)}` : '****',
+    });
+}));
+
 /* ------------------------------------------------------------------
    Internal only - the vendor's own panel (public/index.html + /panel/*
    login). Never expose these paths to customers.

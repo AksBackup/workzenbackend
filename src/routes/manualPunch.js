@@ -126,10 +126,13 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
             return res.status(404).json({ error: 'Manual punch not found' });
         }
         const punch = rows[0];
-        if (punch.status !== 'pending') {
+        if (punch.status === 'approved') {
             await conn.rollback();
             return res.status(409).json({ error: `Already ${punch.status}` });
         }
+
+        // Remember the day's attendance as it is BEFORE this approval, so Revert / Delete can restore it exactly.
+        const _snap = await require('../utils/punchRevert').snapshotAttendance(conn, req.user.companyId, punch.employee_id, punch.date);
 
         // The real write: same upsert shape as attendance.js's /sync route.
         // verify_mode='manual' (migration_011) - an admin typed this in,
@@ -141,12 +144,22 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
             `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, verify_mode)
              VALUES (?, ?, ?, ?, ?, 'manual', 'manual')
              ON DUPLICATE KEY UPDATE
-               check_in = COALESCE(VALUES(check_in), check_in),
-               check_out = COALESCE(VALUES(check_out), check_out),
+               -- First punch of the day is the IN, the latest is the OUT (any source). check_out is
+               -- assigned first so it can still see the OLD check_in (MySQL applies SETs left to right).
+               check_out = CASE
+                 WHEN VALUES(check_in) IS NOT NULL AND check_in IS NOT NULL AND VALUES(check_in) < check_in AND check_out IS NULL THEN check_in
+                 WHEN VALUES(check_out) IS NULL THEN check_out
+                 WHEN check_out IS NULL THEN VALUES(check_out)
+                 ELSE GREATEST(check_out, VALUES(check_out)) END,
+               check_in = CASE
+                 WHEN VALUES(check_in) IS NULL THEN check_in
+                 WHEN check_in IS NULL THEN VALUES(check_in)
+                 ELSE LEAST(check_in, VALUES(check_in)) END,
                verify_mode = 'manual'`,
             [req.user.companyId, punch.employee_id, punch.date, punch.check_in, punch.check_out]
         );
 
+        await require('../utils/punchRevert').saveSnapshot(conn, 'manual', punch.id, _snap);
         const adminId = await _currentAdminId(req);
         await conn.query(
             `UPDATE manual_punches SET status = 'approved', approved_by = ?, approved_on = NOW()
@@ -155,12 +168,13 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
         );
 
         await conn.commit();
+        const payrollUpdated = await require('../utils/punchRevert').refreshPayrollSafe(req.user.companyId, punch.employee_id, punch.date);
         if (punch.check_out) {
             await computeAndRecordOvertime(req.user.companyId, punch.employee_id, punch.date, punch.check_out).catch(err =>
                 console.error('Overtime computation failed:', err)
             );
         }
-        return res.json({ message: 'Approved and written to attendance' });
+        return res.json({ message: 'Approved and written to attendance', payroll_updated: payrollUpdated });
     } catch (err) {
         await conn.rollback();
         console.error('Manual punch approval failed:', err);
@@ -170,14 +184,8 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
     }
 }));
 
-router.post('/:id/reject', requireAdmin, asyncHandler(async (req, res) => {
-    const adminId = await _currentAdminId(req);
-    await pool.query(
-        `UPDATE manual_punches SET status = 'rejected', approved_by = ?, approved_on = NOW()
-         WHERE id = ? AND company_id = ? AND status = 'pending'`,
-        [adminId, req.params.id, req.user.companyId]
-    );
-    return res.json({ message: 'Rejected' });
-}));
+router.post('/:id/reject', requireAdmin, asyncHandler(require('../utils/punchRevert').makeRejectHandler({ pool, table: 'manual_punches', kind: 'manual', currentAdminId: _currentAdminId })));
+
+require('../utils/punchRevert').addRevertAndDelete(router, { pool, requireAdmin, asyncHandler, table: 'manual_punches', kind: 'manual' });
 
 module.exports = router;

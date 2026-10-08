@@ -3,7 +3,9 @@ const admin = require('firebase-admin');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin, isStaff } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
-const { loadWeeklyOffIndex, effectiveOffDaysBitmask, isAltSaturdayOff } = require('../utils/attendanceRules');
+const { loadWeeklyOffIndex, effectiveOffDaysBitmask, isAltSaturdayOff, loadShiftPolicyOffIndex } = require('../utils/attendanceRules');
+const { resolveEmployeeOffDays } = require('../utils/dayClassifier');
+const { loadRosterOffIndex } = require('../utils/dayShift');
 const { computeMonthlyPaidUsage } = require('../utils/leaveQuota');
 const { loadLeaveIndex } = require('../utils/leaveIndex');
 
@@ -202,6 +204,9 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
                 !!statutory_override_active, card_no || null]
         );
 
+        if (req.body.geofence_enabled !== undefined && (await require('../utils/columnCache').hasColumn('employees', 'geofence_enabled'))) {
+            await conn.query('UPDATE employees SET geofence_enabled = ? WHERE id = ?', [req.body.geofence_enabled ? 1 : 0, result.insertId]);
+        }
         const newShiftIds = normaliseShiftIds(req.body);
         if (newShiftIds && newShiftIds.length) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, newShiftIds);
         else if (shift_id) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, [Number(shift_id)]);
@@ -379,7 +384,10 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     // statutory/OT overrides; see that migration's header comment).
     const fields = ['name', 'designation', 'department', 'department_id', 'designation_id', 'shift_id', 'doj', 'dob', 'salary', 'status', 'photo_url', 'category_id', 'remote_location_enabled', 'branch_id',
         'phone', 'personal_email', 'office_email', 'address', 'id_proof_type', 'id_proof_number', 'bank_account_holder', 'bank_account_no', 'bank_ifsc', 'bank_name', 'assigned_device_id',
-        'pf_percent', 'epf_percent', 'esi_percent', 'pf_limit', 'ot_rate_type', 'ot_rate_value', 'tds_amount', 'tds_percent', 'statutory_override_active', 'card_no'];
+        'pf_percent', 'epf_percent', 'esi_percent', 'pf_limit', 'ot_rate_type', 'ot_rate_value', 'tds_amount', 'tds_percent', 'statutory_override_active', 'card_no', 'geofence_enabled'];
+    if (!(await require('../utils/columnCache').hasColumn('employees', 'geofence_enabled'))) {
+        fields.splice(fields.indexOf('geofence_enabled'), 1); // migration_046 not run yet
+    }
     if (req.body.id_proof_type !== undefined && req.body.id_proof_type !== null
         && !['aadhaar', 'pan', 'voter_id'].includes(req.body.id_proof_type)) {
         return res.status(400).json({ error: 'id_proof_type must be one of: aadhaar, pan, voter_id' });
@@ -658,8 +666,13 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         );
         empShift = shiftRows[0] ?? null;
     }
-    const offBitmask = effectiveOffDaysBitmask(empShift, employee.department, weeklyOffIndex);
-    const altSaturdays = empShift ? empShift.alt_saturdays : null;
+    // Same resolution as the reports / payroll: the shift's assigned Office Time Policy first,
+    // else the shift's own weekly-off columns / department / company config. Plus the Shift
+    // Roster: a rostered OFF day is a week off / holiday too.
+    const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(req.user.companyId);
+    const { offDaysBitmask: offBitmask, altSaturdays, isWeeklyOff2 } =
+        resolveEmployeeOffDays(employee.shift_id, empShift, employee.department, weeklyOffIndex, shiftPolicyOffIndex);
+    const rosterOffIdx = await loadRosterOffIndex(req.user.companyId, monthStart, monthEnd);
     // Leave v2: whole-day leave only (half / quarter / hours leave days are normal working days
     // here); holidays / weekly offs inside a leave only show as leave if the leave type counts them.
     const leaveIdx = await loadLeaveIndex(req.user.companyId, monthStart, monthEnd, { employeeId });
@@ -712,7 +725,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     for (let d = 1; d <= daysInMonth; d++) {
         const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
         const dow = new Date(year, month - 1, d).getDay(); // 0=Sun..6=Sat
-        const isWeeklyOff = ((offBitmask >> dow) & 1) === 1 || isAltSaturdayOff(dateStr, altSaturdays);
+        const isWeeklyOff = ((offBitmask >> dow) & 1) === 1 || isAltSaturdayOff(dateStr, altSaturdays) || isWeeklyOff2(dateStr) || rosterOffIdx.isOff(Number(employeeId), dateStr);
         const holidayName = holidayByDate.get(dateStr);
         const onLeave = leaveIdx.isFullLeave(Number(employeeId), dateStr);
         const att = attendanceByDate.get(dateStr);

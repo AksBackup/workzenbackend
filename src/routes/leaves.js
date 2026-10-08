@@ -178,4 +178,15 @@ router.post('/:id/reject', requireAdmin, asyncHandler(async (req, res) => {
     return res.json({ message: 'Rejected' });
 }));
 
+// DELETE /leave-applications/:id - removes the application (and its per-day rows). Quota/payroll
+// read the applications table, so the leave simply stops counting.
+router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
+    const [rows] = await pool.query('SELECT id FROM leave_applications WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Leave application not found' });
+    try { await pool.query('DELETE FROM leave_application_days WHERE application_id = ?', [req.params.id]); }
+    catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    await pool.query('DELETE FROM leave_applications WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
+    return res.json({ message: 'Deleted' });
+}));
+
 module.exports = router;

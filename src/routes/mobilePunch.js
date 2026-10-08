@@ -4,6 +4,7 @@ const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFireb
 const asyncHandler = require('../utils/asyncHandler');
 const { computeAndRecordOvertime } = require('../utils/overtime');
 const { checkAgainstZones } = require('./geofenceZones');
+const { hasColumn } = require('../utils/columnCache');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -54,7 +55,8 @@ async function _currentEmployeeId(req) {
 router.get('/', asyncHandler(async (req, res) => {
     const { status, employee_id } = req.query;
     const params = [req.user.companyId];
-    let sql = `SELECT mp.*, e.name AS employee_name, e.emp_code AS employee_code, e.remote_location_enabled
+    const hasGeo = await hasColumn('employees', 'geofence_enabled');
+    let sql = `SELECT mp.*, e.name AS employee_name, e.emp_code AS employee_code, e.remote_location_enabled${hasGeo ? ', e.geofence_enabled' : ''}
                FROM mobile_punches mp
                JOIN employees e ON e.id = mp.employee_id
                WHERE mp.company_id = ?`;
@@ -85,7 +87,8 @@ router.get('/', asyncHandler(async (req, res) => {
     // submission is always reflected against still-pending rows rather
     // than freezing a stale judgement from submission time.
     const rowsWithGeofence = await Promise.all(rows.map(async (row) => {
-        if (row.remote_location_enabled) {
+        // Geofencing is assigned per employee (migration_046): not assigned = may punch anywhere.
+        if (hasGeo ? !row.geofence_enabled : row.remote_location_enabled) {
             return { ...row, geofence: { exempt: true } };
         }
         if (row.latitude == null || row.longitude == null) {
@@ -125,16 +128,58 @@ router.post('/', asyncHandler(async (req, res) => {
         if (!employeeId) return res.status(400).json({ error: 'employee_id required for admin-submitted mobile punch' });
     }
 
+    // ---- Geofencing (per employee, migration_046) ---------------------------------------------
+    // An employee who is ASSIGNED geofencing can only punch from inside a zone AND only with a
+    // photo that was captured and confirmed on the phone. The app must call this endpoint ONLY
+    // after the photo is confirmed - cancelling / Back / leaving the camera sends nothing, so no
+    // punch exists. The server enforces both rules too, so a modified app cannot skip them.
+    // Employees without geofencing may punch from anywhere (location and photo stay optional).
+    // Admin-submitted punches are not restricted.
+    if (req.user.role === 'employee' && await hasColumn('employees', 'geofence_enabled')) {
+        const [[emp]] = await pool.query('SELECT geofence_enabled FROM employees WHERE id = ?', [employeeId]);
+        if (emp && emp.geofence_enabled) {
+            if (!photo_base64) {
+                return res.status(400).json({ error: 'A photo is required for this punch. Capture and confirm your photo, then punch again.', code: 'photo_required' });
+            }
+            if (latitude == null || longitude == null) {
+                return res.status(400).json({ error: 'Your location could not be read. Turn on location and try again.', code: 'location_required' });
+            }
+            const zone = await checkAgainstZones(req.user.companyId, parseFloat(latitude), parseFloat(longitude));
+            if (!zone.inside) {
+                return res.status(403).json({
+                    error: `You are outside the allowed location${zone.nearestZoneName ? ` (nearest: ${zone.nearestZoneName}, ${zone.nearestDistanceMeters} m away)` : ''}. Move inside the geofence to punch.`,
+                    code: 'outside_geofence',
+                });
+            }
+        }
+    }
+
+    // ---- First punch of the day is the IN, every later one is an OUT / next punch --------------
+    // Whatever the app labelled it, and whichever source made the earlier punches (biometric
+    // machine, GPS/mobile, manual, anything else): if the employee has no earlier punch on this
+    // date it is the IN, otherwise it is an OUT / next punch.
+    const punchTime = check_in || check_out;
+    const dayStart = String(date).slice(0, 10);
+    const [[prior]] = await pool.query(
+        `SELECT
+           (SELECT COUNT(*) FROM attendance WHERE employee_id = ? AND date = ? AND (check_in IS NOT NULL OR check_out IS NOT NULL)) +
+           (SELECT COUNT(*) FROM manual_punches WHERE employee_id = ? AND date = ? AND status <> 'rejected') +
+           (SELECT COUNT(*) FROM mobile_punches WHERE employee_id = ? AND date = ? AND status <> 'rejected') AS n`,
+        [employeeId, dayStart, employeeId, dayStart, employeeId, dayStart]);
+    const isFirstOfDay = Number(prior.n) === 0;
+    const finalCheckIn = isFirstOfDay ? punchTime : null;
+    const finalCheckOut = isFirstOfDay ? null : punchTime;
+
     const [result] = await pool.query(
         `INSERT INTO mobile_punches
             (company_id, employee_id, date, check_in, check_out, latitude, longitude, accuracy_meters, photo_base64, remark, submitted_by)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-            req.user.companyId, employeeId, date, check_in || null, check_out || null,
+            req.user.companyId, employeeId, date, finalCheckIn, finalCheckOut,
             latitude ?? null, longitude ?? null, accuracy_meters ?? null, photo_base64 || null, remark || null, employeeId
         ]
     );
-    return res.status(201).json({ id: result.insertId });
+    return res.status(201).json({ id: result.insertId, direction: isFirstOfDay ? 'in' : 'out' });
 }));
 
 /**
@@ -170,37 +215,51 @@ router.post('/:id/approve', requireAdmin, asyncHandler(async (req, res) => {
             return res.status(404).json({ error: 'Mobile punch not found' });
         }
         const punch = rows[0];
-        if (punch.status !== 'pending') {
+        if (punch.status === 'approved') {
             await conn.rollback();
             return res.status(409).json({ error: `Already ${punch.status}` });
         }
+
+        // Remember the day's attendance as it is BEFORE this approval, so Revert / Delete can restore it exactly.
+        const _snap = await require('../utils/punchRevert').snapshotAttendance(conn, req.user.companyId, punch.employee_id, punch.date);
 
         await conn.query(
             `INSERT INTO attendance (company_id, employee_id, date, check_in, check_out, source, verify_mode)
              VALUES (?, ?, ?, ?, ?, 'mobile', 'mobile')
              ON DUPLICATE KEY UPDATE
-               check_in = COALESCE(VALUES(check_in), check_in),
-               check_out = COALESCE(VALUES(check_out), check_out),
+               -- First punch of the day is the IN, the latest is the OUT (any source). check_out is
+               -- assigned first so it can still see the OLD check_in (MySQL applies SETs left to right).
+               check_out = CASE
+                 WHEN VALUES(check_in) IS NOT NULL AND check_in IS NOT NULL AND VALUES(check_in) < check_in AND check_out IS NULL THEN check_in
+                 WHEN VALUES(check_out) IS NULL THEN check_out
+                 WHEN check_out IS NULL THEN VALUES(check_out)
+                 ELSE GREATEST(check_out, VALUES(check_out)) END,
+               check_in = CASE
+                 WHEN VALUES(check_in) IS NULL THEN check_in
+                 WHEN check_in IS NULL THEN VALUES(check_in)
+                 ELSE LEAST(check_in, VALUES(check_in)) END,
                verify_mode = 'mobile'`,
             [req.user.companyId, punch.employee_id, punch.date, punch.check_in, punch.check_out]
         );
 
+        await require('../utils/punchRevert').saveSnapshot(conn, 'mobile', punch.id, _snap);
         const adminId = await _currentAdminId(req);
+        const lt = location_type ? ', location_type = ?' : '';
+        const ltVal = location_type ? [location_type] : [];
         await conn.query(
-            `UPDATE mobile_punches SET status = 'approved', approved_by = ?, approved_on = NOW()${location_type ? ', location_type = ?' : ''}
+            `UPDATE mobile_punches SET status = 'approved', approved_by = ?, approved_on = NOW()${lt}
              WHERE id = ? AND company_id = ?`,
-            location_type
-                ? [adminId, location_type, req.params.id, req.user.companyId]
-                : [adminId, req.params.id, req.user.companyId]
+            [adminId, ...ltVal, req.params.id, req.user.companyId]
         );
 
         await conn.commit();
+        const payrollUpdated = await require('../utils/punchRevert').refreshPayrollSafe(req.user.companyId, punch.employee_id, punch.date);
         if (punch.check_out) {
             await computeAndRecordOvertime(req.user.companyId, punch.employee_id, punch.date, punch.check_out).catch(err =>
                 console.error('Overtime computation failed:', err)
             );
         }
-        return res.json({ message: 'Approved and written to attendance' });
+        return res.json({ message: 'Approved and written to attendance', payroll_updated: payrollUpdated });
     } catch (err) {
         await conn.rollback();
         console.error('Mobile punch approval failed:', err);
@@ -224,14 +283,8 @@ router.patch('/:id/location-type', requireAdmin, asyncHandler(async (req, res) =
     return res.json({ message: 'Updated' });
 }));
 
-router.post('/:id/reject', requireAdmin, asyncHandler(async (req, res) => {
-    const adminId = await _currentAdminId(req);
-    await pool.query(
-        `UPDATE mobile_punches SET status = 'rejected', approved_by = ?, approved_on = NOW()
-         WHERE id = ? AND company_id = ? AND status = 'pending'`,
-        [adminId, req.params.id, req.user.companyId]
-    );
-    return res.json({ message: 'Rejected' });
-}));
+router.post('/:id/reject', requireAdmin, asyncHandler(require('../utils/punchRevert').makeRejectHandler({ pool, table: 'mobile_punches', kind: 'mobile', currentAdminId: _currentAdminId })));
+
+require('../utils/punchRevert').addRevertAndDelete(router, { pool, requireAdmin, asyncHandler, table: 'mobile_punches', kind: 'mobile' });
 
 module.exports = router;

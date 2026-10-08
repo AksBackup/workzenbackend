@@ -271,7 +271,7 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
         const existing = payrollByEmp.get(emp.id);
 
         // Frozen (already paid) -> return the snapshot exactly as paid.
-        if (existing && existing.is_paid && existing.paid_snapshot) {
+        if (!opts.ignoreFrozen && existing && existing.is_paid && existing.paid_snapshot) {
             try {
                 const snap = typeof existing.paid_snapshot === 'string' ? JSON.parse(existing.paid_snapshot) : existing.paid_snapshot;
                 return { ...snap, is_paid: true, paid_on: existing.paid_on, frozen: true };
@@ -808,6 +808,38 @@ router.post('/:employeeId/mark-paid', requireAdmin, asyncHandler(async (req, res
     return res.json({ message: 'Paid status updated' });
 }));
 
+/**
+ * Attendance for one employee-day changed (a manual / geo punch was approved or rejected).
+ * If that employee's payroll for the month is already PAID, recompute it from the new attendance and
+ * overwrite the frozen snapshot + paid amount (paid_on / paid_by stay as they were). Unpaid months are
+ * computed live, so nothing needs refreshing there. Loan deductions and conveyance already settled at
+ * payment time are not re-run.
+ * @returns {Promise<{refreshed: boolean, gross_total?: number}>}
+ */
+async function refreshPaidPayrollForDate(companyId, employeeId, dateStr) {
+    const d = new Date(String(dateStr).slice(0, 10) + 'T00:00:00');
+    if (isNaN(d)) return { refreshed: false };
+    const year = d.getFullYear(), month = d.getMonth() + 1;
+    let rec;
+    try {
+        [rec] = await pool.query(
+            'SELECT is_paid FROM payroll_records WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?',
+            [companyId, employeeId, year, month]);
+    } catch (err) { if (err.code === 'ER_BAD_FIELD_ERROR' || err.code === 'ER_NO_SUCH_TABLE') return { refreshed: false }; throw err; }
+    if (!rec.length || !rec[0].is_paid) return { refreshed: false };
+    const rows = await computeMonthlyPayroll(companyId, year, month, { employeeId, ignoreFrozen: true });
+    const own = rows[0];
+    if (!own) return { refreshed: false };
+    const snapshot = JSON.stringify({ ...own, is_paid: true, paid_on: null, frozen: true });
+    try {
+        await pool.query(
+            'UPDATE payroll_records SET paid_amount = ?, paid_snapshot = ? WHERE company_id = ? AND employee_id = ? AND year = ? AND month = ?',
+            [own.gross_total, snapshot, companyId, employeeId, year, month]);
+    } catch (err) { if (err.code === 'ER_BAD_FIELD_ERROR') return { refreshed: false }; throw err; }
+    return { refreshed: true, gross_total: own.gross_total };
+}
+
 module.exports = router;
+module.exports.refreshPaidPayrollForDate = refreshPaidPayrollForDate;
 module.exports.computeMonthlyPayroll = computeMonthlyPayroll;
 module.exports.revertLoanDeductions = revertLoanDeductions;
