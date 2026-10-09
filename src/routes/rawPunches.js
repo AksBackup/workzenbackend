@@ -102,35 +102,60 @@ router.get('/', asyncHandler(async (req, res) => {
     // selecting a column that doesn't exist (d.name), which threw a SQL
     // error and surfaced to the Flutter screen as a bare "HTTP 500:
     // Internal server error".
-    let sql = `SELECT rp.*, e.name AS employee_name, e.emp_code AS employee_code, d.device_name AS device_name
+    // day_first / day_last: the employee's earliest / latest punch of that day within this result
+    // set. They let the screen show a usable In/Out even when the device sends no usable in/out
+    // flag (many F22 units send nothing or 255): same rule the attendance table itself uses -
+    // first punch of the day = in, last = out. Needs MySQL 8 window functions; falls back
+    // automatically (without the two columns) on a server that doesn't have them.
+    const build = (withWindow) => {
+        const p = [req.user.companyId];
+        let q = `SELECT rp.*, e.name AS employee_name, e.emp_code AS employee_code, d.device_name AS device_name${withWindow
+            ? `,
+                      MIN(rp.punch_time) OVER (PARTITION BY rp.device_user_id, DATE(rp.punch_time)) AS day_first,
+                      MAX(rp.punch_time) OVER (PARTITION BY rp.device_user_id, DATE(rp.punch_time)) AS day_last`
+            : ''}
                FROM raw_punches rp
                LEFT JOIN employees e ON e.id = rp.employee_id
                LEFT JOIN devices d ON d.id = rp.device_id
                WHERE rp.company_id = ?`;
-    if (device_id) {
-        sql += ' AND rp.device_id = ?';
-        params.push(device_id);
-    }
-    if (employee_id) {
-        sql += ' AND rp.employee_id = ?';
-        params.push(employee_id);
-    }
-    if (from) {
-        sql += ' AND rp.punch_time >= ?';
-        params.push(from);
-    }
-    if (to) {
-        sql += ' AND rp.punch_time <= ?';
-        params.push(to);
-    }
-    sql += ' ORDER BY rp.punch_time DESC LIMIT 5000'; // hard cap - this is a raw log, not a paginated table yet
+        if (device_id) { q += ' AND rp.device_id = ?'; p.push(device_id); }
+        if (employee_id) { q += ' AND rp.employee_id = ?'; p.push(employee_id); }
+        if (from) { q += ' AND rp.punch_time >= ?'; p.push(from); }
+        if (to) { q += ' AND rp.punch_time <= ?'; p.push(to); }
+        q += ' ORDER BY rp.punch_time DESC LIMIT 5000'; // hard cap - this is a raw log, not a paginated table yet
+        return [q, p];
+    };
 
-    const [rows] = await pool.query(sql, params);
-    const withLabels = rows.map(r => ({
-        ...r,
-        verify_mode_label: VERIFY_MODE_LABELS[r.verify_mode] ?? 'unknown',
-        in_out_mode_label: IN_OUT_MODE_LABELS[r.in_out_mode] ?? 'unknown',
-    }));
+    let rows;
+    try {
+        const [q, p] = build(true);
+        [rows] = await pool.query(q, p);
+    } catch (err) {
+        if (err && (err.code === 'ER_PARSE_ERROR' || err.errno === 1064)) {
+            const [q, p] = build(false);
+            [rows] = await pool.query(q, p);
+        } else {
+            throw err;
+        }
+    }
+
+    const ms = (v) => (v == null ? NaN : (v instanceof Date ? v.getTime() : new Date(v).getTime()));
+    const withLabels = rows.map((r) => {
+        const { day_first, day_last, ...rest } = r;
+        const cur = ms(r.punch_time);
+        let derived = null;
+        if (cur === ms(day_first)) derived = 'in';
+        else if (cur === ms(day_last)) derived = 'out';
+        return {
+            ...rest,
+            // An unmapped code is shown as "code N" (not just "unknown") so what the device really
+            // sends is visible; null/255/unmapped in/out -> null label (the screen then uses
+            // in_out_derived instead of a useless "unknown").
+            verify_mode_label: VERIFY_MODE_LABELS[r.verify_mode] ?? (r.verify_mode == null ? 'unknown' : `code ${r.verify_mode}`),
+            in_out_mode_label: IN_OUT_MODE_LABELS[r.in_out_mode] ?? null,
+            in_out_derived: derived,
+        };
+    });
     return res.json(withLabels);
 }));
 
