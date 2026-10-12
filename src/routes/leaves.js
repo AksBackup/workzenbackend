@@ -90,7 +90,7 @@ async function buildPlanFromRequest(req) {
         employeeId = b.employee_id;
         if (!employeeId) throw Object.assign(new Error('employee_id required for admin-submitted leave'), { status: 400 });
     }
-    const [empRows] = await pool.query('SELECT id, shift_id, department FROM employees WHERE id = ? AND company_id = ?', [employeeId, req.user.companyId]);
+    const [empRows] = await pool.query('SELECT id, shift_id, work_mode, office_time_policy_id, department FROM employees WHERE id = ? AND company_id = ?', [employeeId, req.user.companyId]);
     if (empRows.length === 0) throw Object.assign(new Error('Employee not found'), { status: 404 });
     const [typeRows] = await pool.query('SELECT * FROM leave_types WHERE id = ? AND company_id = ?', [b.leave_type_id, req.user.companyId]);
     if (typeRows.length === 0) throw Object.assign(new Error('Leave type not found'), { status: 404 });

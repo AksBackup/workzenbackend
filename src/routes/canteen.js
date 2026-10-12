@@ -7,6 +7,17 @@ const router = express.Router();
 router.use(verifyFirebaseToken);
 
 /**
+ * Current time as a wall-clock 'YYYY-MM-DD HH:mm:ss' string in the company's local
+ * zone (PAYROLL_UTC_OFFSET_MIN, default 330 = IST), the same convention as device
+ * punches (see index.js). Stamping in SQL with NOW() / CURRENT_TIMESTAMP uses the DB
+ * server's own clock instead (often UTC), which is why these times could be hours off.
+ */
+function wallClockNow() {
+    const offset = Number(process.env.PAYROLL_UTC_OFFSET_MIN ?? 330);
+    return new Date(Date.now() + offset * 60000).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
  * Canteen Management (5.2) - same "stub" treatment as visitors.js: real
  * persisted CRUD, just no attendance/payroll linkage.
  */
@@ -38,10 +49,11 @@ router.post('/', asyncHandler(async (req, res) => {
     );
     if (empRows.length === 0) return res.status(404).json({ error: 'Employee not found' });
 
+    // punch_time is the actual moment of the punch, stamped in wall-clock time (not the DB clock).
     const [result] = await pool.query(
-        `INSERT INTO canteen_usage (company_id, employee_id, date, meal_type, subsidy, amount)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [req.user.companyId, employee_id, date, meal_type || 'lunch', subsidy || null, amount || null]
+        `INSERT INTO canteen_usage (company_id, employee_id, date, punch_time, meal_type, subsidy, amount)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, employee_id, date, wallClockNow(), meal_type || 'lunch', subsidy || null, amount || null]
     );
     return res.status(201).json({ id: result.insertId });
 }));

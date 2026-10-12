@@ -1,4 +1,5 @@
 const pool = require('../db');
+const { officePolicyShiftFor } = require('./officePolicyBasis');
 
 /**
  * Auto-computes overtime for one employee/day whenever a check-out is
@@ -37,16 +38,23 @@ const pool = require('../db');
 async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOutValue) {
     if (!checkOutValue) return;
 
+    // migration_051: a no-shift employee (work_mode 'office_policy') is measured
+    // against their Office Time Policy's end time; OT is allowed for them.
+    const officeShift = await officePolicyShiftFor(companyId, employeeId);
+
     // migration_015: per-shift OT eligibility gate. An employee with no
     // shift assigned (shift_id NULL) keeps today's original behaviour
     // (OT computed for everyone) - the join below only excludes someone
     // when their *specific* assigned shift has ot_allowed = FALSE.
-    const [shiftRows] = await pool.query(
-        `SELECT s.ot_allowed, s.end_time FROM employees e
-         JOIN shifts s ON s.id = e.shift_id
-         WHERE e.id = ? AND e.company_id = ?`,
-        [employeeId, companyId]
-    );
+    let shiftRows = [];
+    if (!officeShift) {
+        [shiftRows] = await pool.query(
+            `SELECT s.ot_allowed, s.end_time FROM employees e
+             JOIN shifts s ON s.id = e.shift_id
+             WHERE e.id = ? AND e.company_id = ?`,
+            [employeeId, companyId]
+        );
+    }
     if (shiftRows.length > 0 && !shiftRows[0].ot_allowed) {
         // This employee's shift explicitly disallows OT - clear any
         // stale pending record for consistency (e.g. their shift was
@@ -69,7 +77,8 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
     // check_out_time is only the fallback for employees with no shift - previously it
     // was used for everyone, so a night/early shift got OT (or none) against the wrong
     // clock time.
-    const check_out_time = shiftRows.length > 0 && shiftRows[0].end_time ? shiftRows[0].end_time : companyCheckOutTime;
+    const check_out_time = officeShift ? officeShift.end_time
+        : (shiftRows.length > 0 && shiftRows[0].end_time ? shiftRows[0].end_time : companyCheckOutTime);
 
     // migration_035 - this employee's own OT rate override, if any.
     // Defensive on the column set (ER_BAD_FIELD_ERROR) the same way the

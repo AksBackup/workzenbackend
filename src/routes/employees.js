@@ -3,7 +3,8 @@ const admin = require('firebase-admin');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin, isStaff } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
-const { loadWeeklyOffIndex, effectiveOffDaysBitmask, isAltSaturdayOff, loadShiftPolicyOffIndex } = require('../utils/attendanceRules');
+const { loadWeeklyOffIndex, effectiveOffDaysBitmask, isAltSaturdayOff, loadShiftPolicyOffIndex, loadShiftPolicyIndex } = require('../utils/attendanceRules');
+const { basisKeyFor, isOfficePolicyEmployee, officePolicyShiftFor } = require('../utils/officePolicyBasis');
 const { resolveEmployeeOffDays } = require('../utils/dayClassifier');
 const { loadRosterOffIndex } = require('../utils/dayShift');
 const { computeMonthlyPaidUsage } = require('../utils/leaveQuota');
@@ -11,6 +12,28 @@ const { loadLeaveIndex } = require('../utils/leaveIndex');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
+// POST /employees/:id/push-to-devices (routes/employeePush.js) - only that one path, so mounting it here is safe.
+router.use(require('./employeePush'));
+
+// ---- No-shift employees (migration_051) -----------------------------------
+// work_mode 'shift' (default, every existing employee): the employee works to a shift.
+// work_mode 'office_policy': no shift; the Office Time Policy named by office_time_policy_id applies.
+const WORK_MODES = ['shift', 'office_policy'];
+async function hasWorkModeColumns() {
+    return require('../utils/columnCache').hasColumn('employees', 'work_mode');
+}
+async function validateOfficePolicy(companyId, policyId) {
+    if (policyId === undefined || policyId === null || policyId === '') {
+        return 'Pick an Office Time Policy for an employee with no shift (or choose Shift and pick a shift instead).';
+    }
+    const [rows] = await pool.query('SELECT id, policy_name, check_in_time, check_out_time FROM office_time_policies WHERE id = ? AND company_id = ?', [policyId, companyId]);
+    if (!rows.length) return 'The selected Office Time Policy does not exist. Pick one from Settings > Office Time.';
+    // The policy is authoritative for a no-shift employee, so it must define the working hours.
+    if (!rows[0].check_in_time || !rows[0].check_out_time) {
+        return `The policy "${rows[0].policy_name}" has no Check-In / Check-Out time. Set both times on it in Settings > Office Time first.`;
+    }
+    return null;
+}
 
 
 // ---- Multi-shift (migration_044) ------------------------------------------
@@ -184,6 +207,15 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         if (zoneErr) return res.status(400).json({ error: zoneErr });
     }
 
+    // migration_051: shift or no-shift (Office Time Policy).
+    const workMode = req.body.work_mode == null ? 'shift' : String(req.body.work_mode);
+    if (!WORK_MODES.includes(workMode)) return res.status(400).json({ error: "work_mode must be 'shift' or 'office_policy'" });
+    if (workMode === 'office_policy') {
+        if (!(await hasWorkModeColumns())) return res.status(400).json({ error: 'Run migration_051_office_policy_employees.sql first (employees.work_mode is missing).' });
+        const policyErr = await validateOfficePolicy(req.user.companyId, req.body.office_time_policy_id);
+        if (policyErr) return res.status(400).json({ error: policyErr });
+    }
+
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
@@ -230,9 +262,19 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         if (req.body.geofence_enabled && req.body.geofence_zone_id && (await require('../utils/columnCache').hasColumn('employees', 'geofence_zone_id'))) {
             await conn.query('UPDATE employees SET geofence_zone_id = ? WHERE id = ?', [req.body.geofence_zone_id, result.insertId]);
         }
-        const newShiftIds = normaliseShiftIds(req.body);
-        if (newShiftIds && newShiftIds.length) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, newShiftIds);
-        else if (shift_id) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, [Number(shift_id)]);
+        if (workMode === 'office_policy') {
+            // No shift at all: clears shift_id and any employee_shifts rows.
+            await conn.query('UPDATE employees SET work_mode = ?, office_time_policy_id = ? WHERE id = ?',
+                ['office_policy', Number(req.body.office_time_policy_id), result.insertId]);
+            await saveEmployeeShifts(conn, req.user.companyId, result.insertId, []);
+        } else {
+            if (await hasWorkModeColumns()) {
+                await conn.query('UPDATE employees SET work_mode = ?, office_time_policy_id = NULL WHERE id = ?', ['shift', result.insertId]);
+            }
+            const newShiftIds = normaliseShiftIds(req.body);
+            if (newShiftIds && newShiftIds.length) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, newShiftIds);
+            else if (shift_id) await saveEmployeeShifts(conn, req.user.companyId, result.insertId, [Number(shift_id)]);
+        }
 
         await conn.commit();
         return res.status(201).json({
@@ -459,14 +501,44 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         empCodeChanging = true;
     }
 
+    // migration_051: shift vs no-shift. work_mode decides which of the two the employee follows.
+    // Sending a work_mode is the explicit choice; an older client that only sends shift ids is
+    // treated as 'shift' so it keeps working exactly as before.
+    let forceNoShifts = false;
+    const bodyShiftIds = normaliseShiftIds(req.body);
+    const bodyGivesShift = (bodyShiftIds && bodyShiftIds.length > 0) || (req.body.shift_id != null && req.body.shift_id !== '');
+    let workModeChosen = req.body.work_mode == null ? undefined : String(req.body.work_mode);
+    if (workModeChosen === undefined && bodyGivesShift) workModeChosen = 'shift';
+    if (workModeChosen !== undefined && (await hasWorkModeColumns())) {
+        if (!WORK_MODES.includes(workModeChosen)) return res.status(400).json({ error: "work_mode must be 'shift' or 'office_policy'" });
+        if (workModeChosen === 'office_policy') {
+            const policyErr = await validateOfficePolicy(req.user.companyId, req.body.office_time_policy_id);
+            if (policyErr) return res.status(400).json({ error: policyErr });
+            updates.push('work_mode = ?', 'office_time_policy_id = ?');
+            values.push('office_policy', Number(req.body.office_time_policy_id));
+            forceNoShifts = true;
+        } else if (bodyGivesShift) {
+            updates.push('work_mode = ?', 'office_time_policy_id = ?');
+            values.push('shift', null);
+        } else {
+            // A shift-mode employee saved without a shift (e.g. Mark Inactive / rejoin, which send the whole
+            // record) is fine as it is. Only switching a no-shift employee over to 'shift' needs a shift picked.
+            const [[current]] = await pool.query('SELECT work_mode FROM employees WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
+            if (current && current.work_mode === 'office_policy') {
+                return res.status(400).json({ error: 'Pick a shift for this employee, or keep No shift and an Office Time Policy.' });
+            }
+        }
+    }
+
     const putShiftIds = normaliseShiftIds(req.body);
-    if (putShiftIds) {
-        // shift_ids owns shift_id: drop a plain shift_id from this update, it is re-derived below.
+    if (putShiftIds || forceNoShifts) {
+        // shift_ids owns shift_id: drop a plain shift_id from this update, it is re-derived below
+        // (a no-shift employee has shift_id NULL, set by saveEmployeeShifts([])).
         const i = updates.indexOf('shift_id = ?');
         if (i !== -1) { updates.splice(i, 1); values.splice(i, 1); }
     }
 
-    if (updates.length === 0 && putShiftIds) {
+    if (updates.length === 0 && putShiftIds && !forceNoShifts) {
         await saveEmployeeShifts(pool, req.user.companyId, req.params.id, putShiftIds);
         return res.json({ message: 'Updated' });
     }
@@ -493,7 +565,8 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         `UPDATE employees SET ${updates.join(', ')} WHERE id = ? AND company_id = ?`,
         values
     );
-    if (putShiftIds) await saveEmployeeShifts(pool, req.user.companyId, req.params.id, putShiftIds);
+    if (forceNoShifts) await saveEmployeeShifts(pool, req.user.companyId, req.params.id, []);
+    else if (putShiftIds) await saveEmployeeShifts(pool, req.user.companyId, req.params.id, putShiftIds);
     return res.json(salaryWarning ? { message: 'Updated', warnings: [salaryWarning] } : { message: 'Updated' });
 }));
 
@@ -690,8 +763,10 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     // migration_027 - shift-level weekly-off (weekly_off_bitmask AND
     // alt_saturdays) now actually resolved via the employee's shift_id,
     // fixing the gap the previous comment here flagged.
+    // migration_051: a no-shift employee's weekly off comes from their Office Time Policy (basisKeyFor 'p:<id>').
+    const basisKey = basisKeyFor(employee);
     let empShift = null;
-    if (employee.shift_id != null) {
+    if (!isOfficePolicyEmployee(employee) && employee.shift_id != null) {
         const [shiftRows] = await pool.query(
             'SELECT weekly_off_bitmask, alt_saturdays FROM shifts WHERE id = ? AND company_id = ?',
             [employee.shift_id, req.user.companyId]
@@ -703,7 +778,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     // Roster: a rostered OFF day is a week off / holiday too.
     const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(req.user.companyId);
     const { offDaysBitmask: offBitmask, altSaturdays, isWeeklyOff2 } =
-        resolveEmployeeOffDays(employee.shift_id, empShift, employee.department, weeklyOffIndex, shiftPolicyOffIndex);
+        resolveEmployeeOffDays(basisKey, empShift, employee.department, weeklyOffIndex, shiftPolicyOffIndex);
     const rosterOffIdx = await loadRosterOffIndex(req.user.companyId, monthStart, monthEnd);
     // Leave v2: whole-day leave only (half / quarter / hours leave days are normal working days
     // here); holidays / weekly offs inside a leave only show as leave if the leave type counts them.
@@ -741,7 +816,18 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     // Grace window for an on-time check-in (migration_010) - a check-in
     // after this is still recorded/counted as present, just flagged
     // 'late' below rather than silently unrecorded.
-    const checkInWindowEnd = policyRows.length > 0 ? policyRows[0].check_in_window_end : '09:45:00';
+    let checkInWindowEnd = policyRows.length > 0 ? policyRows[0].check_in_window_end : '09:45:00';
+    // migration_051: a no-shift employee is late after their Office Time Policy in-time + its late grace.
+    if (isOfficePolicyEmployee(employee)) {
+        const policyShift = await officePolicyShiftFor(req.user.companyId, employeeId);
+        if (policyShift && policyShift.start_time) {
+            const grace = (await loadShiftPolicyIndex(req.user.companyId)).graceFor(basisKey);
+            const [hh, mm] = String(policyShift.start_time).split(':').map(Number);
+            const total = hh * 60 + mm + ((grace && grace.lateGraceMinutes) || 0);
+            const pad = (n) => String(n).padStart(2, '0');
+            checkInWindowEnd = `${pad(Math.floor(total / 60) % 24)}:${pad(total % 60)}:00`; // same rule as computeLateEarly: late once strictly after in-time + grace
+        }
+    }
     const [overtimeRows] = await pool.query(
         `SELECT id, date, checkout_time, overtime_hours, rate_per_hour, amount, status
          FROM overtime_records WHERE employee_id = ? AND date BETWEEN ? AND ? ORDER BY date ASC`,

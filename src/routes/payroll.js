@@ -7,6 +7,7 @@ const {
     loadPunchEventsIndex, loadShiftPolicyIndex, loadShiftPolicyOffIndex,
     derivePunchSpan, applyPrefixSuffixAbsent,
 } = require('../utils/attendanceRules');
+const { basisKeyFor, isOfficePolicyEmployee } = require('../utils/officePolicyBasis');
 const { windowForShift } = require('../utils/punchPairing');
 const { resolvePaymentWindow } = require('../utils/paymentWindow');
 const { classifyDay, resolveEmployeeOffDays, computeLateEarly } = require('../utils/dayClassifier');
@@ -119,7 +120,8 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
         [employees] = await pool.query(
             `SELECT e.id, e.name, e.emp_code, e.salary, e.doj, e.department, e.shift_id, d.default_salary,
                     e.pf_percent, e.epf_percent, e.esi_percent, e.pf_limit,
-                    e.tds_amount, e.tds_percent, e.statutory_override_active
+                    e.tds_amount, e.tds_percent, e.statutory_override_active,
+                    e.work_mode, e.office_time_policy_id
              FROM employees e LEFT JOIN designations d ON d.id = e.designation_id
              WHERE e.company_id = ? AND e.status = 'active'${empFilterSql}`, empParams);
     } catch (err) {
@@ -280,14 +282,19 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
 
         const baseSalary = Number(emp.salary ?? emp.default_salary ?? 0);
         const perDayRate = baseSalary / daysInMonth;
-        const empShift = shiftOffIndex.byId.get(emp.shift_id) ?? null;
+        // migration_051: the basis every shift-keyed rule is looked up by - the employee's shift id,
+        // or 'p:<policyId>' for a no-shift employee (see utils/attendanceRules.js basisKeyFor).
+        const basisKey = basisKeyFor(emp);
+        const empShift = shiftOffIndex.byId.get(basisKey) ?? null;
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
         const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
-            resolveEmployeeOffDays(emp.shift_id, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
-        const deductBreaks = emp.shift_id != null ? shiftPolicyIndex.deductBreaksFor(emp.shift_id) : false;
-        const shiftForDay = (emp.shift_id != null ? shiftsById.get(emp.shift_id) : null) || defaultShift;
-        const grace = emp.shift_id != null && shiftPolicyIndex.has(emp.shift_id) ? shiftPolicyIndex.graceFor(emp.shift_id) : null;
-        const rules = shiftPolicyIndex.rulesFor(emp.shift_id);
+            resolveEmployeeOffDays(basisKey, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+        const deductBreaks = basisKey != null ? shiftPolicyIndex.deductBreaksFor(basisKey) : false;
+        const shiftForDay = isOfficePolicyEmployee(emp)
+            ? null // no-shift employee: the day's shift is always their policy's virtual shift (dayShiftResolver)
+            : ((emp.shift_id != null ? shiftsById.get(emp.shift_id) : null) || defaultShift);
+        const grace = basisKey != null && shiftPolicyIndex.has(basisKey) ? shiftPolicyIndex.graceFor(basisKey) : null;
+        const rules = shiftPolicyIndex.rulesFor(basisKey);
         const dojStr = emp.doj ? dateKey(emp.doj) : null;
 
         // 1) classify every counted day with the shared classifier
@@ -300,7 +307,7 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
             // Roster / multi-shift aware shift for THIS day (falls back to the primary shift).
             const dayShift = dayShiftResolver.resolve(emp, dateStr, attendance && attendance.check_in) || shiftForDay;
-            const dayShiftId = dayShift && dayShift.id != null ? dayShift.id : emp.shift_id;
+            const dayShiftId = dayShift && dayShift.id != null ? dayShift.id : basisKey;
             const dayDeductBreaks = dayShiftId != null ? shiftPolicyIndex.deductBreaksFor(dayShiftId) : deductBreaks;
             const dayGrace = dayShiftId != null && shiftPolicyIndex.has(dayShiftId) ? shiftPolicyIndex.graceFor(dayShiftId) : grace;
             const dayRules = dayShiftId != null ? shiftPolicyIndex.rulesFor(dayShiftId) : rules;
@@ -329,7 +336,7 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
         // 2) Office-policy prefix/suffix rule (weekly off / holiday next to an absence becomes absent)
         applyPrefixSuffixAbsent(
             dayList.filter(d => d.status !== 'not_joined'),
-            emp.shift_id != null ? shiftPolicyIndex.prefixSuffixFor(emp.shift_id) : null);
+            basisKey != null ? shiftPolicyIndex.prefixSuffixFor(basisKey) : null);
 
         // 3) day-units -> earned
         const counts = { present: 0, half_day: 0, absent: 0, paid_leave: 0, unpaid_leave: 0, holiday: 0, weekly_off: 0 };

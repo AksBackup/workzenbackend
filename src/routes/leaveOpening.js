@@ -2,9 +2,22 @@ const express = require('express');
 const pool = require('../db');
 const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFirebaseToken');
 const asyncHandler = require('../utils/asyncHandler');
+const { parseBalances, resolveEmployees, runBulkBalance } = require('../utils/leaveBalanceBulk');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
+
+/**
+ * Leave Balance Entry (bulk Addition / Deletion, desktop screen).
+ * Endpoints: GET /leave-balances/bulk/employees and POST /leave-balances/bulk.
+ * Both write through the same leave_balances.allocated + leave_adjustments
+ * storage as Earn Leave, so Apply Leave, payroll and reports all agree.
+ * Rules and filter semantics: utils/leaveBalanceBulk.js.
+ */
+function sendBulkError(res, err) {
+    if (err.status === 400) return res.status(400).json({ error: err.message });
+    throw err;
+}
 
 /**
  * Leave Opening Entry (4.2, SCREENS.md). `leave_balances` has existed in
@@ -113,6 +126,72 @@ router.delete('/', requireAdmin, asyncHandler(async (req, res) => {
     // Only employees of THIS company are touched (leave_balances has no company_id of its own).
     const [result] = await pool.query('DELETE FROM leave_balances WHERE employee_id IN (?) AND year = ?', [empRows.map(r => r.id), year]);
     return res.json({ message: 'Cleared', employees: empRows.length, rows_deleted: result.affectedRows });
+}));
+
+// GET /leave-balances/bulk/employees?filter=<JSON>
+// The employees a Leave Balance Entry filter matches (active employees of this
+// company only). filter = { companyIds, branchIds, departmentIds, designationIds,
+// employeeIds }: a key left out (or null / "all") means "All"; an array means
+// "Few" (only those ids). Passing no filter returns every active employee.
+router.get('/bulk/employees', requireAdmin, asyncHandler(async (req, res) => {
+    let filter = {};
+    if (req.query.filter) {
+        try {
+            filter = JSON.parse(String(req.query.filter));
+        } catch (_) {
+            return res.status(400).json({ error: 'filter must be valid JSON' });
+        }
+    }
+    try {
+        const rows = await resolveEmployees(pool, req.user.companyId, filter);
+        return res.json(rows.map(r => ({
+            id: r.id,
+            emp_code: r.emp_code,
+            name: r.name,
+            branch_id: r.branch_id,
+            department_id: r.department_id,
+            designation_id: r.designation_id,
+        })));
+    } catch (err) {
+        return sendBulkError(res, err);
+    }
+}));
+
+// POST /leave-balances/bulk
+// body: {
+//   year: 2026,
+//   mode: 'add' | 'delete',                      // Addition / Deletion
+//   period?: 'monthly' (default) | 'yearly',     // Balance type: per-month quota or annual pool
+//   balances: { "<leave_type_id>": days, ... },  // zero entries are ignored
+//   filter: { companyIds?, branchIds?, departmentIds?, designationIds?, employeeIds? },
+//   reason?: "text for the audit trail",
+//   dry_run?: true                               // count only, write nothing
+// }
+// 'add' credits every matched employee (allocated += days, audit 'earn').
+// 'delete' removes up to `days` from each (allocated = max(0, allocated - days),
+// audit 'adjust' with the amount actually removed). One transaction for the lot.
+// Returns { mode, year, dry_run, employees_matched, affected_employees,
+//           affected_balances, total_days, by_leave_type[] }.
+router.post('/bulk', requireAdmin, asyncHandler(async (req, res) => {
+    const { year, mode, period, balances, filter, reason, dry_run } = req.body || {};
+    try {
+        const parsed = parseBalances(balances);
+        const [adminRows] = await pool.query('SELECT id FROM admins WHERE firebase_uid = ?', [req.user.uid]);
+        const result = await runBulkBalance(pool, {
+            companyId: req.user.companyId,
+            adminId: adminRows[0] ? adminRows[0].id : null,
+            year,
+            mode,
+            period: period === undefined ? 'monthly' : period,
+            balances: parsed,
+            filter,
+            reason,
+            dryRun: dry_run === true,
+        });
+        return res.json(result);
+    } catch (err) {
+        return sendBulkError(res, err);
+    }
 }));
 
 module.exports = router;

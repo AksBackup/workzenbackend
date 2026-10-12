@@ -152,8 +152,10 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
         }
         const adj = rows[0];
 
+        // Yearly-pool entries (Leave Balance Entry, "[Yearly]" reason marker) live in leave_yearly_pools.
+        const table = String(adj.reason || '').startsWith('[Yearly]') ? 'leave_yearly_pools' : 'leave_balances';
         await conn.query(
-            'UPDATE leave_balances SET allocated = allocated - ? WHERE employee_id = ? AND leave_type_id = ? AND year = ?',
+            `UPDATE ${table} SET allocated = GREATEST(allocated - ?, 0) WHERE employee_id = ? AND leave_type_id = ? AND year = ?`,
             [adj.amount, adj.employee_id, adj.leave_type_id, adj.year]
         );
         await conn.query('DELETE FROM leave_adjustments WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);

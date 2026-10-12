@@ -227,6 +227,28 @@ module.exports = {
     isNthWeekdayOfMonthOff,
 };
 
+/** Rows of the policy-rule query, one per policy (plus one per assigned shift). Missing migration_051 columns -> the caller just sees no policies. */
+async function loadPolicyRuleRows(companyId, columns) {
+    const [rows] = await pool.query(
+        `SELECT p.id AS policy_id, ops.shift_id, ${columns}
+         FROM office_time_policies p
+         LEFT JOIN office_time_policy_shifts ops ON ops.policy_id = p.id AND ops.company_id = p.company_id
+         WHERE p.company_id = ?`,
+        [companyId]
+    );
+    return rows;
+}
+
+/** Map keyed by shift id AND by 'p:<policyId>' so both kinds of basis resolve through the same index. */
+function indexByBasisKey(rows) {
+    const byKey = new Map();
+    for (const r of rows) {
+        if (r.shift_id != null) byKey.set(r.shift_id, r);
+        if (r.policy_id != null && !byKey.has(`p:${r.policy_id}`)) byKey.set(`p:${r.policy_id}`, r);
+    }
+    return byKey;
+}
+
 /**
  * Task 3: derives {firstIn, lastOut, workMinutes} from one day's raw
  * punch_events rows (migration_033). Implements the client's exact
@@ -306,20 +328,14 @@ async function loadPunchEventsIndex(companyId, fromDateStr, toDateStr) {
  * header comment on why they weren't dropped) for those shifts.
  */
 async function loadShiftPolicyIndex(companyId) {
-    const [rows] = await pool.query(
-        `SELECT ops.shift_id, p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences,
+    const rows = await loadPolicyRuleRows(companyId, `p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences,
                 p.grace_late_coming_minutes, p.grace_early_going_minutes,
                 p.deduct_break_hours_from_work_duration,
                 p.mark_absent_prefix_day, p.mark_absent_suffix_day, p.mark_absent_both_prefix_suffix_day,
                 p.absent_if_duration_less_than_minutes, p.half_day_if_duration_less_than_minutes,
                 p.half_day_if_late_by_enabled, p.half_day_if_late_by_minutes,
-                p.half_day_if_early_going_by_enabled, p.half_day_if_early_going_by_minutes
-         FROM office_time_policy_shifts ops
-         JOIN office_time_policies p ON p.id = ops.policy_id
-         WHERE ops.company_id = ?`,
-        [companyId]
-    );
-    const byShiftId = new Map(rows.map((r) => [r.shift_id, r]));
+                p.half_day_if_early_going_by_enabled, p.half_day_if_early_going_by_minutes`);
+    const byShiftId = indexByBasisKey(rows);
     return {
         has(shiftId) {
             return byShiftId.has(shiftId);
@@ -364,14 +380,8 @@ async function loadShiftPolicyIndex(companyId) {
  * all need the grace/deduct-breaks fields, only the weekly-off ones.
  */
 async function loadShiftPolicyOffIndex(companyId) {
-    const [rows] = await pool.query(
-        `SELECT ops.shift_id, p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences
-         FROM office_time_policy_shifts ops
-         JOIN office_time_policies p ON p.id = ops.policy_id
-         WHERE ops.company_id = ?`,
-        [companyId]
-    );
-    const byShiftId = new Map(rows.map((r) => [r.shift_id, r]));
+    const rows = await loadPolicyRuleRows(companyId, 'p.weekly_off_1_day, p.weekly_off_2_day, p.weekly_off_2_occurrences');
+    const byShiftId = indexByBasisKey(rows);
     return {
         has(shiftId) {
             return byShiftId.has(shiftId);

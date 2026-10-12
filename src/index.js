@@ -32,6 +32,10 @@ const licenseRoutes = require('./routes/license');
 const panelAdminRoutes = require('./routes/panelAdmins');
 // migration_038: Cloud Server (ADMS/iClock) push receiver - public by design.
 const { verifyFirebaseToken, requireFeature } = require('./middleware/verifyFirebaseToken');
+// Workstream A: platform admin pages (/admin, /254) + payroll/geofence lock (migration_041).
+const { requireUnlocked } = require('./middleware/screenLock');
+const lockStatusRoutes = require('./routes/lockStatus');
+const { employeeDevicesRouter, deviceUserCopyRouter } = require('./routes/employeeDevices');
 const admsRoutes = require('./routes/adms');
 const authRoutes = require('./routes/auth');
 const communicationsEmailRoutes = require('./routes/communicationsEmail');
@@ -123,6 +127,11 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
+// Platform admin web pages (static HTML under public/admin and public/254).
+// Explicit routes so /admin and /254 (no trailing slash) serve the page directly.
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'admin', 'index.html')));
+app.get('/254', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', '254', 'index.html')));
+
 // Friendly errors + codes for EVERY failed response (see utils/errorCatalog.js, ERROR_CODES.md):
 // any JSON body with an `error` string and HTTP >= 400 gets a `code` and the code appended to the
 // text the user sees: "<message> (Code: WZ-DEV-404)". Routes need no changes.
@@ -165,9 +174,11 @@ app.use('/designations', designationRoutes);
 app.use('/office-time-policy', officeTimePolicyRoutes);
 app.use('/overtime', overtimeRoutes);
 app.use('/weekly-off', weeklyOffRoutes);
-app.use('/payroll', payrollRoutes);
-app.use('/statutory-settings', statutorySettingsRoutes);
-app.use('/payroll-payment-window', paymentWindowRoutes);
+// Payroll-family routes are locked by default (migration_041): verifyFirebaseToken, then
+// requireUnlocked returns 403 unless the company is unlocked or the caller is a platform admin.
+app.use('/payroll', verifyFirebaseToken, requireUnlocked, payrollRoutes);
+app.use('/statutory-settings', verifyFirebaseToken, requireUnlocked, statutorySettingsRoutes);
+app.use('/payroll-payment-window', verifyFirebaseToken, requireUnlocked, paymentWindowRoutes);
 
 // Agent A scope.
 app.use('/devices', deviceRoutes);
@@ -190,13 +201,13 @@ app.use('/visitors', visitorRoutes);
 app.use('/canteen', canteenRoutes);
 
 // Agent C scope (Phase 5) - appended, existing app.use(...) lines above untouched.
-app.use('/loans', loanRoutes);
-app.use('/ad-hoc-payments', adHocPaymentRoutes);
-app.use('/salary-structures', salaryStructureRoutes);
+app.use('/loans', verifyFirebaseToken, requireUnlocked, loanRoutes);
+app.use('/ad-hoc-payments', verifyFirebaseToken, requireUnlocked, adHocPaymentRoutes);
+app.use('/salary-structures', verifyFirebaseToken, requireUnlocked, salaryStructureRoutes);
 app.use('/app-users', appUserRoutes);
 app.use('/import', importDataRoutes);
-app.use('/bonuses', bonusRoutes);
-app.use('/conveyance', conveyanceRoutes);
+app.use('/bonuses', verifyFirebaseToken, requireUnlocked, bonusRoutes);
+app.use('/conveyance', verifyFirebaseToken, requireUnlocked, conveyanceRoutes);
 app.use('/reports', reportRoutes);
 app.use('/error-logs', errorLogRoutes);
 app.use('/backup', backupRoutes);
@@ -207,9 +218,15 @@ app.use('/calendar-events', calendarEventRoutes);
 app.use('/dashboard-notes', dashboardNotesRoutes);
 app.use('/holiday-groups', holidayGroupRoutes);
 app.use('/employee-categories', employeeCategoryRoutes);
-app.use('/geofence-zones', verifyFirebaseToken, requireFeature('geofence'), geofenceZoneRoutes);
-app.use('/field-tracking', verifyFirebaseToken, requireFeature('geofence'), fieldTrackingRoutes);
+app.use('/geofence-zones', verifyFirebaseToken, requireFeature('geofence'), requireUnlocked, geofenceZoneRoutes);
+app.use('/field-tracking', verifyFirebaseToken, requireFeature('geofence'), requireUnlocked, fieldTrackingRoutes);
 app.use('/raw-punches', rawPunchRoutes);
+
+// Workstream A: lock state (GET any company user / POST platform admins) and platform-admin info.
+app.use('/employee-devices', employeeDevicesRouter);
+app.use('/device-users', deviceUserCopyRouter);
+app.use('/lock-status', lockStatusRoutes.lockStatusRouter);
+app.use('/platform', lockStatusRoutes.platformRouter);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 

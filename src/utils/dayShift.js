@@ -1,11 +1,14 @@
 const pool = require('../db');
+const { loadOfficePolicyShifts, isOfficePolicyEmployee } = require('./officePolicyBasis');
 
 /**
  * Per-day shift resolution shared by payroll (and mirrored in reports.js):
  *   1) a Shift Roster row (shift_assignments) covering that date wins,
- *   2) else, if the employee works in several shifts (employee_shifts, migration_044),
+ *   2) else, a no-shift employee (work_mode 'office_policy', migration_051) gets
+ *      the virtual shift of their Office Time Policy (in/out times + policy key 'p:<id>'),
+ *   3) else, if the employee works in several shifts (employee_shifts, migration_044),
  *      the one whose start time is closest to their FIRST punch of the day,
- *   3) else the employee's primary shift (employees.shift_id).
+ *   4) else the employee's primary shift (employees.shift_id).
  * Returns null when nothing applies (caller falls back to its default shift).
  */
 const toMin = (t) => {
@@ -43,6 +46,7 @@ async function loadDayShiftResolver(companyId, fromStr, toStr, shiftsById) {
          ORDER BY effective_from DESC, id DESC`, [companyId, toStr, fromStr]);
     const rosterByEmp = new Map();
     for (const r of rosterRows) { if (!rosterByEmp.has(r.employee_id)) rosterByEmp.set(r.employee_id, []); rosterByEmp.get(r.employee_id).push(r); }
+    const officeShifts = await loadOfficePolicyShifts(companyId);
 
     return {
         /** @returns shift row or null.  firstPunch: Date | 'YYYY-MM-DD HH:mm:ss' | null */
@@ -52,6 +56,10 @@ async function loadDayShiftResolver(companyId, fromStr, toStr, shiftsById) {
                     const s = shiftsById.get(r.shift_id);
                     if (s) return s;
                 }
+            }
+            if (isOfficePolicyEmployee(emp)) {
+                const virtual = officeShifts.forPolicyId(emp.office_time_policy_id);
+                if (virtual) return virtual;
             }
             const ids = multi.get(emp.id);
             if (ids && ids.length > 1) {

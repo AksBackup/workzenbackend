@@ -91,7 +91,10 @@ router.put('/', requireAdmin, asyncHandler(async (req, res) => {
 // ---------------------------------------------------------------------
 
 const POLICY_FIELDS = [
-    'policy_name', 'short_name', 'grace_late_coming_minutes', 'grace_early_going_minutes',
+    'policy_name', 'short_name',
+    // migration_051: in/out times used by employees on this policy who have NO shift (NULL = company Office Time times).
+    'check_in_time', 'check_out_time',
+    'grace_late_coming_minutes', 'grace_early_going_minutes',
     'weekly_off_1_day', 'weekly_off_2_day', 'weekly_off_2_occurrences',
     'absent_if_duration_less_than_minutes', 'half_day_if_duration_less_than_minutes',
     'mark_late_absent_enabled', 'mark_late_absent_status', 'mark_late_absent_after_minutes',
@@ -106,6 +109,20 @@ const POLICY_FIELDS = [
     'mark_absent_prefix_day', 'mark_absent_suffix_day', 'mark_absent_both_prefix_suffix_day',
     'punch_required_mode', 'present_weekly_off_count', 'check_duplicate_minute',
 ];
+
+const TIME_RE = /^([01]?\d|2[0-3]):([0-5]\d)(:[0-5]\d)?$/;
+/** Normalises check_in_time / check_out_time in body to HH:MM:SS (blank -> null). Returns an error string or null. */
+function normalizePolicyTimes(body) {
+    for (const f of ['check_in_time', 'check_out_time']) {
+        const v = body[f];
+        if (v === undefined || v === null || String(v).trim() === '') { body[f] = null; continue; }
+        const m = TIME_RE.exec(String(v).trim());
+        if (!m) return 'Check-In and Check-Out times must be valid 24-hour times like 09:30.';
+        body[f] = `${m[1].padStart(2, '0')}:${m[2]}:${(m[3] || ':00').slice(1)}`;
+    }
+    if ((body.check_in_time == null) !== (body.check_out_time == null)) return 'Enter both Check-In Time and Check-Out Time, or leave both blank.';
+    return null;
+}
 
 /** Pulls only the known policy fields out of req.body, in a stable order matching POLICY_FIELDS. */
 function pickPolicyFields(body) {
@@ -135,6 +152,8 @@ router.get('/policies', asyncHandler(async (req, res) => {
 router.post('/policies', requireAdmin, asyncHandler(async (req, res) => {
     const { policy_name } = req.body;
     if (!policy_name || !policy_name.trim()) return res.status(400).json({ error: 'policy_name is required' });
+    const timeErr = normalizePolicyTimes(req.body);
+    if (timeErr) return res.status(400).json({ error: timeErr });
 
     const [result] = await pool.query(
         `INSERT INTO office_time_policies (company_id, ${POLICY_FIELDS.join(', ')})
@@ -148,6 +167,19 @@ router.post('/policies', requireAdmin, asyncHandler(async (req, res) => {
 router.put('/policies/:id', requireAdmin, asyncHandler(async (req, res) => {
     const { policy_name } = req.body;
     if (!policy_name || !policy_name.trim()) return res.status(400).json({ error: 'policy_name is required' });
+    const timeErr = normalizePolicyTimes(req.body);
+    if (timeErr) return res.status(400).json({ error: timeErr });
+    if (req.body.check_in_time == null) {
+        // Blank times are only tolerated for legacy policies nobody without a shift follows.
+        try {
+            const [[used]] = await pool.query(
+                'SELECT COUNT(*) AS n FROM employees WHERE office_time_policy_id = ? AND company_id = ?',
+                [req.params.id, req.user.companyId]);
+            if (used.n > 0) {
+                return res.status(400).json({ error: `${used.n} employee(s) with no shift follow this policy, so Check-In and Check-Out times are required.` });
+            }
+        } catch (err) { if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; }
+    }
 
     const [result] = await pool.query(
         `UPDATE office_time_policies SET ${POLICY_FIELDS.map((f) => `${f} = ?`).join(', ')}
@@ -160,6 +192,20 @@ router.put('/policies/:id', requireAdmin, asyncHandler(async (req, res) => {
 
 // DELETE /office-time-policy/policies/:id
 router.delete('/policies/:id', requireAdmin, asyncHandler(async (req, res) => {
+    // migration_051: employees with NO shift are attached to a policy directly (employees.office_time_policy_id).
+    // Deleting it would silently drop their rules, so refuse and say who is affected.
+    try {
+        const [[used]] = await pool.query(
+            'SELECT COUNT(*) AS n FROM employees WHERE office_time_policy_id = ? AND company_id = ?',
+            [req.params.id, req.user.companyId]);
+        if (used.n > 0) {
+            return res.status(409).json({
+                error: `${used.n} employee(s) with no shift use this policy. Move them to a shift or another policy first.`,
+            });
+        }
+    } catch (err) {
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; // migration_051 not run yet
+    }
     // office_time_policy_shifts rows for this policy cascade-delete
     // (ON DELETE CASCADE, migration_034) - any shift that was assigned
     // to this policy simply goes back to having no policy assigned,

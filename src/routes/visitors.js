@@ -7,6 +7,17 @@ const router = express.Router();
 router.use(verifyFirebaseToken);
 
 /**
+ * Current time as a wall-clock 'YYYY-MM-DD HH:mm:ss' string in the company's local
+ * zone (PAYROLL_UTC_OFFSET_MIN, default 330 = IST), the same convention as device
+ * punches (see index.js). Stamping in SQL with NOW() / CURRENT_TIMESTAMP uses the DB
+ * server's own clock instead (often UTC), which is why these times could be hours off.
+ */
+function wallClockNow() {
+    const offset = Number(process.env.PAYROLL_UTC_OFFSET_MIN ?? 330);
+    return new Date(Date.now() + offset * 60000).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
  * Visitor Management (5.1) - explicitly a stub per FROZEN_CONTRACT_V2.md:
  * "no attendance/payroll linkage. Front-desk sign-in/out log." This is a
  * real, persisted CRUD (not fake local-only state) - "stub" here refers
@@ -35,9 +46,9 @@ router.post('/', asyncHandler(async (req, res) => {
     if (!name) return res.status(400).json({ error: 'name required' });
 
     const [result] = await pool.query(
-        `INSERT INTO visitors (company_id, name, phone, purpose, host_employee_id)
-         VALUES (?, ?, ?, ?, ?)`,
-        [req.user.companyId, name, phone || null, purpose || null, host_employee_id || null]
+        `INSERT INTO visitors (company_id, name, phone, purpose, host_employee_id, sign_in_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [req.user.companyId, name, phone || null, purpose || null, host_employee_id || null, wallClockNow()]
     );
     return res.status(201).json({ id: result.insertId });
 }));
@@ -46,8 +57,8 @@ router.post('/', asyncHandler(async (req, res) => {
 // front desk has a single obvious action for "this visitor just left".
 router.post('/:id/sign-out', asyncHandler(async (req, res) => {
     await pool.query(
-        'UPDATE visitors SET sign_out_at = NOW() WHERE id = ? AND company_id = ? AND sign_out_at IS NULL',
-        [req.params.id, req.user.companyId]
+        'UPDATE visitors SET sign_out_at = ? WHERE id = ? AND company_id = ? AND sign_out_at IS NULL',
+        [wallClockNow(), req.params.id, req.user.companyId]
     );
     return res.json({ message: 'Signed out' });
 }));

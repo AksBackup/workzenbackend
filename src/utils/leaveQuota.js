@@ -31,10 +31,19 @@ const pool = require('../db');
  *   - "used" is summed for JUST the one (year, month) being checked,
  *     not the whole year - a true reset each month.
  *
+ * YEARLY POOL precedence: leave_yearly_pools (migration_053) > 0 overrides the monthly rule for that
+ * employee/type/year; see the block inside computeMonthlyPaidUsage.
+ *
  * leave_types.yearly_quota is NOT read here - it's back to being a
  * separate, informational figure only (not part of this calculation),
  * matching the monthly-reset model this now implements.
  */
+function addDay(dateStr, n) {
+    const d = new Date(`${dateStr}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+}
+
 async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year, month, opts = {}) {
     // opts.includePending: also count PENDING applications as "used" (reserve the balance).
     // Apply Leave uses this so two pending requests cannot both claim the same paid days.
@@ -43,11 +52,63 @@ async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year,
     const monthStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
+    // Paid usage inside [from, to]. Leave v2 (migration_043): summed from the per-day rows, so a
+    // leave spanning two months only uses each month's own quota. Applications created before the
+    // migration have no day rows and are counted the old way (whole application, paid_days).
+    let haveDayTable = true;
+    const usedBetween = async (from, to) => {
+        let sum = 0;
+        if (haveDayTable) {
+            try {
+                const [dayRows] = await pool.query(
+                    `SELECT COALESCE(SUM(d.paid_fraction), 0) AS used
+                     FROM leave_application_days d JOIN leave_applications a ON a.id = d.application_id
+                     WHERE d.employee_id = ? AND d.leave_type_id = ? AND a.status IN (?) AND d.leave_date BETWEEN ? AND ?`,
+                    [employeeId, leaveTypeId, statuses, from, to]
+                );
+                sum += Number(dayRows[0].used) || 0;
+            } catch (err) {
+                if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+                haveDayTable = false;
+            }
+        }
+        const [leaveRows] = await pool.query(
+            `SELECT a.days_count, a.paid_days FROM leave_applications a
+             WHERE a.employee_id = ? AND a.leave_type_id = ? AND a.status IN (?) AND a.from_date <= ? AND a.to_date >= ?
+             ${haveDayTable ? 'AND NOT EXISTS (SELECT 1 FROM leave_application_days d WHERE d.application_id = a.id)' : ''}`,
+            [employeeId, leaveTypeId, statuses, to, from]
+        );
+        return sum + leaveRows.reduce((t, r) => t + (r.paid_days !== null ? Number(r.paid_days) : Number(r.days_count)), 0);
+    };
+
+    // YEARLY POOL (migration_053, Leave Balance Entry "Yearly total"): if a pool > 0 exists it
+    // governs this employee/type/year and the monthly quota below is ignored (no double count).
+    // quota = pool minus paid days already used earlier in the year, so Apply Leave, Remaining,
+    // the employee summary and planLeave all consume the pool in date order, then go unpaid.
+    let pool_ = 0;
+    try {
+        const [poolRows] = await pool.query(
+            'SELECT allocated FROM leave_yearly_pools WHERE employee_id = ? AND leave_type_id = ? AND year = ?',
+            [employeeId, leaveTypeId, year]
+        );
+        pool_ = poolRows.length ? Number(poolRows[0].allocated) || 0 : 0;
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    if (pool_ > 0) {
+        const before = month === 1 ? 0 : await usedBetween(`${year}-01-01`, addDay(monthStart, -1));
+        const usedMonth = await usedBetween(monthStart, monthEnd);
+        return {
+            quota: Math.max(0, Math.round((pool_ - before) * 100) / 100),
+            used: Math.round(usedMonth * 100) / 100,
+            yearly: true,
+        };
+    }
+
     const [balanceRows] = await pool.query(
         'SELECT allocated FROM leave_balances WHERE employee_id = ? AND leave_type_id = ? AND year = ?',
         [employeeId, leaveTypeId, year]
     );
-
     let quota;
     if (balanceRows.length > 0) {
         quota = Number(balanceRows[0].allocated) || 0;
@@ -58,31 +119,7 @@ async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year,
         );
         quota = typeRows.length > 0 ? parseFloat(typeRows[0].monthly_quota) || 0 : 0;
     }
-
-    // Leave v2 (migration_043): paid usage is summed from the per-day rows, so a leave that
-    // spans two months only uses each month's own quota. Applications created before the
-    // migration have no day rows and are counted the old way (whole application, paid_days).
-    let used = 0;
-    let haveDayTable = true;
-    try {
-        const [dayRows] = await pool.query(
-            `SELECT COALESCE(SUM(d.paid_fraction), 0) AS used
-             FROM leave_application_days d JOIN leave_applications a ON a.id = d.application_id
-             WHERE d.employee_id = ? AND d.leave_type_id = ? AND a.status IN (?) AND d.leave_date BETWEEN ? AND ?`,
-            [employeeId, leaveTypeId, statuses, monthStart, monthEnd]
-        );
-        used += Number(dayRows[0].used) || 0;
-    } catch (err) {
-        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
-        haveDayTable = false;
-    }
-    const [leaveRows] = await pool.query(
-        `SELECT a.days_count, a.paid_days FROM leave_applications a
-         WHERE a.employee_id = ? AND a.leave_type_id = ? AND a.status IN (?) AND a.from_date <= ? AND a.to_date >= ?
-         ${haveDayTable ? 'AND NOT EXISTS (SELECT 1 FROM leave_application_days d WHERE d.application_id = a.id)' : ''}`,
-        [employeeId, leaveTypeId, statuses, monthEnd, monthStart]
-    );
-    used += leaveRows.reduce((sum, r) => sum + (r.paid_days !== null ? Number(r.paid_days) : Number(r.days_count)), 0);
+    const used = await usedBetween(monthStart, monthEnd);
 
     return { quota, used: Math.round(used * 100) / 100 };
 }

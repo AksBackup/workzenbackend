@@ -6,6 +6,7 @@ const {
 const { resolveEmployeeOffDays } = require('./dayClassifier');
 const { computeMonthlyPaidUsage } = require('./leaveQuota');
 const { loadLeaveIndex, addDays } = require('./leaveIndex');
+const { basisKeyFor } = require('./officePolicyBasis');
 
 /**
  * Leave v2 planner: turns "employee X applies for leave type Y from A to B (full / half /
@@ -42,9 +43,11 @@ async function dayKinds(companyId, employee, from, to) {
     const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
     const shiftOffIndex = await loadShiftOffIndex(companyId);
     const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId);
-    const empShift = shiftOffIndex.byId.get(employee.shift_id) ?? null;
+    // migration_051: a no-shift employee is keyed 'p:<policyId>' (their Office Time Policy's weekly off).
+    const basisKey = basisKeyFor(employee);
+    const empShift = shiftOffIndex.byId.get(basisKey) ?? null;
     const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
-        resolveEmployeeOffDays(employee.shift_id, empShift, employee.department, weeklyOffIndex, shiftPolicyOffIndex);
+        resolveEmployeeOffDays(basisKey, empShift, employee.department, weeklyOffIndex, shiftPolicyOffIndex);
     const groupId = groups.get(employee.id) ?? null;
     const kinds = new Map();
     for (const d of eachDate(from, to)) {
@@ -63,7 +66,7 @@ async function fullDayHours(companyId) {
 }
 
 /**
- * input: { companyId, employee:{id,shift_id,department}, leaveType:{id,is_paid,count_holidays,count_weekly_offs},
+ * input: { companyId, employee:{id,shift_id,work_mode,office_time_policy_id,department}, leaveType:{id,is_paid,count_holidays,count_weekly_offs},
  *          durationType, from, to, session, fromTime, toTime }
  * returns { days:[{date,fraction,paidFraction,kind}], excluded:[{date,kind}], daysCount, paidDays, unpaidDays,
  *           dayHours, hours, durationType, session, fromTime, toTime, rangeDays }
