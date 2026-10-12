@@ -38,7 +38,7 @@ const { officePolicyShiftFor } = require('./officePolicyBasis');
 async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOutValue) {
     if (!checkOutValue) return;
 
-    // migration_051: a no-shift employee (work_mode 'office_policy') is measured
+    // migration_049: a no-shift employee (work_mode 'office_policy') is measured
     // against their Office Time Policy's end time; OT is allowed for them.
     const officeShift = await officePolicyShiftFor(companyId, employeeId);
 

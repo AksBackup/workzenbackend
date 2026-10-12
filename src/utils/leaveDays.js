@@ -43,7 +43,7 @@ async function dayKinds(companyId, employee, from, to) {
     const weeklyOffIndex = await loadWeeklyOffIndex(companyId);
     const shiftOffIndex = await loadShiftOffIndex(companyId);
     const shiftPolicyOffIndex = await loadShiftPolicyOffIndex(companyId);
-    // migration_051: a no-shift employee is keyed 'p:<policyId>' (their Office Time Policy's weekly off).
+    // migration_049: a no-shift employee is keyed 'p:<policyId>' (their Office Time Policy's weekly off).
     const basisKey = basisKeyFor(employee);
     const empShift = shiftOffIndex.byId.get(basisKey) ?? null;
     const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =

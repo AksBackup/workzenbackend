@@ -31,7 +31,7 @@ const pool = require('../db');
  *   - "used" is summed for JUST the one (year, month) being checked,
  *     not the whole year - a true reset each month.
  *
- * YEARLY POOL precedence: leave_yearly_pools (migration_053) > 0 overrides the monthly rule for that
+ * YEARLY POOL precedence: leave_yearly_pools (migration_051) > 0 overrides the monthly rule for that
  * employee/type/year; see the block inside computeMonthlyPaidUsage.
  *
  * leave_types.yearly_quota is NOT read here - it's back to being a
@@ -81,7 +81,7 @@ async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year,
         return sum + leaveRows.reduce((t, r) => t + (r.paid_days !== null ? Number(r.paid_days) : Number(r.days_count)), 0);
     };
 
-    // YEARLY POOL (migration_053, Leave Balance Entry "Yearly total"): if a pool > 0 exists it
+    // YEARLY POOL (migration_051, Leave Balance Entry "Yearly total"): if a pool > 0 exists it
     // governs this employee/type/year and the monthly quota below is ignored (no double count).
     // quota = pool minus paid days already used earlier in the year, so Apply Leave, Remaining,
     // the employee summary and planLeave all consume the pool in date order, then go unpaid.

@@ -4,7 +4,7 @@ const { platformRoleFor } = require('./platformAuth');
 /**
  * Company-wide lock for the payroll, salary, statutory, payment-window,
  * bonus, loan, ad-hoc payment, conveyance, geofence and field-tracking
- * features. Stored in the screen_locks table (migration_041).
+ * features. Stored in the screen_locks table (migration_048).
  *
  * LOCKED BY DEFAULT: a company with no row for LOCK_KEY is locked. A
  * query error also fails closed (the error reaches the error handler, so

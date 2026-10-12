@@ -227,7 +227,7 @@ module.exports = {
     isNthWeekdayOfMonthOff,
 };
 
-/** Rows of the policy-rule query, one per policy (plus one per assigned shift). Missing migration_051 columns -> the caller just sees no policies. */
+/** Rows of the policy-rule query, one per policy (plus one per assigned shift). Missing migration_049 columns -> the caller just sees no policies. */
 async function loadPolicyRuleRows(companyId, columns) {
     const [rows] = await pool.query(
         `SELECT p.id AS policy_id, ops.shift_id, ${columns}

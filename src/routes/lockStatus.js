@@ -77,6 +77,45 @@ lockStatusRouter.post('/', verifyPlatformToken, asyncHandler(async (req, res) =>
 
 const platformRouter = express.Router();
 
+// Firebase WEB app config for the /admin and /254 login pages. Public by design
+// (the pages need it before sign-in); these values only identify the Firebase
+// project, they are not secrets. Built from env vars on every call.
+const FIREBASE_REQUIRED = {
+    apiKey: 'FIREBASE_WEB_API_KEY',
+    authDomain: 'FIREBASE_AUTH_DOMAIN',
+    projectId: 'FIREBASE_PROJECT_ID',
+    appId: 'FIREBASE_WEB_APP_ID',
+};
+const FIREBASE_OPTIONAL = {
+    messagingSenderId: 'FIREBASE_MESSAGING_SENDER_ID',
+    storageBucket: 'FIREBASE_STORAGE_BUCKET',
+};
+
+function firebaseConfigHandler(req, res) {
+    res.set('Cache-Control', 'no-store');
+    const cfg = {};
+    const missing = [];
+    for (const [key, env] of Object.entries(FIREBASE_REQUIRED)) {
+        const v = String(process.env[env] || '').trim();
+        if (v) cfg[key] = v; else missing.push(env);
+    }
+    if (missing.length) {
+        return res.status(503).json({
+            error: 'firebase_config_missing',
+            message: 'Firebase web config is not set on the server. Missing environment variables: ' + missing.join(', '),
+            missing,
+        });
+    }
+    for (const [key, env] of Object.entries(FIREBASE_OPTIONAL)) {
+        const v = String(process.env[env] || '').trim();
+        if (v) cfg[key] = v;
+    }
+    return res.json(cfg);
+}
+
+// No auth: registered before the token-protected routes.
+platformRouter.get('/firebase-config', firebaseConfigHandler);
+
 // Who is signed in as a platform admin. Used by the web pages and by the Flutter admin login.
 platformRouter.get('/me', verifyPlatformToken, (req, res) => {
     return res.json({
@@ -111,4 +150,4 @@ platformRouter.get('/admins', verifyPlatformToken, requireSuperAdminPlatform, (r
     return res.json({ source: 'env', admins: configuredPlatformAdmins() });
 });
 
-module.exports = { lockStatusRouter, platformRouter };
+module.exports = { lockStatusRouter, platformRouter, firebaseConfigHandler };

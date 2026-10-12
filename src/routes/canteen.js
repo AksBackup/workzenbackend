@@ -23,7 +23,12 @@ function wallClockNow() {
  */
 
 router.get('/', asyncHandler(async (req, res) => {
-    const { date } = req.query;
+    // ?date=YYYY-MM-DD for one day (by canteen date), or ?from=&to= (either optional) for an inclusive range.
+    const { date, from, to } = req.query;
+    const isDay = (v) => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v);
+    if ((date && !isDay(date)) || (from && !isDay(from)) || (to && !isDay(to))) {
+        return res.status(400).json({ error: 'date, from and to must be YYYY-MM-DD' });
+    }
     const params = [req.user.companyId];
     let sql = `SELECT c.*, e.name AS employee_name, e.emp_code AS employee_code
                FROM canteen_usage c
@@ -32,6 +37,14 @@ router.get('/', asyncHandler(async (req, res) => {
     if (date) {
         sql += ' AND c.date = ?';
         params.push(date);
+    }
+    if (!date && from) {
+        sql += ' AND c.date >= ?';
+        params.push(from);
+    }
+    if (!date && to) {
+        sql += ' AND c.date <= ?';
+        params.push(to);
     }
     sql += ' ORDER BY c.punch_time DESC';
 

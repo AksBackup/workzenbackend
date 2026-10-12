@@ -92,7 +92,7 @@ router.put('/', requireAdmin, asyncHandler(async (req, res) => {
 
 const POLICY_FIELDS = [
     'policy_name', 'short_name',
-    // migration_051: in/out times used by employees on this policy who have NO shift (NULL = company Office Time times).
+    // migration_049: in/out times used by employees on this policy who have NO shift (NULL = company Office Time times).
     'check_in_time', 'check_out_time',
     'grace_late_coming_minutes', 'grace_early_going_minutes',
     'weekly_off_1_day', 'weekly_off_2_day', 'weekly_off_2_occurrences',
@@ -192,7 +192,7 @@ router.put('/policies/:id', requireAdmin, asyncHandler(async (req, res) => {
 
 // DELETE /office-time-policy/policies/:id
 router.delete('/policies/:id', requireAdmin, asyncHandler(async (req, res) => {
-    // migration_051: employees with NO shift are attached to a policy directly (employees.office_time_policy_id).
+    // migration_049: employees with NO shift are attached to a policy directly (employees.office_time_policy_id).
     // Deleting it would silently drop their rules, so refuse and say who is affected.
     try {
         const [[used]] = await pool.query(
@@ -204,7 +204,7 @@ router.delete('/policies/:id', requireAdmin, asyncHandler(async (req, res) => {
             });
         }
     } catch (err) {
-        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; // migration_051 not run yet
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; // migration_049 not run yet
     }
     // office_time_policy_shifts rows for this policy cascade-delete
     // (ON DELETE CASCADE, migration_034) - any shift that was assigned

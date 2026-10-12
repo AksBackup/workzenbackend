@@ -1,7 +1,7 @@
 const pool = require('../db');
 
 /**
- * migration_051 - "no shift" employees.
+ * migration_049 - "no shift" employees.
  *
  * An employee with work_mode 'office_policy' and an office_time_policy_id has
  * no shift. Every shift-keyed lookup (policy rules, grace, weekly off,
@@ -48,7 +48,7 @@ function virtualShiftFromPolicy(policy, companyTimes) {
 
 /**
  * { forPolicyId(id) -> virtual shift | null }, built once per request/report.
- * Works before migration_051 is applied: the policy in/out columns are then
+ * Works before migration_049 is applied: the policy in/out columns are then
  * missing, the query falls back to no policies, and nobody is a no-shift employee.
  */
 async function loadOfficePolicyShifts(companyId) {
@@ -66,7 +66,7 @@ async function loadOfficePolicyShifts(companyId) {
         [policies] = await pool.query(
             'SELECT id, policy_name, check_in_time, check_out_time FROM office_time_policies WHERE company_id = ?', [companyId]);
     } catch (err) {
-        if (err.code !== 'ER_BAD_FIELD_ERROR' && err.code !== 'ER_NO_SUCH_TABLE') throw err; // migration_051 not run yet
+        if (err.code !== 'ER_BAD_FIELD_ERROR' && err.code !== 'ER_NO_SUCH_TABLE') throw err; // migration_049 not run yet
     }
     const byId = new Map(policies.map((p) => [Number(p.id), virtualShiftFromPolicy(p, companyTimes)]));
     return {
@@ -87,7 +87,7 @@ async function officePolicyShiftFor(companyId, employeeId) {
         [rows] = await pool.query(
             'SELECT work_mode, office_time_policy_id FROM employees WHERE id = ? AND company_id = ?', [employeeId, companyId]);
     } catch (err) {
-        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; // migration_051 not run yet
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; // migration_049 not run yet
         return null;
     }
     if (!rows.length || !isOfficePolicyEmployee(rows[0])) return null;

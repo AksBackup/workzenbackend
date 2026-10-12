@@ -4,7 +4,7 @@ const { verifyFirebaseToken, requireAdmin } = require('../middleware/verifyFireb
 const asyncHandler = require('../utils/asyncHandler');
 
 /**
- * Multi-device employees (migration_045) and device-to-device user copy.
+ * Multi-device employees (migration_050) and device-to-device user copy.
  *
  * Mounted in index.js as TWO prefixes from this one file:
  *   app.use('/employee-devices', employeeDevicesRouter);   -> GET/PUT /employee-devices/:employeeId

@@ -32,7 +32,7 @@ const licenseRoutes = require('./routes/license');
 const panelAdminRoutes = require('./routes/panelAdmins');
 // migration_038: Cloud Server (ADMS/iClock) push receiver - public by design.
 const { verifyFirebaseToken, requireFeature } = require('./middleware/verifyFirebaseToken');
-// Workstream A: platform admin pages (/admin, /254) + payroll/geofence lock (migration_041).
+// Workstream A: platform admin pages (/admin, /254) + payroll/geofence lock (migration_048).
 const { requireUnlocked } = require('./middleware/screenLock');
 const lockStatusRoutes = require('./routes/lockStatus');
 const { employeeDevicesRouter, deviceUserCopyRouter } = require('./routes/employeeDevices');
@@ -174,7 +174,7 @@ app.use('/designations', designationRoutes);
 app.use('/office-time-policy', officeTimePolicyRoutes);
 app.use('/overtime', overtimeRoutes);
 app.use('/weekly-off', weeklyOffRoutes);
-// Payroll-family routes are locked by default (migration_041): verifyFirebaseToken, then
+// Payroll-family routes are locked by default (migration_048): verifyFirebaseToken, then
 // requireUnlocked returns 403 unless the company is unlocked or the caller is a platform admin.
 app.use('/payroll', verifyFirebaseToken, requireUnlocked, payrollRoutes);
 app.use('/statutory-settings', verifyFirebaseToken, requireUnlocked, statutorySettingsRoutes);

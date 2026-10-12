@@ -19,7 +19,7 @@
  *
  * Period (balance type): 'monthly' (default) edits the per-month quota
  * (leave_balances.allocated); 'yearly' edits an annual pool (leave_yearly_pools,
- * migration_053). A pool > 0 governs that employee/type/year and the monthly quota is
+ * migration_051). A pool > 0 governs that employee/type/year and the monthly quota is
  * ignored (utils/leaveQuota.js). Yearly audit rows start with '[Yearly]'.
  *
  * Modes:

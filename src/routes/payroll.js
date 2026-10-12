@@ -282,7 +282,7 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
 
         const baseSalary = Number(emp.salary ?? emp.default_salary ?? 0);
         const perDayRate = baseSalary / daysInMonth;
-        // migration_051: the basis every shift-keyed rule is looked up by - the employee's shift id,
+        // migration_049: the basis every shift-keyed rule is looked up by - the employee's shift id,
         // or 'p:<policyId>' for a no-shift employee (see utils/attendanceRules.js basisKeyFor).
         const basisKey = basisKeyFor(emp);
         const empShift = shiftOffIndex.byId.get(basisKey) ?? null;

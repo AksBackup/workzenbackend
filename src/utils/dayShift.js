@@ -4,7 +4,7 @@ const { loadOfficePolicyShifts, isOfficePolicyEmployee } = require('./officePoli
 /**
  * Per-day shift resolution shared by payroll (and mirrored in reports.js):
  *   1) a Shift Roster row (shift_assignments) covering that date wins,
- *   2) else, a no-shift employee (work_mode 'office_policy', migration_051) gets
+ *   2) else, a no-shift employee (work_mode 'office_policy', migration_049) gets
  *      the virtual shift of their Office Time Policy (in/out times + policy key 'p:<id>'),
  *   3) else, if the employee works in several shifts (employee_shifts, migration_044),
  *      the one whose start time is closest to their FIRST punch of the day,

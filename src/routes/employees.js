@@ -15,7 +15,7 @@ router.use(verifyFirebaseToken);
 // POST /employees/:id/push-to-devices (routes/employeePush.js) - only that one path, so mounting it here is safe.
 router.use(require('./employeePush'));
 
-// ---- No-shift employees (migration_051) -----------------------------------
+// ---- No-shift employees (migration_049) -----------------------------------
 // work_mode 'shift' (default, every existing employee): the employee works to a shift.
 // work_mode 'office_policy': no shift; the Office Time Policy named by office_time_policy_id applies.
 const WORK_MODES = ['shift', 'office_policy'];
@@ -207,11 +207,11 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
         if (zoneErr) return res.status(400).json({ error: zoneErr });
     }
 
-    // migration_051: shift or no-shift (Office Time Policy).
+    // migration_049: shift or no-shift (Office Time Policy).
     const workMode = req.body.work_mode == null ? 'shift' : String(req.body.work_mode);
     if (!WORK_MODES.includes(workMode)) return res.status(400).json({ error: "work_mode must be 'shift' or 'office_policy'" });
     if (workMode === 'office_policy') {
-        if (!(await hasWorkModeColumns())) return res.status(400).json({ error: 'Run migration_051_office_policy_employees.sql first (employees.work_mode is missing).' });
+        if (!(await hasWorkModeColumns())) return res.status(400).json({ error: 'Run migration_049_office_policy_employees.sql first (employees.work_mode is missing).' });
         const policyErr = await validateOfficePolicy(req.user.companyId, req.body.office_time_policy_id);
         if (policyErr) return res.status(400).json({ error: policyErr });
     }
@@ -501,7 +501,7 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         empCodeChanging = true;
     }
 
-    // migration_051: shift vs no-shift. work_mode decides which of the two the employee follows.
+    // migration_049: shift vs no-shift. work_mode decides which of the two the employee follows.
     // Sending a work_mode is the explicit choice; an older client that only sends shift ids is
     // treated as 'shift' so it keeps working exactly as before.
     let forceNoShifts = false;
@@ -763,7 +763,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     // migration_027 - shift-level weekly-off (weekly_off_bitmask AND
     // alt_saturdays) now actually resolved via the employee's shift_id,
     // fixing the gap the previous comment here flagged.
-    // migration_051: a no-shift employee's weekly off comes from their Office Time Policy (basisKeyFor 'p:<id>').
+    // migration_049: a no-shift employee's weekly off comes from their Office Time Policy (basisKeyFor 'p:<id>').
     const basisKey = basisKeyFor(employee);
     let empShift = null;
     if (!isOfficePolicyEmployee(employee) && employee.shift_id != null) {
@@ -817,7 +817,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     // after this is still recorded/counted as present, just flagged
     // 'late' below rather than silently unrecorded.
     let checkInWindowEnd = policyRows.length > 0 ? policyRows[0].check_in_window_end : '09:45:00';
-    // migration_051: a no-shift employee is late after their Office Time Policy in-time + its late grace.
+    // migration_049: a no-shift employee is late after their Office Time Policy in-time + its late grace.
     if (isOfficePolicyEmployee(employee)) {
         const policyShift = await officePolicyShiftFor(req.user.companyId, employeeId);
         if (policyShift && policyShift.start_time) {

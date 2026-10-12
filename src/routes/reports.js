@@ -597,7 +597,7 @@ async function resolveEffectiveShift(companyId, employeeId, dateStr) {
     );
     if (assignmentRows.length > 0) return assignmentRows[0];
 
-    // No-shift employee (migration_051): the Office Time Policy window is the shift.
+    // No-shift employee (migration_049): the Office Time Policy window is the shift.
     const policyShift = await officePolicyShiftFor(companyId, employeeId);
     if (policyShift) return policyShift;
 
@@ -1294,12 +1294,38 @@ router.get('/weekly-muster', requireAdmin, asyncHandler(async (req, res) => {
 
     const context = await loadCompanyContext(req.user.companyId);
     const result = await computeMuster(req.user.companyId, weekStart, weekEnd, context);
-    return res.json(result.map(r => ({
-        employee_id: r.employee_id,
-        employee_name: r.employee_name,
-        emp_code: r.emp_code,
-        days: r.days,
-    })));
+
+    // Branch / department / shift / designation per employee - the Weekly muster screen sorts
+    // and exports by these. Every join is optional so a missing table/column never breaks the grid.
+    const extras = new Map();
+    try {
+        const [rows] = await pool.query(
+            `SELECT e.id, e.department, e.designation, b.name AS branch_name, d.name AS designation_name, s.name AS shift_name
+             FROM employees e
+             LEFT JOIN branches b ON b.id = e.branch_id
+             LEFT JOIN designations d ON d.id = e.designation_id
+             LEFT JOIN shifts s ON s.id = e.shift_id
+             WHERE e.company_id = ?`, [req.user.companyId]);
+        for (const x of rows) extras.set(x.id, x);
+    } catch (_) {
+        try {
+            const [rows] = await pool.query('SELECT id, department, designation FROM employees WHERE company_id = ?', [req.user.companyId]);
+            for (const x of rows) extras.set(x.id, x);
+        } catch (_2) { /* leave the extra fields empty */ }
+    }
+    return res.json(result.map(r => {
+        const x = extras.get(r.employee_id) || {};
+        return {
+            employee_id: r.employee_id,
+            employee_name: r.employee_name,
+            emp_code: r.emp_code,
+            branch: x.branch_name || '',
+            department: x.department || '',
+            shift: x.shift_name || '',
+            designation: x.designation_name || x.designation || '',
+            days: r.days,
+        };
+    }));
 }));
 
 

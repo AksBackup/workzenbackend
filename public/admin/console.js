@@ -5,7 +5,8 @@
  *
  * Usage (in the page, after the Firebase scripts):
  *   ConsolePage.start({ requireSuperAdmin: false });
- * The page must define window.FIREBASE_CONFIG first.
+ * The Firebase web config is NOT in the page: start() fetches it from the
+ * public GET /platform/firebase-config endpoint (server env vars).
  */
 (function () {
     'use strict';
@@ -181,11 +182,28 @@
         if (me.role === 'super_admin') await loadAdmins();
     }
 
-    function start(opts) {
+    async function loadFirebaseConfig() {
+        var res;
+        try {
+            res = await fetch(API + '/platform/firebase-config', { cache: 'no-store' });
+        } catch (e) {
+            throw new Error('Could not reach the server to load the Firebase configuration.');
+        }
+        var body = null;
+        try { body = await res.json(); } catch (e) { /* non-JSON */ }
+        if (!res.ok || !body || !body.apiKey) {
+            throw new Error((body && (body.message || body.error)) || ('Firebase configuration unavailable (HTTP ' + res.status + ').'));
+        }
+        return body;
+    }
+
+    async function start(opts) {
         options = opts || {};
-        var cfg = window.FIREBASE_CONFIG;
-        if (!cfg || !cfg.apiKey || /^REPLACE_/.test(cfg.apiKey)) {
-            setMsg('Firebase is not configured on this page yet. Set window.FIREBASE_CONFIG in the page.', 'error');
+        var cfg;
+        try {
+            cfg = await loadFirebaseConfig();
+        } catch (e) {
+            setMsg(e.message, 'error');
             return;
         }
         if (!firebase.apps.length) firebase.initializeApp(cfg);
