@@ -28,7 +28,7 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 
 const licenseRoutes = require('./routes/license');
-// migration_036: two-tier vendor panel login (admin / super_admin) + audit log.
+// Vendor panel API (/panel/*) for /admin and /254: Firebase platform tokens only (migration_052).
 const panelAdminRoutes = require('./routes/panelAdmins');
 // migration_038: Cloud Server (ADMS/iClock) push receiver - public by design.
 const { verifyFirebaseToken, requireFeature } = require('./middleware/verifyFirebaseToken');
@@ -127,10 +127,16 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json());
 
-// Platform admin web pages (static HTML under public/admin and public/254).
-// Explicit routes so /admin and /254 (no trailing slash) serve the page directly.
-app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'admin', 'index.html')));
-app.get('/254', (req, res) => res.sendFile(path.join(__dirname, '..', 'public', '254', 'index.html')));
+// Platform consoles (Firebase sign-in): /admin (app admin) and /254 (super admin).
+// Explicit page routes so /admin and /254 (no trailing slash) serve the page directly;
+// only these folders are served statically (the old single-page public/index.html is gone).
+const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+app.get('/', (req, res) => res.redirect('/admin'));
+app.get('/admin', (req, res) => res.sendFile(path.join(PUBLIC_DIR, 'admin', 'index.html')));
+app.get('/254', (req, res) => res.sendFile(path.join(PUBLIC_DIR, '254', 'index.html')));
+app.use('/admin', express.static(path.join(PUBLIC_DIR, 'admin'), { index: false }));
+app.use('/254', express.static(path.join(PUBLIC_DIR, '254'), { index: false }));
+app.use('/platform-assets', express.static(path.join(PUBLIC_DIR, 'platform'), { index: false }));
 
 // Friendly errors + codes for EVERY failed response (see utils/errorCatalog.js, ERROR_CODES.md):
 // any JSON body with an `error` string and HTTP >= 400 gets a `code` and the code appended to the
@@ -149,10 +155,6 @@ app.use((req, res, next) => {
     };
     next();
 });
-
-// Internal license admin panel (public/index.html) - protected route-by-route
-// inside routes/license.js via adminPanelAuth, not by this static mount.
-app.use(express.static(path.join(__dirname, '..', 'public')));
 
 app.use('/license', licenseRoutes);
 app.use('/panel', panelAdminRoutes);
@@ -230,7 +232,7 @@ app.use('/platform', lockStatusRoutes.platformRouter);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-// 404 for anything unmatched (after the static/panel mount and all routes above)
+// 404 for anything unmatched (after the console pages and all routes above)
 app.use((req, res) => {
     res.status(404).json({ error: 'Not found' });
 });

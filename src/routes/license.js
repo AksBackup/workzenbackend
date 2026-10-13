@@ -283,8 +283,11 @@ router.get('/my-company/info', asyncHandler(async (req, res) => {
 }));
 
 /* ------------------------------------------------------------------
-   Internal only - the vendor's own panel (public/index.html + /panel/*
-   login). Never expose these paths to customers.
+   Internal only - the vendor's own consoles (/admin and /254, Firebase
+   sign-in) call these. adminPanelAuth accepts only a Firebase token of a
+   platform admin (admin or super_admin); every write below is audited
+   against that Firebase actor (utils/panelAudit.js). Never expose these
+   paths to customers.
    ------------------------------------------------------------------ */
 
 router.use('/admin', adminPanelAuth);
@@ -331,7 +334,7 @@ router.post('/admin/generate-batch', asyncHandler(async (req, res) => {
         const [batchResult] = await conn.query(
             `INSERT INTO license_batches (company_name, company_name_norm, admin_email, admin_email_norm, max_employees, number_of_licenses, created_by_panel_admin_id)
              VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [company_name, norm(company_name), admin_email, norm(admin_email), number_of_employees || 50, count, req.panelAdmin ? req.panelAdmin.id : null]
+            [company_name, norm(company_name), admin_email, norm(admin_email), number_of_employees || 50, count, null]  // created_by_panel_admin_id: FK to the legacy panel_admins table; Firebase actors are recorded in panel_audit_log instead
         );
         const batchId = batchResult.insertId;
 

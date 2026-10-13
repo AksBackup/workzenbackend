@@ -1,88 +1,43 @@
-const pool = require('../db');
 const asyncHandler = require('../utils/asyncHandler');
+const { authenticatePlatform } = require('./platformAuth');
 
 /**
- * Guards the internal license-generation panel (public/index.html and its
- * /license/admin/* and /panel/* routes). Deliberately separate from
- * verifyFirebaseToken - this is YOUR tool as the vendor, it must never be
- * reachable using a customer's admin login.
+ * Guards the vendor endpoints (/license/admin/* and /panel/*) used by the
+ * /admin and /254 consoles.
  *
- * migration_040: this used to be a single shared PANEL_SECRET checked
- * against `x-panel-key` - anyone with that one string had full access,
- * with no way to tell two people apart or revoke just one of them.
- * Replaced with real per-person accounts (`panel_admins`) + DB-backed
- * bearer sessions (`panel_sessions`), so:
- *   - revoking one person's access doesn't require rotating the secret
- *     everyone else also uses
- *   - every write action can be attributed to a named person in
- *     `panel_audit_log` (see routes/panelAdmins.js / routes/license.js)
- *   - a 'super_admin' can see everything an 'admin' does; an 'admin'
- *     cannot see or manage other panel_admins at all
+ * Authentication is Firebase ONLY: a valid Firebase ID token (Bearer) whose
+ * uid is a platform admin, i.e. in SUPER_ADMIN_UIDS (role 'super_admin'),
+ * in ADMIN_UIDS or an active row in platform_admins (role 'admin'). The
+ * legacy login (panel_sessions), the PANEL_SECRET / x-panel-key break-glass
+ * and customer company tokens can NOT reach these routes.
  *
- * PANEL_SECRET is kept as a break-glass fallback ONLY - if
- * `x-panel-key` matches it, the caller is treated as an anonymous
- * super_admin (req.panelAdmin = null, req.panelRole = 'super_admin',
- * logged in the audit trail as panel_admin_id NULL). This exists so a
- * server is never permanently locked out if the panel_admins table is
- * ever empty or misconfigured - it is NOT meant for routine daily use
- * once real accounts exist. Rotate/retire PANEL_SECRET once your real
- * accounts are set up; don't hand it out like a normal login.
+ *   no / invalid token            -> 401
+ *   valid token, not a platform uid, or disabled -> 403
+ *   plain admin on a super-only route            -> 403
  *
- * Usage: `router.use(adminPanelAuth)` for "any panel account", or
- * `router.use(requireSuperAdmin)` for super_admin-only routes (see
- * routes/panelAdmins.js). Both are exported off the same module.
+ * Sets req.platform = { uid, email, name, role }. req.panelAdmin is always
+ * null (it referred to the legacy panel_admins table).
+ *
+ * Usage: `router.use(adminPanelAuth)` for "any platform admin"; add
+ * `requireSuperAdmin` per route for super-only routes. requireSuperAdmin
+ * also authenticates by itself when it is mounted alone.
  */
-
-/** Shared lookup, NOT wrapped in asyncHandler itself - both exported
- * middlewares wrap their own call to this so a thrown/rejected DB error
- * is always caught by whichever one is actually mounted on the route. */
-async function resolvePanelCaller(req) {
-    const bearer = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
-    const legacyKey = req.headers['x-panel-key'];
-
-    if (bearer) {
-        const [rows] = await pool.query(
-            `SELECT s.panel_admin_id, a.role, a.status, a.name, a.email
-             FROM panel_sessions s
-             JOIN panel_admins a ON a.id = s.panel_admin_id
-             WHERE s.token = ? AND s.expires_at > NOW()`,
-            [bearer]
-        );
-        if (rows.length > 0 && rows[0].status === 'active') {
-            return {
-                ok: true,
-                panelAdmin: { id: rows[0].panel_admin_id, name: rows[0].name, email: rows[0].email },
-                role: rows[0].role,
-            };
-        }
-        return { ok: false, status: 401, error: 'Session expired or invalid. Please log in again.' };
+async function guard(req, res, next, superOnly) {
+    if (!req.platform) {
+        const r = await authenticatePlatform(req);
+        if (!r.ok) return res.status(r.status).json({ error: r.error });
+        req.platform = r.platform;
     }
-
-    if (legacyKey && process.env.PANEL_SECRET && legacyKey === process.env.PANEL_SECRET) {
-        return { ok: true, panelAdmin: null, role: 'super_admin' };
-    }
-
-    return { ok: false, status: 401, error: 'Unauthorized' };
-}
-
-const adminPanelAuth = asyncHandler(async function adminPanelAuth(req, res, next) {
-    const result = await resolvePanelCaller(req);
-    if (!result.ok) return res.status(result.status).json({ error: result.error });
-    req.panelAdmin = result.panelAdmin;
-    req.panelRole = result.role;
-    return next();
-});
-
-const requireSuperAdmin = asyncHandler(async function requireSuperAdmin(req, res, next) {
-    const result = await resolvePanelCaller(req);
-    if (!result.ok) return res.status(result.status).json({ error: result.error });
-    if (result.role !== 'super_admin') {
+    req.panelAdmin = null;
+    req.panelRole = req.platform.role;
+    if (superOnly && req.platform.role !== 'super_admin') {
         return res.status(403).json({ error: 'Super admin access required' });
     }
-    req.panelAdmin = result.panelAdmin;
-    req.panelRole = result.role;
     return next();
-});
+}
+
+const adminPanelAuth = asyncHandler((req, res, next) => guard(req, res, next, false));
+const requireSuperAdmin = asyncHandler((req, res, next) => guard(req, res, next, true));
 
 module.exports = adminPanelAuth;
 module.exports.requireSuperAdmin = requireSuperAdmin;

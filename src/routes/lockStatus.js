@@ -8,6 +8,7 @@ const {
     requireSuperAdminPlatform,
 } = require('../middleware/platformAuth');
 const { readLock, LOCK_KEY } = require('../middleware/screenLock');
+const { logPanelAction } = require('../utils/panelAudit');
 
 /*
  * GET  /lock-status              any company user (own company) or platform admin
@@ -71,6 +72,7 @@ lockStatusRouter.post('/', verifyPlatformToken, asyncHandler(async (req, res) =>
                                  updated_by_email = VALUES(updated_by_email)`,
         [company.id, LOCK_KEY, locked ? 1 : 0, req.platform.uid, req.platform.email || null]
     );
+    await logPanelAction(req, 'set_screen_lock', 'company', company.id, { lock_key: LOCK_KEY, locked, company_name: company.name });
     const lock = await readLock(company.id);
     return res.json(lockPayload(company.id, company.name, lock, req.platform));
 }));
@@ -121,6 +123,7 @@ platformRouter.get('/me', verifyPlatformToken, (req, res) => {
     return res.json({
         uid: req.platform.uid,
         email: req.platform.email || null,
+        name: req.platform.name || null,
         role: req.platform.role,
         company_id: req.platform.companyId,
     });
@@ -144,8 +147,8 @@ platformRouter.get('/companies', verifyPlatformToken, asyncHandler(async (req, r
     })));
 }));
 
-// Configured platform accounts. Read-only: the lists come from the ADMIN_UIDS
-// and SUPER_ADMIN_UIDS env vars, so changing them means editing env and restarting.
+// Env-configured platform accounts only (read-only). The /254 Panel Admins tab uses
+// GET /panel/admins, which also lists and manages the platform_admins table.
 platformRouter.get('/admins', verifyPlatformToken, requireSuperAdminPlatform, (req, res) => {
     return res.json({ source: 'env', admins: configuredPlatformAdmins() });
 });

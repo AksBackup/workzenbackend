@@ -9,6 +9,28 @@ const pool = require('../db');
  * Every route handler MUST filter its queries by req.user.companyId -
  * never by a company_id supplied in the request body/query string.
  */
+// Companies removed by the super admin ("delete company data", company_deletions,
+// migration_053). Cheap: one tiny indexed lookup per company, cached for 30s
+// (the deleting process also updates its own cache immediately). A missing
+// table (migration not applied) means nothing is removed.
+const REMOVED_MESSAGE = 'This company has been removed. Contact Sarvottam.';
+const removedCache = new Map(); // companyId -> { at, removed }
+async function isCompanyRemoved(companyId) {
+    const key = String(companyId);
+    const hit = removedCache.get(key);
+    if (hit && Date.now() - hit.at < 30000) return hit.removed;
+    let removed = false;
+    try {
+        const [rows] = await pool.query('SELECT 1 FROM company_deletions WHERE company_id = ? LIMIT 1', [companyId]);
+        removed = rows.length > 0;
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    removedCache.set(key, { at: Date.now(), removed });
+    return removed;
+}
+function markCompanyRemoved(companyId) { removedCache.set(String(companyId), { at: Date.now(), removed: true }); }
+
 async function verifyFirebaseToken(req, res, next) {
     const authHeader = req.headers.authorization || '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
@@ -23,6 +45,9 @@ async function verifyFirebaseToken(req, res, next) {
 
         if (!companyId || !role) {
             return res.status(403).json({ error: 'Account has no company_id/role claim set' });
+        }
+        if (await isCompanyRemoved(companyId)) {
+            return res.status(403).json({ error: REMOVED_MESSAGE, company_removed: true });
         }
 
         req.user = {
@@ -129,4 +154,4 @@ function requireFeature(flag) {
     };
 }
 
-module.exports = { requireFeature, verifyFirebaseToken, requireAdmin, requireAdminOnly, isStaff };
+module.exports = { isCompanyRemoved, markCompanyRemoved, REMOVED_MESSAGE, requireFeature, verifyFirebaseToken, requireAdmin, requireAdminOnly, isStaff };

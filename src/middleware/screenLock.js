@@ -1,5 +1,5 @@
 const pool = require('../db');
-const { platformRoleFor } = require('./platformAuth');
+const { resolvePlatformRole } = require('./platformAuth');
 
 /**
  * Company-wide lock for the payroll, salary, statutory, payment-window,
@@ -37,7 +37,7 @@ async function readLock(companyId) {
 async function requireUnlocked(req, res, next) {
     try {
         if (!req.user) return res.status(403).json({ error: 'Admin access required' });
-        if (platformRoleFor(req.user.uid)) return next();
+        if (await resolvePlatformRole(req.user.uid)) return next();
         const lock = await readLock(req.user.companyId);
         if (lock.locked) {
             return res.status(403).json({ error: LOCKED_MESSAGE, locked: true });
