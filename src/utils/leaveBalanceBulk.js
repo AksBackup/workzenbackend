@@ -22,6 +22,9 @@
  * migration_051). A pool > 0 governs that employee/type/year and the monthly quota is
  * ignored (utils/leaveQuota.js). Yearly audit rows start with '[Yearly]'.
  *
+ * Month (monthly period only): a month 1-12 turns the Addition into a one-time credit for that month
+ * (leave_month_credits); leave_types.carry_forward decides whether the unused part rolls into later months.
+ *
  * Modes:
  *   - 'add':    allocated = allocated + amount (a missing row starts from 0, the
  *               same base Earn Leave already uses). Audit row type 'earn', amount +.
@@ -31,6 +34,9 @@
 const bad = (message) => Object.assign(new Error(message), { status: 400 });
 
 const YEARLY_MARKER = '[Yearly]';
+/** '[Month 2026-03]' - tags audit rows of a month-wise credit so a void reverses the right store. */
+const monthMarker = (y, m) => `[Month ${y}-${String(m).padStart(2, '0')}]`;
+const MONTH_MARKER_RE = /^\[Month (\d{4})-(\d{2})\]/;
 const MAX_BALANCE = 9999.9;   // leave_balances.allocated is DECIMAL(5,1)
 const MAX_TENTHS = 99999;
 const CHUNK = 500;
@@ -118,16 +124,24 @@ async function resolveEmployees(db, companyId, filter) {
  * Applies (or, with dryRun, only counts) an Addition or Deletion for every
  * employee matched by `filter`, in one transaction. Returns a summary.
  */
-async function runBulkBalance(pool, { companyId, adminId, year, mode, period = 'monthly', balances, filter, reason, dryRun }) {
+async function runBulkBalance(pool, { companyId, adminId, year, month, mode, period = 'monthly', balances, filter, reason, dryRun }) {
     if (!['add', 'delete'].includes(mode)) throw bad("mode must be 'add' or 'delete'.");
     if (!['monthly', 'yearly'].includes(period)) throw bad("period must be 'monthly' or 'yearly'.");
     // monthly -> leave_balances.allocated (per-month quota); yearly -> leave_yearly_pools.allocated (annual pool)
-    const table = period === 'yearly' ? 'leave_yearly_pools' : 'leave_balances';
+    // With a month chosen (monthly period only) the amount is a ONE-TIME credit for that month:
+    // leave_month_credits (migration_052). Without a month it edits the standing monthly quota.
+    const m = month === undefined || month === null || month === '' ? null : Number(month);
+    if (m !== null && (!Number.isInteger(m) || m < 1 || m > 12)) throw bad('month must be 1-12.');
+    if (m !== null && period === 'yearly') throw bad('A month can only be chosen for a monthly entry.');
+    const isMonthCredit = m !== null;
+    const table = period === 'yearly' ? 'leave_yearly_pools' : (isMonthCredit ? 'leave_month_credits' : 'leave_balances');
+    const amountCol = isMonthCredit ? 'amount' : 'allocated';
     const y = Number(year);
     if (!Number.isInteger(y) || y < 2000 || y > 2100) throw bad('year must be a valid year.');
     const baseReason = (reason && String(reason).trim()) || (mode === 'add' ? 'Leave balance entry: addition' : 'Leave balance entry: deletion');
     // The marker lets DELETE /leave-adjustments/:id reverse the right store.
-    const reasonText = period === 'yearly' ? `${YEARLY_MARKER} ${baseReason}` : baseReason;
+    const reasonText = period === 'yearly' ? `${YEARLY_MARKER} ${baseReason}`
+        : (isMonthCredit ? `${monthMarker(y, m)} ${baseReason}` : baseReason);
 
     const conn = await pool.getConnection();
     try {
@@ -145,7 +159,7 @@ async function runBulkBalance(pool, { companyId, adminId, year, mode, period = '
         const typeName = new Map(typeRows.map(r => [Number(r.id), r.name]));
 
         const summary = {
-            mode, period, year: y, dry_run: !!dryRun,
+            mode, period, year: y, month: m, dry_run: !!dryRun,
             employees_matched: employees.length,
             affected_employees: 0,
             affected_balances: 0,
@@ -160,8 +174,8 @@ async function runBulkBalance(pool, { companyId, adminId, year, mode, period = '
         // Lock the rows that will change so two concurrent bulk runs cannot both
         // read the same starting value and lose one of the additions.
         const [existingRows] = await conn.query(
-            `SELECT employee_id, leave_type_id, allocated FROM ${table} WHERE year = ? AND employee_id IN (?) AND leave_type_id IN (?) FOR UPDATE`,
-            [y, empIds, typeIds]
+            `SELECT employee_id, leave_type_id, ${amountCol} AS allocated FROM ${table} WHERE year = ? ${isMonthCredit ? 'AND month = ?' : ''} AND employee_id IN (?) AND leave_type_id IN (?) FOR UPDATE`,
+            isMonthCredit ? [y, m, empIds, typeIds] : [y, empIds, typeIds]
         );
         const current = new Map(existingRows.map(r => [`${r.employee_id}|${r.leave_type_id}`, Math.round(Number(r.allocated) * 10)]));
 
@@ -184,7 +198,7 @@ async function runBulkBalance(pool, { companyId, adminId, year, mode, period = '
                 const nextT = curT + deltaT;
                 if (nextT > MAX_TENTHS) throw bad(`A resulting balance would exceed ${MAX_BALANCE} days. Check the amounts.`);
 
-                upserts.push([emp, b.leaveTypeId, y, nextT / 10]);
+                upserts.push(isMonthCredit ? [emp, b.leaveTypeId, y, m, nextT / 10] : [emp, b.leaveTypeId, y, nextT / 10]);
                 audits.push([companyId, emp, b.leaveTypeId, y, deltaT > 0 ? 'earn' : 'adjust', deltaT / 10, reasonText, adminId ?? null]);
                 touched.add(emp);
                 totalTenths += deltaT;
@@ -207,8 +221,8 @@ async function runBulkBalance(pool, { companyId, adminId, year, mode, period = '
 
         for (let i = 0; i < upserts.length; i += CHUNK) {
             await conn.query(
-                `INSERT INTO ${table} (employee_id, leave_type_id, year, allocated) VALUES ?
-                 ON DUPLICATE KEY UPDATE allocated = VALUES(allocated)`,
+                `INSERT INTO ${table} (employee_id, leave_type_id, year, ${isMonthCredit ? 'month, ' : ''}${amountCol}) VALUES ?
+                 ON DUPLICATE KEY UPDATE ${amountCol} = VALUES(${amountCol})`,
                 [upserts.slice(i, i + CHUNK)]
             );
         }
@@ -229,4 +243,4 @@ async function runBulkBalance(pool, { companyId, adminId, year, mode, period = '
     }
 }
 
-module.exports = { YEARLY_MARKER, normalizeFilter, parseBalances, resolveEmployees, runBulkBalance };
+module.exports = { YEARLY_MARKER, monthMarker, MONTH_MARKER_RE, normalizeFilter, parseBalances, resolveEmployees, runBulkBalance };

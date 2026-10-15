@@ -77,6 +77,24 @@ router.get('/', asyncHandler(async (req, res) => {
     return res.json(rows);
 }));
 
+// GET /leave-balances/month-credits?year=2026[&month=3][&employee_id=]
+// One-time month-wise credits (Leave Opening Entry with a month chosen), for the screen's table.
+router.get('/month-credits', requireAdmin, asyncHandler(async (req, res) => {
+    const params = [req.user.companyId];
+    let sql = `SELECT c.employee_id, c.leave_type_id, c.year, c.month, c.amount
+               FROM leave_month_credits c JOIN employees e ON e.id = c.employee_id WHERE e.company_id = ?`;
+    if (req.query.year) { sql += ' AND c.year = ?'; params.push(req.query.year); }
+    if (req.query.month) { sql += ' AND c.month = ?'; params.push(req.query.month); }
+    if (req.query.employee_id) { sql += ' AND c.employee_id = ?'; params.push(req.query.employee_id); }
+    try {
+        const [rows] = await pool.query(sql, params);
+        return res.json(rows);
+    } catch (err) {
+        if (err.code === 'ER_NO_SUCH_TABLE') return res.json([]);
+        throw err;
+    }
+}));
+
 // POST /leave-balances - upsert allocated for (employee_id, leave_type_id, year).
 // Mirrors the `ON DUPLICATE KEY UPDATE` pattern attendance.js already
 // uses against the table's own unique key (uq_emp_type_year).
@@ -173,7 +191,7 @@ router.get('/bulk/employees', requireAdmin, asyncHandler(async (req, res) => {
 // Returns { mode, year, dry_run, employees_matched, affected_employees,
 //           affected_balances, total_days, by_leave_type[] }.
 router.post('/bulk', requireAdmin, asyncHandler(async (req, res) => {
-    const { year, mode, period, balances, filter, reason, dry_run } = req.body || {};
+    const { year, month, mode, period, balances, filter, reason, dry_run } = req.body || {};
     try {
         const parsed = parseBalances(balances);
         const [adminRows] = await pool.query('SELECT id FROM admins WHERE firebase_uid = ?', [req.user.uid]);
@@ -181,6 +199,7 @@ router.post('/bulk', requireAdmin, asyncHandler(async (req, res) => {
             companyId: req.user.companyId,
             adminId: adminRows[0] ? adminRows[0].id : null,
             year,
+            month,
             mode,
             period: period === undefined ? 'monthly' : period,
             balances: parsed,

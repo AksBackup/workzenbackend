@@ -23,7 +23,7 @@ const { loadLeaveIndex } = require('../utils/leaveIndex');
 const { buildPunchWindow, pairPunches, windowForShift } = require('../utils/punchPairing');
 
 const { basisKeyFor, officePolicyShiftFor, addPolicyShiftsToMap } = require('../utils/officePolicyBasis');
-const { pickClosestShift, loadRosterOffIndex, isOffShiftName } = require('../utils/dayShift');
+const { pickClosestShift, loadRosterOffIndex, isOffShiftName, loadDayShiftPicker } = require('../utils/dayShift');
 const router = express.Router();
 router.use(verifyFirebaseToken);
 
@@ -48,6 +48,79 @@ router.use(verifyFirebaseToken);
  * "old version" is purely a denser Flutter-side table layout
  * (old_monthly_report_screen.dart), not a different backend shape.
  */
+
+/**
+ * Text shown in a report cell for one day. P = present, P/2 = half day (also a day worked after a half-day
+ * leave), the leave type's own code (AL, SL...) for a leave day (code/2 for a half-day leave on a day with
+ * no work), A = absent, WO = weekly off, HL = holiday.
+ */
+function dayStatusCode(status, leaveCode, partialFraction) {
+    switch (status) {
+        case 'present': return partialFraction > 0 ? 'P/2' : 'P';
+        case 'half_day': return 'P/2';
+        case 'absent': return leaveCode && partialFraction > 0 ? leaveCode : 'A';
+        case 'weekly_off': return 'WO';
+        case 'holiday': return 'HL';
+        case 'leave': return leaveCode || 'L';
+        default: return status;
+    }
+}
+
+/**
+ * Remarks per employee-day for the reports: the manual-punch remark (typed on the Manual Punch screen)
+ * and the mobile-punch remark (typed in the mobile app while punching) are both shown (joined with " / "
+ * when both exist); the Daily Report's own saved remark is the fallback. Rejected punches are skipped.
+ * Returns Map `${employeeId}|${YYYY-MM-DD}` -> text. A failing query is logged and skipped (never silent):
+ * the old version swallowed column errors, which is how the Vertical Report ended up with an empty Remark.
+ */
+async function loadRemarkIndex(companyId, from, to, employeeId) {
+    const out = new Map();
+    const empSql = employeeId ? ' AND employee_id = ?' : '';
+    const run = async (table, withStatus) => {
+        const params = [companyId, from, to];
+        if (employeeId) params.push(employeeId);
+        const statusSql = withStatus ? " AND (status IS NULL OR status <> 'rejected')" : '';
+        const [rows] = await pool.query(
+            `SELECT employee_id, date, remark FROM ${table} WHERE company_id = ? AND date BETWEEN ? AND ?${empSql}${statusSql} ORDER BY id ASC`,
+            params);
+        return rows;
+    };
+    const add = (rows, bucket) => {
+        for (const r of rows) {
+            const text = String(r.remark || '').trim();
+            if (!text) continue;
+            const k = `${r.employee_id}|${toDateStr(r.date)}`;
+            if (!bucket.has(k)) bucket.set(k, []);
+            if (!bucket.get(k).includes(text)) bucket.get(k).push(text);
+        }
+    };
+    const punchRemarks = new Map();
+    for (const table of ['manual_punches', 'mobile_punches']) {
+        try {
+            let rows;
+            try { rows = await run(table, true); }
+            catch (err) { if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; rows = await run(table, false); }
+            add(rows, punchRemarks);
+        } catch (err) {
+            if (err.code !== 'ER_NO_SUCH_TABLE') console.error(`[reports] remark lookup on ${table} failed:`, err.message);
+        }
+    }
+    for (const [k, list] of punchRemarks) out.set(k, list.join(' / '));
+    try {
+        const params = [companyId, from, to];
+        if (employeeId) params.push(employeeId);
+        const [rows] = await pool.query(
+            `SELECT employee_id, date, remark FROM attendance_remarks WHERE company_id = ? AND date BETWEEN ? AND ?${empSql}`, params);
+        for (const r of rows) {
+            const text = String(r.remark || '').trim();
+            const k = `${r.employee_id}|${toDateStr(r.date)}`;
+            if (text && !out.has(k)) out.set(k, text);
+        }
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') console.error('[reports] remark lookup on attendance_remarks failed:', err.message);
+    }
+    return out;
+}
 
 function toDateStr(d) {
     if (d == null) return null;
@@ -96,16 +169,7 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
          WHERE e.company_id = ? AND e.status = 'active'`,
         [companyId]
     );
-    let remarkRows = [];
-    try {
-        [remarkRows] = await pool.query(
-            'SELECT employee_id, remark FROM attendance_remarks WHERE company_id = ? AND date = ?',
-            [companyId, date]
-        );
-    } catch (err) {
-        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
-    }
-    const remarkByEmp = new Map(remarkRows.map(r => [r.employee_id, r.remark]));
+    const remarkIdx = await loadRemarkIndex(companyId, date, date);
     const overtimeIndex = await loadOvertimeIndex(companyId, date, date);
     const [attendanceRows] = await pool.query(
         'SELECT employee_id, check_in, check_out FROM attendance WHERE company_id = ? AND date = ?',
@@ -152,15 +216,18 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
     );
     const shiftDetails = new Map(shiftDetailRows.map(s => [s.id, s]));
     await addPolicyShiftsToMap(companyId, shiftDetails);
+    const shiftPicker = await loadDayShiftPicker(companyId, date, date, shiftDetails);
 
     const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
 
     const result = employees.map(emp => {
         const attendance = attendanceByEmp.get(emp.id);
+            const { shift: dayShift, key: bk } = shiftPicker.pick(emp, date, attendance);
+            const empShift = shiftOffIndex.byId.get(bk) ?? null;
+            const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+                resolveEmployeeOffDays(bk, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+            const deductBreaks = bk != null ? shiftPolicyIndex.deductBreaksFor(bk) : false;
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
-        const empShift = shiftOffIndex.byId.get(basisKeyFor(emp)) ?? null;
-        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
-            resolveEmployeeOffDays(basisKeyFor(emp), empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
 
         // Task 3: derive this day's punch span/work-minutes from raw
         // punch_events when any exist (going-forward-only per
@@ -168,15 +235,14 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
         // applied per the employee's shift's assigned policy, default
         // OFF (full elapsed span) when no policy is assigned.
         const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, date);
-        const deductBreaks = basisKeyFor(emp) != null ? shiftPolicyIndex.deductBreaksFor(basisKeyFor(emp)) : false;
-        const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks, windowForShift(date, shiftDetails.get(basisKeyFor(emp)) ?? null)) : null;
+        const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks, windowForShift(date, shiftDetails.get(bk) ?? null)) : null;
 
-        const le = computeLateEarly(date, attendance, shiftDetails.get(basisKeyFor(emp)) ?? null, (basisKeyFor(emp) != null && shiftPolicyIndex.has(basisKeyFor(emp)) ? shiftPolicyIndex.graceFor(basisKeyFor(emp)) : null));
+        const le = computeLateEarly(date, attendance, shiftDetails.get(bk) ?? null, (bk != null && shiftPolicyIndex.has(bk) ? shiftPolicyIndex.graceFor(bk) : null));
         const status = classifyDay({
                 isRosterOff: rosterOffIdx.isOff(emp.id, date),
             dateStr: date,
             dayOfWeek,
-            rules: shiftPolicyIndex.rulesFor(basisKeyFor(emp)), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
+            rules: shiftPolicyIndex.rulesFor(bk), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
             isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
             offDaysBitmask,
             altSaturdays,
@@ -189,11 +255,11 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
             workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
         });
 
-        const shiftDetail = shiftDetails.get(basisKeyFor(emp)) ?? null;
+        const shiftDetail = shiftDetails.get(bk) ?? null;
         let lateByMinutes = 0, earlyByMinutes = 0, workMinutes = null;
         if (shiftDetail && attendance && attendance.check_in) {
-            const grace = basisKeyFor(emp) != null && shiftPolicyIndex.has(basisKeyFor(emp))
-                ? shiftPolicyIndex.graceFor(basisKeyFor(emp))
+            const grace = bk != null && shiftPolicyIndex.has(bk)
+                ? shiftPolicyIndex.graceFor(bk)
                 : { lateGraceMinutes: shiftDetail.late_grace_minutes || 0, earlyGraceMinutes: shiftDetail.early_grace_minutes || 0 };
             const actualIn = new Date(attendance.check_in);
             const scheduledStart = new Date(`${date}T${shiftDetail.start_time}`);
@@ -228,11 +294,13 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
             early_by_minutes: earlyByMinutes,
             work_minutes: workMinutes,
             status,
+            status_code: dayStatusCode(status, leaveIdx.codeFor(emp.id, date), leaveIdx.partialFraction(emp.id, date)),
+            leave_code: leaveIdx.codeFor(emp.id, date) || null,
             card_no: emp.card_no || null,
             department: emp.department || null,
             branch_name: emp.branch_name || null,
             overtime_minutes: overtimeIndex.minutesFor(emp.id, date),
-            remark: remarkByEmp.get(emp.id) || null,
+            remark: remarkIdx.get(`${emp.id}|${date}`) || null,
             // Present in daily_report.jpeg but there is no thermal
             // sensor data anywhere in this system - always null, the
             // screen renders them as blank columns to match the layout.
@@ -241,6 +309,15 @@ router.get('/daily', requireAdmin, asyncHandler(async (req, res) => {
         };
     });
     return res.json(result);
+}));
+
+/**
+ * GET /reports/leave-legend - every leave type's report code and full name (AL = Annual Leave ...), printed
+ * under the reports that show leave codes.
+ */
+router.get('/leave-legend', requireAdmin, asyncHandler(async (req, res) => {
+    const idx = await loadLeaveIndex(req.user.companyId, '2000-01-01', '2000-01-01');
+    return res.json(idx.legend());
 }));
 
 /**
@@ -336,29 +413,31 @@ async function computeMonthlySummary(companyId, year, month, context) {
     const [shiftRowsAll] = await pool.query('SELECT id, name, start_time, end_time, ot_allowed, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ?', [companyId]);
     const shiftsById = new Map(shiftRowsAll.map(x => [x.id, x]));
     await addPolicyShiftsToMap(companyId, shiftsById);
+    const shiftPicker = await loadDayShiftPicker(companyId, monthStart, monthEnd, shiftsById);
 
     return employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
 
         const isOnApprovedLeave = (dateStr) => leaveIdx.isFullLeave(emp.id, dateStr);
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
-        const empShift = shiftOffIndex.byId.get(basisKeyFor(emp)) ?? null;
-        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
-            resolveEmployeeOffDays(basisKeyFor(emp), empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
-        const deductBreaks = basisKeyFor(emp) != null ? shiftPolicyIndex.deductBreaksFor(basisKeyFor(emp)) : false;
 
         const dayList = [];
         for (let day = 1; day <= daysInMonth; day++) {
             const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
             const dayOfWeek = new Date(year, month - 1, day).getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
+            const { shift: dayShift, key: bk } = shiftPicker.pick(emp, dateStr, attendance);
+            const empShift = shiftOffIndex.byId.get(bk) ?? null;
+            const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+                resolveEmployeeOffDays(bk, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+            const deductBreaks = bk != null ? shiftPolicyIndex.deductBreaksFor(bk) : false;
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
-            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks, windowForShift(dateStr, shiftsById.get(basisKeyFor(emp)) ?? null)) : null;
-            const le = computeLateEarly(dateStr, attendance, shiftsById.get(basisKeyFor(emp)) ?? null, (basisKeyFor(emp) != null && shiftPolicyIndex.has(basisKeyFor(emp)) ? shiftPolicyIndex.graceFor(basisKeyFor(emp)) : null));
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks, windowForShift(dateStr, shiftsById.get(bk) ?? null)) : null;
+            const le = computeLateEarly(dateStr, attendance, shiftsById.get(bk) ?? null, (bk != null && shiftPolicyIndex.has(bk) ? shiftPolicyIndex.graceFor(bk) : null));
             const status = classifyDay({
                 isRosterOff: rosterOffIdx.isOff(emp.id, dateStr),
                 dateStr, dayOfWeek,
-                rules: shiftPolicyIndex.rulesFor(basisKeyFor(emp)), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
+                rules: shiftPolicyIndex.rulesFor(bk), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask,
                 altSaturdays,
@@ -367,12 +446,14 @@ async function computeMonthlySummary(companyId, year, month, context) {
                 thresholdScale: 1 - leaveIdx.partialFraction(emp.id, dateStr),
                 workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
             });
-            dayList.push({ status });
+            dayList.push({ status, partial: leaveIdx.partialFraction(emp.id, dateStr) });
         }
         // Office Time Policy prefix/suffix-day rules (weekly-off/holiday -> absent).
         applyPrefixSuffixAbsent(dayList, basisKeyFor(emp) != null ? shiftPolicyIndex.prefixSuffixFor(basisKeyFor(emp)) : null);
-        for (const { status } of dayList) {
-            if (status === 'present') { presentDays++; workingDays++; }
+        for (const { status, partial } of dayList) {
+            // A day worked after a half-day leave is shown as P/2 and counted as a half day.
+            if (status === 'present' && partial > 0) { halfDays++; workingDays++; }
+            else if (status === 'present') { presentDays++; workingDays++; }
             else if (status === 'half_day') { halfDays++; workingDays++; }
             else if (status === 'absent') { absentDays++; workingDays++; }
             else if (status === 'leave') { leaveDays++; }
@@ -510,15 +591,12 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
     const [shiftRowsAll] = await pool.query('SELECT id, name, start_time, end_time, ot_allowed, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ?', [companyId]);
     const shiftsById = new Map(shiftRowsAll.map(x => [x.id, x]));
     await addPolicyShiftsToMap(companyId, shiftsById);
+    const shiftPicker = await loadDayShiftPicker(companyId, weekStart, weekEnd, shiftsById);
 
     const result = employees.map(emp => {
         let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, workingDays = 0;
         const isOnApprovedLeave = (dateStr) => leaveIdx.isFullLeave(emp.id, dateStr);
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
-        const empShift = shiftOffIndex.byId.get(basisKeyFor(emp)) ?? null;
-        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
-            resolveEmployeeOffDays(basisKeyFor(emp), empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
-        const deductBreaks = basisKeyFor(emp) != null ? shiftPolicyIndex.deductBreaksFor(basisKeyFor(emp)) : false;
 
         const weekDays = [];
         let weekWorkMinutes = 0, weekLateDays = 0, weekEarlyDays = 0;
@@ -527,13 +605,18 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             const dateStr = toDateStr(cursor);
             const dayOfWeek = cursor.getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`);
+            const { shift: dayShift, key: bk } = shiftPicker.pick(emp, dateStr, attendance);
+            const empShift = shiftOffIndex.byId.get(bk) ?? null;
+            const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+                resolveEmployeeOffDays(bk, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+            const deductBreaks = bk != null ? shiftPolicyIndex.deductBreaksFor(bk) : false;
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
-            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks, windowForShift(dateStr, shiftsById.get(basisKeyFor(emp)) ?? null)) : null;
-            const le = computeLateEarly(dateStr, attendance, shiftsById.get(basisKeyFor(emp)) ?? null, (basisKeyFor(emp) != null && shiftPolicyIndex.has(basisKeyFor(emp)) ? shiftPolicyIndex.graceFor(basisKeyFor(emp)) : null));
+            const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks, windowForShift(dateStr, shiftsById.get(bk) ?? null)) : null;
+            const le = computeLateEarly(dateStr, attendance, shiftsById.get(bk) ?? null, (bk != null && shiftPolicyIndex.has(bk) ? shiftPolicyIndex.graceFor(bk) : null));
             const status = classifyDay({
                 isRosterOff: rosterOffIdx.isOff(emp.id, dateStr),
                 dateStr, dayOfWeek,
-                rules: shiftPolicyIndex.rulesFor(basisKeyFor(emp)), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
+                rules: shiftPolicyIndex.rulesFor(bk), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask,
                 altSaturdays,
@@ -542,7 +625,8 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
                 thresholdScale: 1 - leaveIdx.partialFraction(emp.id, dateStr),
                 workMinutesOverride: punchSpan ? punchSpan.workMinutes ?? undefined : undefined,
             });
-            if (status === 'present') { presentDays++; workingDays++; }
+            if (status === 'present' && leaveIdx.partialFraction(emp.id, dateStr) > 0) { halfDays++; workingDays++; }
+            else if (status === 'present') { presentDays++; workingDays++; }
             else if (status === 'half_day') { halfDays++; workingDays++; }
             else if (status === 'absent') { absentDays++; workingDays++; }
             else if (status === 'leave') { leaveDays++; }
@@ -557,6 +641,11 @@ router.get('/weekly', requireAdmin, asyncHandler(async (req, res) => {
             if (le.earlyMinutes > 0) weekEarlyDays++;
             weekDays.push({
                 date: dateStr, weekday: dayOfWeek, status,
+                status_code: dayStatusCode(status, leaveIdx.codeFor(emp.id, dateStr), leaveIdx.partialFraction(emp.id, dateStr)),
+                leave_code: leaveIdx.codeFor(emp.id, dateStr) || null,
+                shift_name: dayShift ? dayShift.name : null,
+                shift_start: dayShift ? dayShift.start_time : null,
+                shift_end: dayShift ? dayShift.end_time : null,
                 check_in: attendance ? attendance.check_in : null,
                 check_out: realOut ? attendance.check_out : null,
                 work_minutes: dayWork, late_by_minutes: le.lateMinutes, early_by_minutes: le.earlyMinutes,
@@ -1014,6 +1103,7 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
     );
     const shiftDetails = new Map(shiftDetailRows.map(s => [s.id, s]));
     await addPolicyShiftsToMap(companyId, shiftDetails);
+    const shiftPicker = await loadDayShiftPicker(companyId, monthStart, monthEnd, shiftDetails);
     const [defaultShiftRows] = await pool.query(
         'SELECT id, name, start_time, end_time, ot_allowed, late_grace_minutes, early_grace_minutes FROM shifts WHERE company_id = ? AND is_default = TRUE LIMIT 1',
         [companyId]
@@ -1023,11 +1113,6 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
     return employees.map(emp => {
         const isOnApprovedLeave = (dateStr) => leaveIdx.isFullLeave(emp.id, dateStr);
         const employeeGroupId = employeeGroups.get(emp.id) ?? null;
-        const empShift = shiftOffIndex.byId.get(basisKeyFor(emp)) ?? null;
-        const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
-            resolveEmployeeOffDays(basisKeyFor(emp), empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
-        const deductBreaks = basisKeyFor(emp) != null ? shiftPolicyIndex.deductBreaksFor(basisKeyFor(emp)) : false;
-        const employeeOwnShiftDetail = shiftDetails.get(basisKeyFor(emp)) ?? null;
 
         const days = [];
         let totalWorkMinutes = 0, totalOvertimeMinutes = 0;
@@ -1040,15 +1125,21 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
             const day = Number(dateStr.slice(-2)); // calendar day-of-month, still shown in the grid header even for a week-only range
             const dayOfWeek = new Date(`${dateStr}T00:00:00`).getDay();
             const attendance = attendanceByEmpDate.get(`${emp.id}|${dateStr}`) || null;
+            const { shift: dayShift, key: bk } = shiftPicker.pick(emp, dateStr, attendance);
+            const empShift = shiftOffIndex.byId.get(bk) ?? null;
+            const { offDaysBitmask, altSaturdays, isWeeklyOff2 } =
+                resolveEmployeeOffDays(bk, empShift, emp.department, weeklyOffIndex, shiftPolicyOffIndex);
+            const deductBreaks = bk != null ? shiftPolicyIndex.deductBreaksFor(bk) : false;
+            const employeeOwnShiftDetail = dayShift || (bk != null ? shiftDetails.get(bk) : null) || null;
             const dayEvents = punchEventsIndex.forEmployeeDate(emp.id, dateStr);
             const punchSpan = dayEvents.length > 0 ? derivePunchSpan(dayEvents, deductBreaks, windowForShift(dateStr, (employeeOwnShiftDetail ?? defaultShift))) : null;
 
             const resolvedShift = shiftAssignmentIndex.resolve(emp.id, dateStr, employeeOwnShiftDetail, defaultShift);
-            const le = computeLateEarly(dateStr, attendance, resolvedShift, (basisKeyFor(emp) != null && shiftPolicyIndex.has(basisKeyFor(emp)) ? shiftPolicyIndex.graceFor(basisKeyFor(emp)) : null));
+            const le = computeLateEarly(dateStr, attendance, resolvedShift, (bk != null && shiftPolicyIndex.has(bk) ? shiftPolicyIndex.graceFor(bk) : null));
             const status = classifyDay({
                 isRosterOff: rosterOffIdx.isOff(emp.id, dateStr),
                 dateStr, dayOfWeek,
-                rules: shiftPolicyIndex.rulesFor(basisKeyFor(emp)), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
+                rules: shiftPolicyIndex.rulesFor(bk), lateMinutes: le.lateMinutes, earlyMinutes: le.earlyMinutes,
                 isHoliday: (d) => holidayIndex.isHoliday(d, employeeGroupId),
                 offDaysBitmask, altSaturdays, isWeeklyOff2,
                 isOnApprovedLeave, attendance, fullDayHours, halfDayMinHours,
@@ -1058,8 +1149,8 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
 
             let lateByMinutes = 0, earlyByMinutes = 0, workMinutes = null;
             if (resolvedShift && attendance && attendance.check_in) {
-                const grace = basisKeyFor(emp) != null && shiftPolicyIndex.has(basisKeyFor(emp))
-                    ? shiftPolicyIndex.graceFor(basisKeyFor(emp))
+                const grace = bk != null && shiftPolicyIndex.has(bk)
+                    ? shiftPolicyIndex.graceFor(bk)
                     : { lateGraceMinutes: resolvedShift.late_grace_minutes || 0, earlyGraceMinutes: resolvedShift.early_grace_minutes || 0 };
                 const actualIn = new Date(attendance.check_in);
                 const scheduledStart = new Date(`${dateStr}T${resolvedShift.start_time}`);
@@ -1077,8 +1168,9 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
             }
             const overtimeMinutes = overtimeIndex.minutesFor(emp.id, dateStr);
 
-            if (status === 'present' || status === 'half_day') presentDays += status === 'half_day' ? 0.5 : 1;
-            else if (status === 'absent') absentDays++;
+            if (status === 'present' || status === 'half_day') {
+                presentDays += (status === 'half_day' || leaveIdx.partialFraction(emp.id, dateStr) > 0) ? 0.5 : 1;
+            } else if (status === 'absent') absentDays++;
             else if (status === 'weekly_off') weeklyOffDays++;
             else if (status === 'holiday') holidayDays++;
             else if (status === 'leave') leaveDays++;
@@ -1102,6 +1194,10 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
                 early_by_minutes: earlyByMinutes,
                 overtime_minutes: overtimeMinutes,
                 shift_code: shiftCode,
+                shift_start: resolvedShift ? resolvedShift.start_time : null,
+                shift_end: resolvedShift ? resolvedShift.end_time : null,
+                status_code: dayStatusCode(status, leaveIdx.codeFor(emp.id, dateStr), leaveIdx.partialFraction(emp.id, dateStr)),
+                leave_code: leaveIdx.codeFor(emp.id, dateStr) || null,
             });
         }
 
@@ -1172,43 +1268,28 @@ router.get('/employee-month', requireAdmin, asyncHandler(async (req, res) => {
     let companyName = null;
     try { const [[c]] = await pool.query('SELECT name FROM companies WHERE id = ?', [companyId]); companyName = c ? c.name : null; } catch (_) {}
 
-    const remarkByDate = new Map();
-    const put = (d, text) => { const k = toDateStr(d); const t = String(text || '').trim(); if (t && !remarkByDate.has(k)) remarkByDate.set(k, t); };
-    try {
-        const [r] = await pool.query(
-            "SELECT date, remark FROM manual_punches WHERE company_id = ? AND employee_id = ? AND date BETWEEN ? AND ? AND (status IS NULL OR status <> 'rejected') ORDER BY id ASC",
-            [companyId, employeeId, from, to]);
-        r.forEach((x) => put(x.date, x.remark));
-    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err; }
-    try {
-        const [r] = await pool.query(
-            "SELECT date, remark FROM mobile_punches WHERE company_id = ? AND employee_id = ? AND date BETWEEN ? AND ? AND (status IS NULL OR status <> 'rejected') ORDER BY id ASC",
-            [companyId, employeeId, from, to]);
-        r.forEach((x) => put(x.date, x.remark));
-    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err; }
-    try {
-        const [r] = await pool.query('SELECT date, remark FROM attendance_remarks WHERE company_id = ? AND employee_id = ? AND date BETWEEN ? AND ?', [companyId, employeeId, from, to]);
-        r.forEach((x) => put(x.date, x.remark));
-    } catch (err) { if (err.code !== 'ER_NO_SUCH_TABLE') throw err; }
+    const remarkIdx = await loadRemarkIndex(companyId, from, to, employeeId);
+    const remarkByDate = { get: (d) => remarkIdx.get(`${employeeId}|${d}`) };
 
-    const CODE = { present: 'P', half_day: 'HD', absent: 'A', weekly_off: 'WO', holiday: 'HL', leave: 'L' };
-    const hm = (v) => { if (!v) return null; const d = v instanceof Date ? v : new Date(v); if (isNaN(d)) return null; return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+        const hm = (v) => { if (!v) return null; const d = v instanceof Date ? v : new Date(v); if (isNaN(d)) return null; return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
     let wo = 0, hl = 0, paidDays = 0, present = 0, half = 0, absent = 0, leave = 0;
     const days = m.days.map((d) => {
-        const code = CODE[d.status] || d.status;
+        const code = d.status_code || d.status;
         const isP = d.status === 'present', isH = d.status === 'half_day';
-        if (isP) { present += 1; paidDays += 1; }
+        const halfWorked = isP && d.status_code === 'P/2'; // worked the other half of a half-day leave
+        if (halfWorked) { present += 0.5; leave += 0.5; paidDays += 1; }
+        else if (isP) { present += 1; paidDays += 1; }
         else if (isH) { half += 1; present += 0.5; paidDays += 0.5; }
         else if (d.status === 'weekly_off') { wo += 1; paidDays += 1; }
         else if (d.status === 'holiday') { hl += 1; paidDays += 1; }
         else if (d.status === 'leave') { leave += 1; paidDays += 1; }
         else if (d.status === 'absent') absent += 1;
         return {
-            date: d.date, day: d.day, shift: d.shift_code, status: code,
+            date: d.date, day: d.day, shift: d.shift_code, status: code, leave_code: d.leave_code || '',
             arrived: hm(d.check_in), departed: d.check_out && d.work_minutes != null ? hm(d.check_out) : null,
             work_minutes: d.work_minutes || 0, late_minutes: d.late_by_minutes || 0, early_minutes: d.early_by_minutes || 0,
             overtime_minutes: d.overtime_minutes || 0,
-            present: isP ? 1 : isH ? 0.5 : 0, absent: d.status === 'absent' ? 1 : 0,
+            present: halfWorked ? 0.5 : isP ? 1 : isH ? 0.5 : 0, absent: d.status === 'absent' ? 1 : 0,
             paid_leave: d.status === 'leave' ? 1 : 0, unpaid_leave: 0,
             remark: remarkByDate.get(d.date) || '',
         };
@@ -1221,6 +1302,31 @@ router.get('/employee-month', requireAdmin, asyncHandler(async (req, res) => {
         days,
     });
 }));
+
+/**
+ * Branch / department / shift / designation per employee - the muster screens sort, filter and export by
+ * these. Every join is optional so a missing table/column never breaks the grid.
+ * Returns Map employee id -> row.
+ */
+async function loadEmployeeExtras(companyId) {
+    const extras = new Map();
+    try {
+        const [rows] = await pool.query(
+            `SELECT e.id, e.department, e.designation, b.name AS branch_name, d.name AS designation_name, s.name AS shift_name
+             FROM employees e
+             LEFT JOIN branches b ON b.id = e.branch_id
+             LEFT JOIN designations d ON d.id = e.designation_id
+             LEFT JOIN shifts s ON s.id = e.shift_id
+             WHERE e.company_id = ?`, [companyId]);
+        for (const x of rows) extras.set(x.id, x);
+    } catch (_) {
+        try {
+            const [rows] = await pool.query('SELECT id, department, designation FROM employees WHERE company_id = ?', [companyId]);
+            for (const x of rows) extras.set(x.id, x);
+        } catch (_2) { /* leave the extra fields empty */ }
+    }
+    return extras;
+}
 
 /**
  * GET /reports/monthly-muster?employee_id=&year=&month=
@@ -1264,12 +1370,20 @@ router.get('/monthly-muster-all', requireAdmin, asyncHandler(async (req, res) =>
     const monthEnd = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
     const context = await loadCompanyContext(req.user.companyId);
     const result = await computeMuster(req.user.companyId, monthStart, monthEnd, context);
-    return res.json(result.map(r => ({
-        employee_id: r.employee_id,
-        employee_name: r.employee_name,
-        emp_code: r.emp_code,
-        days: r.days,
-    })));
+    const extras = await loadEmployeeExtras(req.user.companyId);
+    return res.json(result.map(r => {
+        const x = extras.get(r.employee_id) || {};
+        return {
+            employee_id: r.employee_id,
+            employee_name: r.employee_name,
+            emp_code: r.emp_code,
+            branch: x.branch_name || '',
+            department: x.department || '',
+            shift: x.shift_name || '',
+            designation: x.designation_name || x.designation || '',
+            days: r.days,
+        };
+    }));
 }));
 
 /**
@@ -1295,24 +1409,7 @@ router.get('/weekly-muster', requireAdmin, asyncHandler(async (req, res) => {
     const context = await loadCompanyContext(req.user.companyId);
     const result = await computeMuster(req.user.companyId, weekStart, weekEnd, context);
 
-    // Branch / department / shift / designation per employee - the Weekly muster screen sorts
-    // and exports by these. Every join is optional so a missing table/column never breaks the grid.
-    const extras = new Map();
-    try {
-        const [rows] = await pool.query(
-            `SELECT e.id, e.department, e.designation, b.name AS branch_name, d.name AS designation_name, s.name AS shift_name
-             FROM employees e
-             LEFT JOIN branches b ON b.id = e.branch_id
-             LEFT JOIN designations d ON d.id = e.designation_id
-             LEFT JOIN shifts s ON s.id = e.shift_id
-             WHERE e.company_id = ?`, [req.user.companyId]);
-        for (const x of rows) extras.set(x.id, x);
-    } catch (_) {
-        try {
-            const [rows] = await pool.query('SELECT id, department, designation FROM employees WHERE company_id = ?', [req.user.companyId]);
-            for (const x of rows) extras.set(x.id, x);
-        } catch (_2) { /* leave the extra fields empty */ }
-    }
+    const extras = await loadEmployeeExtras(req.user.companyId);
     return res.json(result.map(r => {
         const x = extras.get(r.employee_id) || {};
         return {
@@ -1365,6 +1462,7 @@ router.get('/all-in-out', requireAdmin, asyncHandler(async (req, res) => {
     const shiftsById = new Map(shiftRows.map(x => [x.id, x]));
     await addPolicyShiftsToMap(companyId, shiftsById);
     const defaultShift = shiftRows.find(x => x.is_default) || null;
+    const shiftPicker = await loadDayShiftPicker(companyId, from, to, shiftsById);
     let maxOtByShift = new Map();
     try {
         const [pr] = await pool.query(
@@ -1413,7 +1511,7 @@ router.get('/all-in-out', requireAdmin, asyncHandler(async (req, res) => {
     for (const [key, timeMap] of punchesByKey) {
         const [empIdStr, date] = key.split('|');
         const emp = empById.get(Number(empIdStr));
-        const shift = (basisKeyFor(emp) != null ? shiftsById.get(basisKeyFor(emp)) : null) || defaultShift;
+        const shift = shiftPicker.pick(emp, date, { check_in: [...timeMap.keys()].sort()[0] }).shift || defaultShift;
 
         const window = buildPunchWindow(date, shift, { otAllowed: !!(shift && shift.ot_allowed), maxOtMinutes: shift ? maxOtByShift.get(shift.id) : null });
         const paired = pairPunches([...timeMap.keys()], window);

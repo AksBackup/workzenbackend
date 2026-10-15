@@ -22,6 +22,17 @@ function addDays(dateStr, n) {
     d.setUTCDate(d.getUTCDate() + n);
     return d.toISOString().slice(0, 10);
 }
+/** Short code for a leave type: the saved code, else the name itself when <= 3 chars, else its word initials. */
+function leaveCodeFor(name, code) {
+    const c = String(code || '').trim();
+    if (c) return c.toUpperCase();
+    const n = String(name || '').trim();
+    if (!n) return 'L';
+    if (n.length <= 3) return n.toUpperCase();
+    const words = n.split(/\s+/).filter(Boolean);
+    if (words.length > 1) return words.map((w) => w[0]).join('').slice(0, 4).toUpperCase();
+    return n.slice(0, 2).toUpperCase();
+}
 function r2(n) { return Math.round(n * 100) / 100; }
 
 async function loadLeaveIndex(companyId, fromStr, toStr, opts = {}) {
@@ -34,18 +45,29 @@ async function loadLeaveIndex(companyId, fromStr, toStr, opts = {}) {
         entries.get(k).push(e);
     };
 
+    // leave type id -> { name, code } so reports can print the leave's own code (AL, SL...) and its full name.
+    const typeInfo = new Map();
+    try {
+        const [types] = await pool.query('SELECT id, name, code FROM leave_types WHERE company_id = ?', [companyId]);
+        for (const t of types) typeInfo.set(Number(t.id), { name: t.name, code: leaveCodeFor(t.name, t.code) });
+    } catch (err) {
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+        const [types] = await pool.query('SELECT id, name FROM leave_types WHERE company_id = ?', [companyId]);
+        for (const t of types) typeInfo.set(Number(t.id), { name: t.name, code: leaveCodeFor(t.name, null) });
+    }
+
     let haveDayTable = true;
     try {
         const params = [companyId, fromStr, toStr, statuses];
         if (opts.employeeId) params.push(opts.employeeId);
         const [rows] = await pool.query(
-            `SELECT d.employee_id, d.leave_date, d.fraction, d.paid_fraction, d.kind
+            `SELECT d.employee_id, d.leave_date, d.leave_type_id, d.fraction, d.paid_fraction, d.kind
              FROM leave_application_days d JOIN leave_applications a ON a.id = d.application_id
              WHERE d.company_id = ? AND d.leave_date BETWEEN ? AND ? AND a.status IN (?)${empFilter.replace('employee_id', 'd.employee_id')}`,
             params);
         for (const r of rows) {
             push(r.employee_id, dateKey(r.leave_date), {
-                fraction: Number(r.fraction), paidFraction: Number(r.paid_fraction), kind: r.kind || 'working',
+                fraction: Number(r.fraction), paidFraction: Number(r.paid_fraction), kind: r.kind || 'working', leaveTypeId: Number(r.leave_type_id),
             });
         }
     } catch (err) {
@@ -56,7 +78,7 @@ async function loadLeaveIndex(companyId, fromStr, toStr, opts = {}) {
     // Legacy applications (no day rows): old calendar-range rule.
     const legacyParams = [companyId, statuses, toStr, fromStr];
     if (opts.employeeId) legacyParams.push(opts.employeeId);
-    const legacySql = `SELECT a.employee_id, a.from_date, a.to_date, a.days_count, a.paid_days FROM leave_applications a
+    const legacySql = `SELECT a.employee_id, a.leave_type_id, a.from_date, a.to_date, a.days_count, a.paid_days FROM leave_applications a
         WHERE a.company_id = ? AND a.status IN (?) AND a.from_date <= ? AND a.to_date >= ?
         ${haveDayTable ? 'AND NOT EXISTS (SELECT 1 FROM leave_application_days d WHERE d.application_id = a.id)' : ''}
         ${opts.employeeId ? 'AND a.employee_id = ?' : ''}`;
@@ -67,12 +89,12 @@ async function loadLeaveIndex(companyId, fromStr, toStr, opts = {}) {
         const paidDays = l.paid_days !== null && l.paid_days !== undefined ? Number(l.paid_days) : daysCount;
         if (from === to && daysCount > 0 && daysCount < 1) {
             // old "0.5 days" application on one date = a partial day
-            push(l.employee_id, from, { fraction: daysCount, paidFraction: Math.min(daysCount, paidDays), kind: 'working' });
+            push(l.employee_id, from, { fraction: daysCount, paidFraction: Math.min(daysCount, paidDays), kind: 'working', leaveTypeId: Number(l.leave_type_id) });
             continue;
         }
         for (let d = from, idx = 0; d <= to; d = addDays(d, 1), idx++) {
             if (d < fromStr || d > toStr) continue;
-            push(l.employee_id, d, { fraction: 1, paidFraction: r2(Math.max(0, Math.min(1, paidDays - idx))), kind: 'working' });
+            push(l.employee_id, d, { fraction: 1, paidFraction: r2(Math.max(0, Math.min(1, paidDays - idx))), kind: 'working', leaveTypeId: Number(l.leave_type_id) });
         }
     }
 
@@ -86,7 +108,9 @@ async function loadLeaveIndex(companyId, fromStr, toStr, opts = {}) {
             const fraction = Math.min(1, r2(list.reduce((a, e) => a + e.fraction, 0)));
             const paidFraction = Math.min(fraction, r2(list.reduce((a, e) => a + e.paidFraction, 0)));
             const kindEntry = list.find(e => e.kind !== 'working') || list[0];
-            out = { fraction, paidFraction, kind: kindEntry.kind };
+            const main = list.reduce((a, e) => (e.fraction > a.fraction ? e : a), list[0]);
+            const info = typeInfo.get(main.leaveTypeId) || { name: 'Leave', code: 'L' };
+            out = { fraction, paidFraction, kind: kindEntry.kind, leaveTypeId: main.leaveTypeId, code: info.code, typeName: info.name };
         }
         merged.set(k, out);
         return out;
@@ -94,8 +118,17 @@ async function loadLeaveIndex(companyId, fromStr, toStr, opts = {}) {
     return {
         get,
         isFullLeave: (emp, date) => { const e = get(emp, date); return !!e && e.fraction >= 0.999; },
+        /** 'AL' for a whole leave day, 'AL/2' for a half day ('AL/4' style is shown as the fraction). '' when none. */
+        codeFor: (emp, date) => {
+            const e = get(emp, date);
+            if (!e) return '';
+            if (e.fraction >= 0.999) return e.code;
+            return e.fraction === 0.5 ? `${e.code}/2` : `${e.code}/${r2(e.fraction)}`;
+        },
+        /** Leave types of the company, for the report legend (code = full name). */
+        legend: () => [...typeInfo.values()].map((t) => ({ code: t.code, name: t.name })),
         partialFraction: (emp, date) => { const e = get(emp, date); return e && e.fraction < 0.999 ? e.fraction : 0; },
     };
 }
 
-module.exports = { loadLeaveIndex, dateKey, addDays };
+module.exports = { loadLeaveIndex, leaveCodeFor, dateKey, addDays };

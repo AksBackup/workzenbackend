@@ -571,6 +571,88 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 /**
+ * POST /employees/device-sync   (admin)
+ * body: { items: [{ emp_code, card_no?, device_password?, fingers?: [{ index, data }] }] }
+ *
+ * Saves what was read from a device while copying users (Device Users > Copy to device) onto the matching
+ * employee (emp_code = the device User ID): card number, device password and fingerprint templates, so
+ * Employee Details shows them. Only the fields present in an item are touched; a fingers list replaces
+ * the stored templates of just those finger positions. Unknown emp_codes are counted, not an error.
+ */
+router.post('/device-sync', requireAdmin, asyncHandler(async (req, res) => {
+    const items = Array.isArray(req.body && req.body.items) ? req.body.items : null;
+    if (!items) return res.status(400).json({ error: 'items (array) required' });
+    if (items.length > 2000) return res.status(400).json({ error: 'At most 2000 users per call' });
+    const companyId = req.user.companyId;
+    let updated = 0, unknown = 0, fingerprints = 0;
+    for (const it of items) {
+        const code = String(it && it.emp_code != null ? it.emp_code : '').trim();
+        if (!code) continue;
+        // device User IDs compare numerically ("007" and "7" are one user)
+        const [rows] = await pool.query(
+            'SELECT id FROM employees WHERE company_id = ? AND (emp_code = ? OR (emp_code REGEXP \'^[0-9]+$\' AND ? REGEXP \'^[0-9]+$\' AND CAST(emp_code AS UNSIGNED) = CAST(? AS UNSIGNED))) LIMIT 1',
+            [companyId, code, code, code]);
+        if (!rows.length) { unknown++; continue; }
+        const id = rows[0].id;
+        const sets = [], params = [];
+        if (it.card_no !== undefined && it.card_no !== null && String(it.card_no).trim() !== '' && String(it.card_no) !== '0') {
+            sets.push('card_no = ?'); params.push(String(it.card_no).trim().slice(0, 30));
+        }
+        if (it.device_password !== undefined && it.device_password !== null && String(it.device_password) !== '') {
+            sets.push('device_password = ?'); params.push(String(it.device_password).slice(0, 20));
+        }
+        if (sets.length) {
+            try {
+                await pool.query(`UPDATE employees SET ${sets.join(', ')} WHERE id = ?`, [...params, id]);
+            } catch (err) {
+                if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; // migration_053 not applied: skip the password
+                const onlyCard = sets.findIndex((x) => x.startsWith('card_no'));
+                if (onlyCard >= 0) await pool.query('UPDATE employees SET card_no = ? WHERE id = ?', [params[onlyCard], id]);
+            }
+        }
+        if (Array.isArray(it.fingers)) {
+            for (const f of it.fingers) {
+                const idx = Number(f && f.index);
+                const data = f && f.data != null ? String(f.data) : '';
+                if (!Number.isInteger(idx) || idx < 0 || idx > 9 || !data) continue;
+                try {
+                    await pool.query(
+                        `INSERT INTO employee_fingerprints (employee_id, finger_index, template) VALUES (?, ?, ?)
+                         ON DUPLICATE KEY UPDATE template = VALUES(template)`, [id, idx, data]);
+                    fingerprints++;
+                } catch (err) {
+                    if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+                }
+            }
+        }
+        updated++;
+    }
+    return res.json({ updated, unknown, fingerprints });
+}));
+
+/**
+ * GET /employees/:id/device-data   (admin) - what Employee Details shows: card no., device password and
+ * the enrolled finger positions (the templates themselves are never sent to the screen).
+ */
+router.get('/:id/device-data', requireAdmin, asyncHandler(async (req, res) => {
+    const [rows] = await pool.query('SELECT * FROM employees WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
+    if (!rows.length) return res.status(404).json({ error: 'Employee not found' });
+    let fingers = [];
+    try {
+        const [f] = await pool.query(
+            'SELECT finger_index, updated_at FROM employee_fingerprints WHERE employee_id = ? ORDER BY finger_index', [req.params.id]);
+        fingers = f.map((x) => ({ index: x.finger_index, updated_at: x.updated_at }));
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    return res.json({
+        card_no: rows[0].card_no || null,
+        device_password: rows[0].device_password || null,
+        fingers,
+    });
+}));
+
+/**
  * PATCH /employees/:id/device-push
  * Called by the Flutter app immediately after ZkWriteService.pushUser()
  * (and, when the emp_code changed, after the old device slot has been

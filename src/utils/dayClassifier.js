@@ -33,6 +33,7 @@ function hasRealCheckout(attendance) {
  * thresholds { absentMinutes, halfDayMinutes, halfDayIfLateMinutes,
  * halfDayIfEarlyMinutes }. When a threshold is null/undefined we fall back to
  * the company-wide full_day_hours / half_day_min_hours from office_time_policy.
+ * `rules.halfDayAs` ('half' | 'full' | 'absent', migration_054) says what an attendance half day counts as.
  * `lateMinutes` / `earlyMinutes` are the (post-grace) late-in / early-out
  * minutes for that day, used only for the "half day if late/early by X" rules.
  */
@@ -83,6 +84,13 @@ function classifyDay({
     if (status === 'present' && rules) {
         if (rules.halfDayIfLateMinutes != null && lateMinutes > Number(rules.halfDayIfLateMinutes)) status = 'half_day';
         else if (rules.halfDayIfEarlyMinutes != null && earlyMinutes > Number(rules.halfDayIfEarlyMinutes)) status = 'half_day';
+    }
+    // Office Time Policy "A half day counts as": Half day (default) / Full day / Absent. Only for a real
+    // attendance half day - a day with a part-day leave (thresholdScale < 1) is leave + the worked part,
+    // so it is left alone.
+    if (status === 'half_day' && thresholdScale >= 1 && rules && rules.halfDayAs) {
+        if (rules.halfDayAs === 'full') status = 'present';
+        else if (rules.halfDayAs === 'absent') status = 'absent';
     }
     return status;
 }

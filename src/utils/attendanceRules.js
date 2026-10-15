@@ -229,14 +229,25 @@ module.exports = {
 
 /** Rows of the policy-rule query, one per policy (plus one per assigned shift). Missing migration_049 columns -> the caller just sees no policies. */
 async function loadPolicyRuleRows(companyId, columns) {
-    const [rows] = await pool.query(
-        `SELECT p.id AS policy_id, ops.shift_id, ${columns}
-         FROM office_time_policies p
-         LEFT JOIN office_time_policy_shifts ops ON ops.policy_id = p.id AND ops.company_id = p.company_id
-         WHERE p.company_id = ?`,
-        [companyId]
-    );
-    return rows;
+    const run = async (cols) => {
+        const [rows] = await pool.query(
+            `SELECT p.id AS policy_id, ops.shift_id, ${cols}
+             FROM office_time_policies p
+             LEFT JOIN office_time_policy_shifts ops ON ops.policy_id = p.id AND ops.company_id = p.company_id
+             WHERE p.company_id = ?`,
+            [companyId]
+        );
+        return rows;
+    };
+    try {
+        return await run(columns);
+    } catch (err) {
+        // migration_054 (half_day_counts_as) not applied yet: same rules without it ('half' everywhere).
+        if (err.code === 'ER_BAD_FIELD_ERROR' && columns.includes('half_day_counts_as')) {
+            return run(columns.replace(/,?\s*p\.half_day_counts_as/, ''));
+        }
+        throw err;
+    }
 }
 
 /** Map keyed by shift id AND by 'p:<policyId>' so both kinds of basis resolve through the same index. */
@@ -334,7 +345,8 @@ async function loadShiftPolicyIndex(companyId) {
                 p.mark_absent_prefix_day, p.mark_absent_suffix_day, p.mark_absent_both_prefix_suffix_day,
                 p.absent_if_duration_less_than_minutes, p.half_day_if_duration_less_than_minutes,
                 p.half_day_if_late_by_enabled, p.half_day_if_late_by_minutes,
-                p.half_day_if_early_going_by_enabled, p.half_day_if_early_going_by_minutes`);
+                p.half_day_if_early_going_by_enabled, p.half_day_if_early_going_by_minutes,
+                p.half_day_counts_as`);
     const byShiftId = indexByBasisKey(rows);
     return {
         has(shiftId) {
@@ -361,6 +373,7 @@ async function loadShiftPolicyIndex(companyId) {
                 halfDayMinutes: r.half_day_if_duration_less_than_minutes,
                 halfDayIfLateMinutes: r.half_day_if_late_by_enabled ? r.half_day_if_late_by_minutes : null,
                 halfDayIfEarlyMinutes: r.half_day_if_early_going_by_enabled ? r.half_day_if_early_going_by_minutes : null,
+                halfDayAs: r.half_day_counts_as || 'half', // 'half' | 'full' | 'absent' (migration_054)
             };
         },
         graceFor(shiftId) {

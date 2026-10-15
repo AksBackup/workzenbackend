@@ -1,5 +1,5 @@
 const pool = require('../db');
-const { loadOfficePolicyShifts, isOfficePolicyEmployee } = require('./officePolicyBasis');
+const { loadOfficePolicyShifts, isOfficePolicyEmployee, basisKeyFor, addPolicyShiftsToMap } = require('./officePolicyBasis');
 
 /**
  * Per-day shift resolution shared by payroll (and mirrored in reports.js):
@@ -72,6 +72,48 @@ async function loadDayShiftResolver(companyId, fromStr, toStr, shiftsById) {
     };
 }
 
+/**
+ * Per-day shift for the REPORTS (daily, weekly, monthly, muster, all in/out), the same rule payroll uses:
+ * roster row > no-shift policy > multi-shift employee (shift whose start is closest to that day's FIRST
+ * punch: punching around shift B's start => shift B for that day) > primary shift.
+ * pick(emp, dateStr, attendance) -> { shift, key }. `key` is what every shift-keyed lookup (policy rules,
+ * grace, weekly off, deduct breaks, OT) is indexed by, so late/early/weekly off/working hours all follow
+ * the shift the day was matched to. `shift` is null only when nothing resolves.
+ */
+async function loadDayShiftPicker(companyId, fromStr, toStr, shiftsById) {
+    const resolver = await loadDayShiftResolver(companyId, fromStr, toStr, shiftsById);
+    return {
+        pick(emp, dateStr, attendance) {
+            const s = resolver.resolve(emp, dateStr, attendance && attendance.check_in);
+            const key = s && s.id != null ? s.id : basisKeyFor(emp);
+            const shift = s || (key != null ? shiftsById.get(key) || null : null);
+            return { shift, key };
+        },
+    };
+}
+
+/**
+ * The shift one employee is on for one date (roster > policy > multi-shift closest to the day's first punch
+ * > primary shift) - used by overtime so an employee punching in shift B is measured against shift B's end.
+ * Returns the shift row ({ id, name, start_time, end_time, ot_allowed }) or null. Never throws.
+ */
+async function resolveShiftForDay(companyId, employeeId, dateStr) {
+    try {
+        const [emps] = await pool.query(
+            'SELECT id, shift_id, work_mode, office_time_policy_id FROM employees WHERE id = ? AND company_id = ?', [employeeId, companyId]);
+        if (!emps.length) return null;
+        const [att] = await pool.query('SELECT check_in FROM attendance WHERE employee_id = ? AND date = ? LIMIT 1', [employeeId, dateStr]);
+        const [shiftRows] = await pool.query('SELECT id, name, start_time, end_time, ot_allowed FROM shifts WHERE company_id = ?', [companyId]);
+        const byId = new Map(shiftRows.map((x) => [x.id, x]));
+        await addPolicyShiftsToMap(companyId, byId);
+        const resolver = await loadDayShiftResolver(companyId, dateStr, dateStr, byId);
+        return resolver.resolve(emps[0], dateStr, att.length ? att[0].check_in : null);
+    } catch (err) {
+        console.error('[dayShift] resolveShiftForDay failed:', err.message);
+        return null;
+    }
+}
+
 /** A roster entry whose shift is named OFF (any case) means Week Off / Holiday for that day. */
 const isOffShiftName = (name) => String(name || '').trim().toUpperCase() === 'OFF';
 
@@ -100,4 +142,4 @@ async function loadRosterOffIndex(companyId, fromStr, toStr) {
     };
 }
 
-module.exports = { loadDayShiftResolver, pickClosestShift, isOffShiftName, loadRosterOffIndex };
+module.exports = { resolveShiftForDay, loadDayShiftPicker, loadDayShiftResolver, pickClosestShift, isOffShiftName, loadRosterOffIndex };

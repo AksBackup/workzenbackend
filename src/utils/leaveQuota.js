@@ -98,8 +98,11 @@ async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year,
     if (pool_ > 0) {
         const before = month === 1 ? 0 : await usedBetween(`${year}-01-01`, addDay(monthStart, -1));
         const usedMonth = await usedBetween(monthStart, monthEnd);
+        const poolCredits = await loadMonthCredits(employeeId, leaveTypeId, year);
+        let creditSum = 0;
+        for (const [m, amt] of poolCredits) if (m <= month) creditSum += amt;
         return {
-            quota: Math.max(0, Math.round((pool_ - before) * 100) / 100),
+            quota: Math.max(0, Math.round((pool_ + creditSum - before) * 100) / 100),
             used: Math.round(usedMonth * 100) / 100,
             yearly: true,
         };
@@ -109,19 +112,80 @@ async function computeMonthlyPaidUsage(companyId, employeeId, leaveTypeId, year,
         'SELECT allocated FROM leave_balances WHERE employee_id = ? AND leave_type_id = ? AND year = ?',
         [employeeId, leaveTypeId, year]
     );
-    let quota;
+    let carryForward = false;
+    let baseQuota;
+    const [typeRows] = await pool.query(
+        'SELECT monthly_quota, carry_forward FROM leave_types WHERE id = ? AND company_id = ?',
+        [leaveTypeId, companyId]
+    );
+    carryForward = typeRows.length > 0 && !!typeRows[0].carry_forward;
     if (balanceRows.length > 0) {
-        quota = Number(balanceRows[0].allocated) || 0;
+        baseQuota = Number(balanceRows[0].allocated) || 0;
     } else {
-        const [typeRows] = await pool.query(
-            'SELECT monthly_quota FROM leave_types WHERE id = ? AND company_id = ?',
-            [leaveTypeId, companyId]
-        );
-        quota = typeRows.length > 0 ? parseFloat(typeRows[0].monthly_quota) || 0 : 0;
+        baseQuota = typeRows.length > 0 ? parseFloat(typeRows[0].monthly_quota) || 0 : 0;
     }
-    const used = await usedBetween(monthStart, monthEnd);
 
-    return { quota, used: Math.round(used * 100) / 100 };
+    // Month-wise credit (Leave Opening Entry, month chosen): a one-time addition for THIS month only.
+    const credits = await loadMonthCredits(employeeId, leaveTypeId, year);
+    const credit = credits.get(month) || 0;
+
+    // Carry forward (only when the leave type has it ticked): unused leave of earlier months rolls in.
+    let carry = 0;
+    if (carryForward) {
+        let startMonth = 1;
+        try {
+            const [emp] = await pool.query('SELECT doj FROM employees WHERE id = ?', [employeeId]);
+            const doj = emp.length && emp[0].doj ? new Date(emp[0].doj) : null;
+            if (doj && !Number.isNaN(doj.getTime())) {
+                if (doj.getUTCFullYear() > year) startMonth = 13; // joined later: nothing to carry
+                else if (doj.getUTCFullYear() === year) startMonth = doj.getUTCMonth() + 1;
+            }
+        } catch (err) {
+            if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+        }
+        carry = await carryInto({ employeeId, year, month, baseQuota, credits, usedBetween, startMonth });
+    }
+
+    const used = await usedBetween(monthStart, monthEnd);
+    const quota = Math.round((baseQuota + credit + carry) * 100) / 100;
+    return { quota, used: Math.round(used * 100) / 100, credit, carry };
 }
 
-module.exports = { computeMonthlyPaidUsage };
+/** { month -> amount } of one-time month credits for (employee, type, year). Missing table = none. */
+async function loadMonthCredits(employeeId, leaveTypeId, year) {
+    const out = new Map();
+    try {
+        const [rows] = await pool.query(
+            'SELECT month, amount FROM leave_month_credits WHERE employee_id = ? AND leave_type_id = ? AND year = ?',
+            [employeeId, leaveTypeId, year]
+        );
+        for (const r of rows) out.set(Number(r.month), Number(r.amount) || 0);
+    } catch (err) {
+        if (err.code !== 'ER_NO_SUCH_TABLE') throw err;
+    }
+    return out;
+}
+
+function monthBounds(year, month) {
+    const last = new Date(year, month, 0).getDate();
+    const mm = String(month).padStart(2, '0');
+    return [`${year}-${mm}-01`, `${year}-${mm}-${String(last).padStart(2, '0')}`];
+}
+
+/**
+ * Unused paid leave carried into (year, month): walk the months of THIS year before it (starting at the
+ * employee's joining month when they joined this year), each month's closing balance (quota + credit +
+ * carry in - used, never below 0) becomes the next month's carry in. Carry stays inside the calendar year:
+ * what is unused at the end of December lapses, so a new year starts from the plain quota.
+ */
+async function carryInto({ employeeId, year, month, baseQuota, credits, usedBetween, startMonth }) {
+    let carry = 0;
+    for (let m = Math.max(1, startMonth); m < month; m++) {
+        const [from, to] = monthBounds(year, m);
+        const used = await usedBetween(from, to);
+        carry = Math.max(0, baseQuota + (credits.get(m) || 0) + carry - used);
+    }
+    return Math.round(carry * 100) / 100;
+}
+
+module.exports = { computeMonthlyPaidUsage, loadMonthCredits };

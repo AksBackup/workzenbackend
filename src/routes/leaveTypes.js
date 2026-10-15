@@ -73,6 +73,10 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [req.user.companyId, name, yearly_quota || 0, isPaid ? (monthly_quota || 0) : 0, !!carry_forward, isPaid, countHolidays, countWeeklyOffs]
     );
+    if (req.body.code !== undefined && String(req.body.code).trim()) {
+        try { await pool.query('UPDATE leave_types SET code = ? WHERE id = ?', [String(req.body.code).trim().slice(0, 10), result.insertId]); }
+        catch (err) { if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; /* migration_052 not applied yet */ }
+    }
     return res.status(201).json({
         id: result.insertId, name, yearly_quota: yearly_quota || 0, monthly_quota: isPaid ? (monthly_quota || 0) : 0,
         carry_forward: !!carry_forward, is_paid: isPaid, count_holidays: countHolidays, count_weekly_offs: countWeeklyOffs,
@@ -82,7 +86,7 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
 router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
     const policyError = validateLeavePolicy(req.body);
     if (policyError) return res.status(400).json({ error: policyError });
-    const fields = ['name', 'yearly_quota', 'monthly_quota', 'carry_forward', 'is_paid', 'count_holidays', 'count_weekly_offs'];
+    const fields = ['name', 'code', 'yearly_quota', 'monthly_quota', 'carry_forward', 'is_paid', 'count_holidays', 'count_weekly_offs'];
     const updates = [];
     const values = [];
     fields.forEach(f => {

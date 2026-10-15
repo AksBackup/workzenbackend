@@ -108,6 +108,8 @@ const POLICY_FIELDS = [
     'consider_early_coming_punch', 'consider_late_going_punch',
     'mark_absent_prefix_day', 'mark_absent_suffix_day', 'mark_absent_both_prefix_suffix_day',
     'punch_required_mode', 'present_weekly_off_count', 'check_duplicate_minute',
+    // migration_054: what an attendance half day counts as - 'half' (default) | 'full' | 'absent'.
+    'half_day_counts_as',
 ];
 
 const TIME_RE = /^([01]?\d|2[0-3]):([0-5]\d)(:[0-5]\d)?$/;
@@ -125,8 +127,22 @@ function normalizePolicyTimes(body) {
 }
 
 /** Pulls only the known policy fields out of req.body, in a stable order matching POLICY_FIELDS. */
-function pickPolicyFields(body) {
-    return POLICY_FIELDS.map((f) => (body[f] === undefined ? null : body[f]));
+function pickPolicyFields(body, fields = POLICY_FIELDS) {
+    return fields.map((f) => {
+        if (f === 'half_day_counts_as') return ['half', 'full', 'absent'].includes(body[f]) ? body[f] : 'half';
+        return body[f] === undefined ? null : body[f];
+    });
+}
+
+/** POLICY_FIELDS, minus half_day_counts_as while migration_054 has not been applied (so saving never breaks). */
+let halfDayColumnKnown = false;
+async function activePolicyFields() {
+    if (!halfDayColumnKnown) {
+        const [cols] = await pool.query(
+            "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'office_time_policies' AND COLUMN_NAME = 'half_day_counts_as' LIMIT 1");
+        halfDayColumnKnown = cols.length > 0;
+    }
+    return halfDayColumnKnown ? POLICY_FIELDS : POLICY_FIELDS.filter((f) => f !== 'half_day_counts_as');
 }
 
 // GET /office-time-policy/policies - list every named policy for this
@@ -155,10 +171,11 @@ router.post('/policies', requireAdmin, asyncHandler(async (req, res) => {
     const timeErr = normalizePolicyTimes(req.body);
     if (timeErr) return res.status(400).json({ error: timeErr });
 
+    const fields = await activePolicyFields();
     const [result] = await pool.query(
-        `INSERT INTO office_time_policies (company_id, ${POLICY_FIELDS.join(', ')})
-         VALUES (?, ${POLICY_FIELDS.map(() => '?').join(', ')})`,
-        [req.user.companyId, ...pickPolicyFields(req.body)]
+        `INSERT INTO office_time_policies (company_id, ${fields.join(', ')})
+         VALUES (?, ${fields.map(() => '?').join(', ')})`,
+        [req.user.companyId, ...pickPolicyFields(req.body, fields)]
     );
     return res.status(201).json({ id: result.insertId, message: 'Policy created' });
 }));
@@ -181,10 +198,11 @@ router.put('/policies/:id', requireAdmin, asyncHandler(async (req, res) => {
         } catch (err) { if (err.code !== 'ER_BAD_FIELD_ERROR') throw err; }
     }
 
+    const fields = await activePolicyFields();
     const [result] = await pool.query(
-        `UPDATE office_time_policies SET ${POLICY_FIELDS.map((f) => `${f} = ?`).join(', ')}
+        `UPDATE office_time_policies SET ${fields.map((f) => `${f} = ?`).join(', ')}
          WHERE id = ? AND company_id = ?`,
-        [...pickPolicyFields(req.body), req.params.id, req.user.companyId]
+        [...pickPolicyFields(req.body, fields), req.params.id, req.user.companyId]
     );
     if (result.affectedRows === 0) return res.status(404).json({ error: 'Policy not found' });
     return res.json({ message: 'Policy updated' });

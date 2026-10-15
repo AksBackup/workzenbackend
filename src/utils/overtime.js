@@ -1,5 +1,6 @@
 const pool = require('../db');
 const { officePolicyShiftFor } = require('./officePolicyBasis');
+const { resolveShiftForDay, isOffShiftName } = require('./dayShift');
 
 /**
  * Auto-computes overtime for one employee/day whenever a check-out is
@@ -48,6 +49,14 @@ async function computeAndRecordOvertime(companyId, employeeId, dateStr, checkOut
     // when their *specific* assigned shift has ot_allowed = FALSE.
     let shiftRows = [];
     if (!officeShift) {
+        // The shift of THAT DAY (roster / multi-shift: first punch near shift B's start => shift B), so
+        // shift B days are measured against shift B's end time, not the primary shift's.
+        const dayShift = await resolveShiftForDay(companyId, employeeId, dateStr);
+        if (dayShift && !isOffShiftName(dayShift.name) && dayShift.end_time) {
+            shiftRows = [{ ot_allowed: dayShift.ot_allowed, end_time: dayShift.end_time }];
+        }
+    }
+    if (!officeShift && shiftRows.length === 0) {
         [shiftRows] = await pool.query(
             `SELECT s.ot_allowed, s.end_time FROM employees e
              JOIN shifts s ON s.id = e.shift_id

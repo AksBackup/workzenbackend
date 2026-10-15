@@ -153,11 +153,20 @@ router.delete('/:id', requireAdmin, asyncHandler(async (req, res) => {
         const adj = rows[0];
 
         // Yearly-pool entries (Leave Balance Entry, "[Yearly]" reason marker) live in leave_yearly_pools.
-        const table = String(adj.reason || '').startsWith('[Yearly]') ? 'leave_yearly_pools' : 'leave_balances';
-        await conn.query(
-            `UPDATE ${table} SET allocated = GREATEST(allocated - ?, 0) WHERE employee_id = ? AND leave_type_id = ? AND year = ?`,
-            [adj.amount, adj.employee_id, adj.leave_type_id, adj.year]
-        );
+        const monthMatch = /^\[Month (\d{4})-(\d{2})\]/.exec(String(adj.reason || ''));
+        if (monthMatch) {
+            // Month-wise credit: reverse it in leave_month_credits for that month.
+            await conn.query(
+                'UPDATE leave_month_credits SET amount = GREATEST(amount - ?, 0) WHERE employee_id = ? AND leave_type_id = ? AND year = ? AND month = ?',
+                [adj.amount, adj.employee_id, adj.leave_type_id, Number(monthMatch[1]), Number(monthMatch[2])]
+            );
+        } else {
+            const table = String(adj.reason || '').startsWith('[Yearly]') ? 'leave_yearly_pools' : 'leave_balances';
+            await conn.query(
+                `UPDATE ${table} SET allocated = GREATEST(allocated - ?, 0) WHERE employee_id = ? AND leave_type_id = ? AND year = ?`,
+                [adj.amount, adj.employee_id, adj.leave_type_id, adj.year]
+            );
+        }
         await conn.query('DELETE FROM leave_adjustments WHERE id = ? AND company_id = ?', [req.params.id, req.user.companyId]);
 
         await conn.commit();
