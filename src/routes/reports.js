@@ -1049,7 +1049,9 @@ const SHIFT_CODE_FALLBACK = 'GEN'; // used only when a resolved shift has no nam
 // duplicate week-only copy. `monthStart`/`monthEnd` names kept as-is
 // internally (despite now being a possibly-week-long range) to keep
 // this diff small - they're just "range start"/"range end" now.
-async function computeMuster(companyId, monthStart, monthEnd, context, { employeeId } = {}) {
+// anyStatus: include an inactive employee too (only meaningful together with employeeId - the employee
+// details screen shows any employee's month through this same function).
+async function computeMuster(companyId, monthStart, monthEnd, context, { employeeId, anyStatus = false } = {}) {
     const { fullDayHours, halfDayMinHours } = context;
     // Build the list of date strings in [monthStart, monthEnd] by
     // stepping a Date object, rather than assuming a calendar month -
@@ -1073,7 +1075,7 @@ async function computeMuster(companyId, monthStart, monthEnd, context, { employe
         empParams.push(employeeId);
     }
     const [employees] = await pool.query(
-        `SELECT id, name, emp_code, department, shift_id, work_mode, office_time_policy_id FROM employees WHERE company_id = ? AND status = 'active'${empFilterSql}`,
+        `SELECT id, name, emp_code, department, shift_id, work_mode, office_time_policy_id FROM employees WHERE company_id = ?${anyStatus ? '' : " AND status = 'active'"}${empFilterSql}`,
         empParams
     );
     if (employees.length === 0) return [];
@@ -1535,3 +1537,7 @@ router.get('/all-in-out', requireAdmin, asyncHandler(async (req, res) => {
 }));
 
 module.exports = router;
+// Shared with routes/employees.js (GET /employees/:id/monthly-summary) so the employee details screen
+// classifies every day exactly like the reports and payroll do.
+module.exports.computeMuster = computeMuster;
+module.exports.loadCompanyContext = loadCompanyContext;

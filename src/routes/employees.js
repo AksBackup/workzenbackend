@@ -9,6 +9,8 @@ const { resolveEmployeeOffDays } = require('../utils/dayClassifier');
 const { loadRosterOffIndex } = require('../utils/dayShift');
 const { computeMonthlyPaidUsage } = require('../utils/leaveQuota');
 const { loadLeaveIndex } = require('../utils/leaveIndex');
+// The reports' own day classifier (office-time-policy hours rules, roster, holiday groups, leave) - see monthly-summary below.
+const reportsRoutes = require('./reports');
 
 const router = express.Router();
 router.use(verifyFirebaseToken);
@@ -919,8 +921,22 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
     const attendanceByDate = new Map(attendanceRows.map(r => [toDateStr(r.date), r]));
     const today = toDateStr(new Date());
 
+    // One source of truth for "was this person present": the same per-day classification the Daily /
+    // Weekly / Monthly reports, the muster and payroll use (reports.js computeMuster -> utils/dayClassifier).
+    // It applies the Office Time Policy rules (a day shorter than the policy's half-day / absent limits is
+    // a Half Day / Absent even with a check-in; a punch on a weekly-off day is still Weekly Off, ...), which
+    // this screen used to skip by counting every day with a check-in as present.
+    let musterByDate = new Map();
+    try {
+        const ctx = await reportsRoutes.loadCompanyContext(req.user.companyId);
+        const [m] = await reportsRoutes.computeMuster(req.user.companyId, monthStart, monthEnd, ctx, { employeeId: Number(employeeId), anyStatus: true });
+        if (m) musterByDate = new Map(m.days.map(d => [d.date, d]));
+    } catch (err) {
+        console.error('monthly-summary: report classifier failed, falling back to the plain check-in rule:', err);
+    }
+
     const days = [];
-    let presentDays = 0, absentDays = 0, leaveDays = 0, holidayDays = 0, weeklyOffDays = 0;
+    let presentDays = 0, halfDays = 0, absentDays = 0, leaveDays = 0, holidayDays = 0, weeklyOffDays = 0;
 
     for (let d = 1; d <= daysInMonth; d++) {
         const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
@@ -933,7 +949,24 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
 
         let status;
         let isLate = false;
-        if (holidayName) {
+        const md = musterByDate.get(dateStr);
+        if (md) {
+            switch (md.status) {
+                case 'holiday': status = 'holiday'; holidayDays++; break;
+                case 'weekly_off': status = 'weekly_off'; weeklyOffDays++; break;
+                case 'leave': status = 'leave'; leaveDays++; break;
+                case 'present':
+                    // A day worked after an approved half-day leave is shown (and counted) as a half day, like the reports' P/2.
+                    if (md.status_code === 'P/2') { status = 'half_day'; halfDays++; } else { status = 'present'; presentDays++; }
+                    break;
+                case 'half_day': status = 'half_day'; halfDays++; break;
+                default: // 'absent'
+                    if (isFuture) { status = 'upcoming'; } else { status = 'absent'; absentDays++; }
+            }
+            if ((status === 'present' || status === 'half_day') && att && att.check_in && timeOfDayStr(att.check_in) > checkInWindowEnd) {
+                isLate = true;
+            }
+        } else if (holidayName) {
             status = 'holiday';
             holidayDays++;
         } else if (onLeave) {
@@ -969,9 +1002,10 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         });
     }
 
-    const workingDaysElapsed = presentDays + absentDays;
+    // A half day counts 0.5 present (same weighting as the reports' present total).
+    const workingDaysElapsed = presentDays + halfDays + absentDays;
     const attendancePercentage = workingDaysElapsed > 0
-        ? Math.round((presentDays / workingDaysElapsed) * 1000) / 10
+        ? Math.round(((presentDays + 0.5 * halfDays) / workingDaysElapsed) * 1000) / 10
         : 0;
     const leaveUsed = leaveBalances.reduce((acc, b) => acc + b.used, 0);
     const leaveRemaining = leaveBalances.reduce((acc, b) => acc + b.remaining, 0);
@@ -989,6 +1023,7 @@ router.get('/:id/monthly-summary', asyncHandler(async (req, res) => {
         month,
         attendance_percentage: attendancePercentage,
         present_days: presentDays,
+        half_days: halfDays, // new: days that count as a half day (policy half day, or worked after a half-day leave)
         absent_days: absentDays,
         leave_days: leaveDays,
         holiday_days: holidayDays,
