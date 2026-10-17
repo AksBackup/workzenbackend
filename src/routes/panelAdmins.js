@@ -24,7 +24,10 @@ const router = express.Router();
  *   POST /panel/admins                          super (adds a Firebase UID as role 'admin' only)
  *   PUT  /panel/admins/:uid/status              super (DB-added admins)
  *   DELETE /panel/admins/:uid                   super (DB-added admins; env admins cannot be removed)
- *   POST /panel/companies/:id/delete-data       super (typed confirmation; dry_run supported)
+ *   POST /panel/companies/:id/delete-data       super (typed confirmation; dry_run supported;
+ *                                               `release: true` also frees the PC(s) - see below)
+ *   POST /panel/companies/:id/release-pc        super (frees the PC(s)/key(s) of a company whose data
+ *                                               was ALREADY deleted without `release`)
  *   GET  /panel/audit-log                       super
  * No passwords are handled here: admins are Firebase UIDs, created in Firebase by the owner.
  */
@@ -367,6 +370,58 @@ async function deletedAlready(companyId) {
     }
 }
 
+/**
+ * "Free the PC": make the license key(s) of a removed company activatable again.
+ *   - licenses: status 'unused', company_id / device_fingerprint / activated_at cleared, so
+ *     POST /license/activate accepts the key again (it requires status 'unused') and the
+ *     fingerprint binding to the old PC is gone (a PC is "new" again).
+ *   - the removed company's row is renamed "<name> [removed #id]". /license/activate refuses a
+ *     company name that already exists (even for a removed company), so without this the same
+ *     company name could never be registered again. The row itself stays (licenses.company_id
+ *     and companies.license_id are foreign keys, company_deletions keeps the tombstone).
+ * Runs inside the caller's transaction. `statuses` limits which licenses are released: a key the
+ * vendor revoked for cause is only un-revoked by the explicit release-pc action, never silently.
+ */
+async function releaseCompanyIdentity(conn, companyId, { statuses, licenseIds }) {
+    let sql = `UPDATE licenses SET status = 'unused', company_id = NULL, device_fingerprint = NULL, activated_at = NULL
+               WHERE company_id = ? AND status IN (${statuses.map(() => '?').join(', ')})`;
+    const params = [companyId, ...statuses];
+    if (Array.isArray(licenseIds) && licenseIds.length) { sql += ' AND id IN (?)'; params.push(licenseIds); }
+    const [rl] = await conn.query(sql, params);
+    await conn.query(
+        `UPDATE companies SET name = LEFT(CONCAT(LEFT(name, 110), ' [removed #', id, ']'), 150)
+         WHERE id = ? AND LOCATE(' [removed #', name) = 0`,
+        [companyId]
+    );
+    return rl && rl.affectedRows ? rl.affectedRows : 0;
+}
+
+/**
+ * After the DB commit (best effort, never fails the request). mode 'disable' blocks the Firebase
+ * accounts; mode 'remove' deletes them so the same e-mail can register again (createUser fails
+ * with "email already exists" for a merely disabled account). Platform admins are never touched.
+ */
+async function retireFirebaseUsers(uids, mode) {
+    const protectedUids = new Set(configuredPlatformAdmins().map((a) => a.uid));
+    let ok = 0;
+    let failed = 0;
+    for (const uid of uids) {
+        if (protectedUids.has(uid)) continue;
+        try {
+            if (mode === 'remove') {
+                await admin.auth().deleteUser(uid);
+            } else {
+                await admin.auth().updateUser(uid, { disabled: true });
+                try { await admin.auth().revokeRefreshTokens(uid); } catch (_) { /* best effort */ }
+            }
+            ok++;
+        } catch (err) {
+            if (mode === 'remove' && err && err.code === 'auth/user-not-found') ok++; else failed++;
+        }
+    }
+    return { ok, failed };
+}
+
 const MIGRATION_053 = 'The database is missing migration_053_company_deletions.sql. Apply it (migrations/migration_053_company_deletions.sql) and retry.';
 
 // POST /panel/companies/:id/delete-data
@@ -376,6 +431,7 @@ router.post('/companies/:id/delete-data', requireSuperAdmin, asyncHandler(async 
     if (!Number.isInteger(companyId) || companyId < 1) return res.status(400).json({ error: 'Invalid company id' });
     const body = req.body || {};
     const dryRun = body.dry_run === true;
+    const release = body.release === true; // also free the PC(s): keys become 'unused' again
 
     const [cRows] = await pool.query('SELECT id, name, company_code FROM companies WHERE id = ?', [companyId]);
     if (cRows.length === 0) return res.status(404).json({ error: 'Company not found' });
@@ -396,6 +452,7 @@ router.post('/companies/:id/delete-data', requireSuperAdmin, asyncHandler(async 
     let counts;
     let uids = [];
     let revoked = 0;
+    let released = 0;
     try {
         const plan = await buildPlan(conn);
         const targets = targetsFor(plan);
@@ -437,8 +494,13 @@ router.post('/companies/:id/delete-data', requireSuperAdmin, asyncHandler(async 
                 throw e;
             }
 
-            const [rv] = await conn.query("UPDATE licenses SET status = 'revoked' WHERE company_id = ?", [companyId]);
-            revoked = rv && rv.affectedRows ? rv.affectedRows : 0;
+            if (release) {
+                // Active keys go back to 'unused' (PC freed). Keys already revoked/expired stay as they are.
+                released = await releaseCompanyIdentity(conn, companyId, { statuses: ['active'] });
+            } else {
+                const [rv] = await conn.query("UPDATE licenses SET status = 'revoked' WHERE company_id = ?", [companyId]);
+                revoked = rv && rv.affectedRows ? rv.affectedRows : 0;
+            }
             await conn.query(
                 `INSERT INTO screen_locks (company_id, lock_key, locked, updated_by_uid, updated_by_email)
                  VALUES (?, ?, 1, ?, ?)
@@ -449,7 +511,7 @@ router.post('/companies/:id/delete-data', requireSuperAdmin, asyncHandler(async 
                 `INSERT INTO company_deletions (company_id, company_name, company_code, deleted_by_uid, deleted_by_email, row_counts_json)
                  VALUES (?, ?, ?, ?, ?, ?)`,
                 [companyId, company.name, company.company_code || null, req.platform.uid, req.platform.email || null,
-                    JSON.stringify({ tables: counts, licenses_revoked: revoked })]
+                    JSON.stringify({ tables: counts, licenses_revoked: revoked, licenses_released: released, firebase_uids: uids })]
             );
             await conn.commit();
         } catch (err) {
@@ -466,27 +528,103 @@ router.post('/companies/:id/delete-data', requireSuperAdmin, asyncHandler(async 
 
     markCompanyRemoved(companyId);
 
-    // Best effort, AFTER the commit: disable the company's Firebase accounts. Never a platform admin.
-    let disabled = 0;
-    let failed = 0;
-    const protectedUids = new Set(configuredPlatformAdmins().map((a) => a.uid));
-    for (const uid of uids) {
-        if (protectedUids.has(uid)) continue;
-        try {
-            await admin.auth().updateUser(uid, { disabled: true });
-            try { await admin.auth().revokeRefreshTokens(uid); } catch (_) { /* best effort */ }
-            disabled++;
-        } catch (_) { failed++; }
-    }
+    // Best effort, AFTER the commit: disable (or, when freeing the PC, delete) the company's Firebase accounts.
+    const fbResult = await retireFirebaseUsers(uids, release ? 'remove' : 'disable');
+    const disabled = fbResult.ok;
+    const failed = fbResult.failed;
     const total = Object.values(counts).reduce((a, b) => a + b, 0);
     await logPanelAction(req, 'delete_company_data', 'company', companyId, {
         company_name: company.name, company_code: company.company_code || null,
-        row_counts: counts, total_rows: total, licenses_revoked: revoked,
-        firebase_users_disabled: disabled, firebase_users_failed: failed,
+        row_counts: counts, total_rows: total, licenses_revoked: revoked, licenses_released: released,
+        released_pc: release, firebase_users_disabled: disabled, firebase_users_failed: failed,
     });
     return res.json({
         message: 'Company data deleted.', company_id: companyId, tables: counts, total_rows: total,
-        licenses_revoked: revoked, firebase_users_disabled: disabled, firebase_users_failed: failed,
+        licenses_revoked: revoked, licenses_released: released, released_pc: release,
+        firebase_users_disabled: disabled, firebase_users_failed: failed,
+    });
+}));
+
+// POST /panel/companies/:id/release-pc
+// body: { confirm: <company code or ORIGINAL company name>, license_ids?: [id...], admin_email?: string }
+// For a company whose data was already deleted (tombstone exists): turns its license key(s) back into
+// 'unused' (fingerprint cleared), frees the company name, and deletes the company's Firebase accounts
+// so the same admin e-mail can register again. Idempotent. NOTE: this also un-revokes keys that were
+// revoked by the delete itself - do not use it for a key you revoked for cause (pass license_ids to
+// release only specific keys).
+router.post('/companies/:id/release-pc', requireSuperAdmin, asyncHandler(async (req, res) => {
+    const companyId = Number(req.params.id);
+    if (!Number.isInteger(companyId) || companyId < 1) return res.status(400).json({ error: 'Invalid company id' });
+    const body = req.body || {};
+
+    let tomb;
+    try {
+        const [t] = await pool.query(
+            'SELECT company_name, company_code, row_counts_json FROM company_deletions WHERE company_id = ? LIMIT 1', [companyId]);
+        tomb = t[0];
+    } catch (err) {
+        if (err.code === 'ER_NO_SUCH_TABLE') return res.status(503).json({ error: MIGRATION_053 });
+        throw err;
+    }
+    if (!tomb) return res.status(409).json({ error: 'This company has not been deleted. Use "Delete data" first.' });
+
+    const typed = String(body.confirm === undefined ? '' : body.confirm);
+    if (!typed || (typed !== String(tomb.company_name) && typed !== String(tomb.company_code || ''))) {
+        return res.status(400).json({ error: 'Confirmation text does not match. Type the exact company code or the original company name.' });
+    }
+    let licenseIds = null;
+    if (body.license_ids !== undefined) {
+        if (!Array.isArray(body.license_ids) || !body.license_ids.length || !body.license_ids.every((i) => Number.isInteger(i) && i > 0)) {
+            return res.status(400).json({ error: 'license_ids must be a non-empty array of license ids' });
+        }
+        licenseIds = body.license_ids;
+    }
+
+    const conn = await pool.getConnection();
+    let released = 0;
+    try {
+        await conn.beginTransaction();
+        try {
+            released = await releaseCompanyIdentity(conn, companyId, { statuses: ['revoked', 'active'], licenseIds });
+            await conn.commit();
+        } catch (err) {
+            try { await conn.rollback(); } catch (_) { /* connection may be gone */ }
+            throw err;
+        }
+    } finally {
+        conn.release();
+    }
+
+    // Firebase accounts: the uids recorded at deletion time, plus (for deletions made before uids were
+    // recorded) an optional admin e-mail - only removed if its custom claim says it belonged to THIS company.
+    let uids = [];
+    try {
+        const rc = typeof tomb.row_counts_json === 'string' ? JSON.parse(tomb.row_counts_json) : tomb.row_counts_json;
+        if (rc && Array.isArray(rc.firebase_uids)) uids = rc.firebase_uids.slice();
+    } catch (_) { /* unreadable json: fall through to the e-mail path */ }
+    let emailStatus = null;
+    if (body.admin_email) {
+        const email = String(body.admin_email).trim();
+        try {
+            const u = await admin.auth().getUserByEmail(email);
+            const claimCompany = u.customClaims && u.customClaims.company_id;
+            if (Number(claimCompany) === companyId) { uids.push(u.uid); emailStatus = 'removed'; }
+            else emailStatus = 'skipped: that account does not belong to this company';
+        } catch (err) {
+            emailStatus = err && err.code === 'auth/user-not-found' ? 'not found in Firebase (already free)' : 'lookup failed';
+        }
+    }
+    uids = [...new Set(uids)];
+    const fbResult = await retireFirebaseUsers(uids, 'remove');
+
+    await logPanelAction(req, 'release_pc', 'company', companyId, {
+        company_name: tomb.company_name, licenses_released: released, license_ids: licenseIds,
+        firebase_users_removed: fbResult.ok, firebase_users_failed: fbResult.failed, admin_email_status: emailStatus,
+    });
+    return res.json({
+        message: released ? 'PC released. The license key(s) can be activated again.' : 'No license of this company needed releasing.',
+        company_id: companyId, licenses_released: released,
+        firebase_users_removed: fbResult.ok, firebase_users_failed: fbResult.failed, admin_email_status: emailStatus,
     });
 }));
 

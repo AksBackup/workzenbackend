@@ -353,7 +353,10 @@
             if (c.removed) {
                 tbody.appendChild(h('tr', {}, [
                     h('td', { text: c.name }), h('td', { class: 'keyval' }, [c.company_code || dash()]),
-                    h('td', { colspan: '6' }, [badge('Removed', 'revoked'), ' ', h('span', { class: 'muted', text: 'Data deleted ' + fmtDate(c.removed_at, true) + '. Licenses revoked.' })]),
+                    h('td', { colspan: '6' }, [badge('Removed', 'revoked'), ' ', h('span', { class: 'muted', text: 'Data deleted ' + fmtDate(c.removed_at, true) + '.' }), ' ',
+                        ME.role === 'super_admin'
+                            ? h('button', { type: 'button', class: 'warn small', text: 'Free PC / license', title: 'Make this company\'s license key(s) activatable again and free its name and admin e-mail', onclick: function () { releasePc(c); } })
+                            : null]),
                 ]));
                 return;
             }
@@ -382,13 +385,32 @@
         var lines = Object.keys(preview.tables).map(function (t) { return '  ' + t + ': ' + preview.tables[t]; });
         var msg = 'DELETE ALL DATA of ' + c.name + '?\n\n' + DELETE_WARNING +
             '\n\nRows to be deleted (' + preview.total_rows + ' total):\n' + (lines.join('\n') || '  (none)') +
-            '\n\nIts licenses will be revoked and its users blocked. This cannot be undone.';
+            '\n\nThis cannot be undone.';
         if (!window.confirm(msg)) return;
+        var release = window.confirm('FREE THE PC(S) too?\n\nOK     = the license key(s) become UNUSED again (fingerprint cleared), the company name and the admin e-mail become free, and the PC can be registered again as a brand-new device.\nCancel = the license key(s) are REVOKED (old behaviour: the key can never be activated again).');
         var typed = window.prompt('Type the company code or the exact company name to confirm:\n' + c.name + (c.company_code ? '  /  ' + c.company_code : ''));
         if (typed === null) return;
         try {
-            var r = await api('/panel/companies/' + c.id + '/delete-data', 'POST', { confirm: typed });
-            globalMsg('Deleted ' + r.total_rows + ' rows of ' + c.name + '; ' + r.licenses_revoked + ' license(s) revoked; ' + r.firebase_users_disabled + ' Firebase user(s) disabled.', 'ok');
+            var r = await api('/panel/companies/' + c.id + '/delete-data', 'POST', { confirm: typed, release: release });
+            globalMsg('Deleted ' + r.total_rows + ' rows of ' + c.name + '; ' +
+                (release ? r.licenses_released + ' license(s) released (PC free); ' + r.firebase_users_disabled + ' Firebase user(s) removed.'
+                         : r.licenses_revoked + ' license(s) revoked; ' + r.firebase_users_disabled + ' Firebase user(s) disabled.'), 'ok');
+        } catch (e) { globalMsg(e.message, 'err'); }
+        loadCompanies();
+    });
+
+    // Companies whose data was deleted earlier (license revoked, key stuck): free the PC afterwards.
+    var releasePc = guard(async function (c) {
+        if (!window.confirm('FREE THE PC / LICENSE of ' + c.name + '?\n\nIts license key(s) become UNUSED again (fingerprint cleared) so they can be activated on a PC, the company name is freed and its Firebase admin account is deleted.\n\nWarning: this also un-revokes keys that were revoked by the delete. Do not use it for a key you revoked for non-payment.')) return;
+        var typed = window.prompt('Type the company code or the ORIGINAL company name to confirm:\n' + (c.company_code || String(c.name).replace(/ \[removed #\d+\]$/, '')));
+        if (typed === null) return;
+        var email = window.prompt('Optional: the admin e-mail used when this company was registered (needed only for companies deleted before this feature existed). Leave empty to skip.', '');
+        try {
+            var body = { confirm: typed };
+            if (email && email.trim()) body.admin_email = email.trim();
+            var r = await api('/panel/companies/' + c.id + '/release-pc', 'POST', body);
+            globalMsg(r.message + ' (' + r.licenses_released + ' license(s) released, ' + r.firebase_users_removed + ' Firebase user(s) removed' +
+                (r.admin_email_status ? '; admin e-mail: ' + r.admin_email_status : '') + ')', 'ok');
         } catch (e) { globalMsg(e.message, 'err'); }
         loadCompanies();
     });
