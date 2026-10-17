@@ -53,6 +53,7 @@ router.post('/activate', asyncHandler(async (req, res) => {
     }
 
     const conn = await pool.getConnection();
+    let createdFirebaseUid = null; // so a failure AFTER createUser does not leave an orphan account behind
     try {
         await conn.beginTransaction();
 
@@ -163,6 +164,7 @@ router.post('/activate', asyncHandler(async (req, res) => {
             password: admin_password,
             displayName: admin_name,
         });
+        createdFirebaseUid = firebaseUser.uid;
         await admin.auth().setCustomUserClaims(firebaseUser.uid, { company_id: companyId, role: 'admin' });
 
         // admins.company_id is UNIQUE - this enforces "one admin per company" at the DB level
@@ -182,9 +184,27 @@ router.post('/activate', asyncHandler(async (req, res) => {
             message: 'License activated. Admin account created.',
         });
     } catch (err) {
-        await conn.rollback();
+        try { await conn.rollback(); } catch (_) { /* connection may be gone */ }
         console.error('License activation failed:', err);
-        return res.status(500).json({ error: 'Activation failed', detail: err.message });
+        // The DB work is rolled back, so the Firebase admin created above must go too - otherwise the
+        // next attempt fails with "email already exists" and the customer is stuck.
+        if (createdFirebaseUid) {
+            try { await admin.auth().deleteUser(createdFirebaseUid); } catch (e) { console.error('Could not remove orphan Firebase user', createdFirebaseUid, e.message); }
+        }
+        // Say what actually went wrong instead of a blind 500.
+        if (err && err.code === 'auth/email-already-exists') {
+            return res.status(409).json({ error: 'An account with this admin e-mail already exists. Use a different e-mail, or ask support to free the old account.' });
+        }
+        if (err && err.code === 'auth/invalid-password') {
+            return res.status(400).json({ error: 'The password is too weak. Use at least 6 characters.' });
+        }
+        if (err && err.code === 'auth/invalid-email') {
+            return res.status(400).json({ error: 'The admin e-mail address is not valid.' });
+        }
+        if (err && err.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({ error: 'Activation conflicts with existing data: ' + (err.sqlMessage || err.message) });
+        }
+        return res.status(500).json({ error: 'Activation failed', detail: err.sqlMessage || err.message });
     } finally {
         conn.release();
     }
