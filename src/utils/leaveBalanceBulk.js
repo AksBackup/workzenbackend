@@ -28,6 +28,8 @@
  * Modes:
  *   - 'add':    allocated = allocated + amount (a missing row starts from 0, the
  *               same base Earn Leave already uses). Audit row type 'earn', amount +.
+ *   - 'set':    allocated = amount (the Save button). Only the difference is written to the audit
+ *               trail ('earn' when it went up, 'adjust' when it went down); unchanged rows are skipped.
  *   - 'delete': allocated = max(0, allocated - amount). Only the amount actually
  *               removed is recorded, as an 'adjust' audit row with a negative amount.
  */
@@ -125,7 +127,7 @@ async function resolveEmployees(db, companyId, filter) {
  * employee matched by `filter`, in one transaction. Returns a summary.
  */
 async function runBulkBalance(pool, { companyId, adminId, year, month, mode, period = 'monthly', balances, filter, reason, dryRun }) {
-    if (!['add', 'delete'].includes(mode)) throw bad("mode must be 'add' or 'delete'.");
+    if (!['add', 'delete', 'set'].includes(mode)) throw bad("mode must be 'add', 'delete' or 'set'.");
     if (!['monthly', 'yearly'].includes(period)) throw bad("period must be 'monthly' or 'yearly'.");
     // monthly -> leave_balances.allocated (per-month quota); yearly -> leave_yearly_pools.allocated (annual pool)
     // With a month chosen (monthly period only) the amount is a ONE-TIME credit for that month:
@@ -138,7 +140,7 @@ async function runBulkBalance(pool, { companyId, adminId, year, month, mode, per
     const amountCol = isMonthCredit ? 'amount' : 'allocated';
     const y = Number(year);
     if (!Number.isInteger(y) || y < 2000 || y > 2100) throw bad('year must be a valid year.');
-    const baseReason = (reason && String(reason).trim()) || (mode === 'add' ? 'Leave balance entry: addition' : 'Leave balance entry: deletion');
+    const baseReason = (reason && String(reason).trim()) || (mode === 'add' ? 'Leave balance entry: addition' : (mode === 'set' ? 'Leave balance entry: saved balance' : 'Leave balance entry: deletion'));
     // The marker lets DELETE /leave-adjustments/:id reverse the right store.
     const reasonText = period === 'yearly' ? `${YEARLY_MARKER} ${baseReason}`
         : (isMonthCredit ? `${monthMarker(y, m)} ${baseReason}` : baseReason);
@@ -191,6 +193,10 @@ async function runBulkBalance(pool, { companyId, adminId, year, month, mode, per
                 let deltaT;
                 if (mode === 'add') {
                     deltaT = b.tenths;
+                } else if (mode === 'set') {
+                    // Save: the entered number becomes the balance; only the difference is recorded.
+                    deltaT = b.tenths - curT;
+                    if (deltaT === 0) continue;
                 } else {
                     deltaT = -Math.min(b.tenths, curT);
                     if (deltaT === 0) continue;

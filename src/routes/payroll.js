@@ -132,6 +132,20 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
              WHERE e.company_id = ? AND e.status = 'active'${empFilterSql}`, empParams);
     }
 
+    // migration_055: per-employee PF / ESI / PT switches, PF / ESI numbers. Read separately so payroll
+    // still runs on a database where that migration has not been applied yet.
+    try {
+        const [extra] = await pool.query(
+            `SELECT id, pf_applicable, esi_applicable, pt_amount FROM employees WHERE company_id = ?${empFilterSql}`, empParams);
+        const byId = new Map(extra.map((r) => [r.id, r]));
+        for (const e of employees) {
+            const x = byId.get(e.id);
+            if (x) { e.pf_applicable = x.pf_applicable; e.esi_applicable = x.esi_applicable; e.pt_amount = x.pt_amount; }
+        }
+    } catch (err) {
+        if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+    }
+
     // ---- Payment Setup heads (names + amounts, not just totals) ----
     let headRows = [];
     try {
@@ -393,7 +407,12 @@ async function computeMonthlyPayroll(companyId, year, month, opts = {}) {
         const additionForWages = round2(heads0.addition.reduce((a, h) => a + h.amount, 0));
         const esiWage = round2(earned + additionForWages);
         const grossEarnings = round2(totalPay + additionForWages);
-        const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, earned, esiWage, grossEarnings, employeeOverride);
+        const empStat = {
+            pfApplicable: emp.pf_applicable === undefined ? null : emp.pf_applicable,
+            esiApplicable: emp.esi_applicable === undefined ? null : emp.esi_applicable,
+            ptAmount: emp.pt_amount === undefined ? null : emp.pt_amount,
+        };
+        const statutory = computeStatutoryDeductions(statutorySettings, ptSlabs, earned, esiWage, grossEarnings, employeeOverride, empStat);
         const statutoryTotal = round2(statutory.pfEmployee + statutory.esiEmployee + statutory.ptAmount + statutory.tdsAmount);
         const total1 = round2(totalPay - statutoryTotal);
 
@@ -478,8 +497,31 @@ function dateKey(d) {
  * company-wide - an override changes the rate/ceiling used, it can't
  * turn on a scheme the company has switched off entirely.
  */
-function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, esiWage, grossPay, employeeOverride) {
-    const override = employeeOverride && employeeOverride.active ? employeeOverride : null;
+function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, esiWage, grossPay, employeeOverride, empStat) {
+    // empStat (migration_055, optional): the employee's own PF / ESI / PT switches. null = follow the company
+    // Statutory Settings exactly as before; 1 / 0 = on / off for this employee. When a switch is set the
+    // employee's own PF % / EPF % / ESI % / PF limit count even without the "Active" tick (the company rates
+    // fill whatever was left blank, or the usual statutory defaults when the company never configured any).
+    const es = empStat || {};
+    const hasOwn = es.pfApplicable !== null && es.pfApplicable !== undefined
+        || es.esiApplicable !== null && es.esiApplicable !== undefined;
+    const override = employeeOverride && (employeeOverride.active || hasOwn) ? employeeOverride : null;
+    const tdsOverride = employeeOverride && employeeOverride.active ? employeeOverride : null;
+    const DEF = { pf_employee_rate: 12, pf_employer_rate: 12, pf_apply_ceiling: true, pf_wage_ceiling: 15000,
+        esi_employee_rate: 0.75, esi_employer_rate: 3.25, esi_wage_ceiling: 21000 };
+    const pick = (k) => (settings[k] === undefined || settings[k] === null ? DEF[k] : settings[k]);
+    settings = { ...settings };
+    if (es.pfApplicable !== null && es.pfApplicable !== undefined) {
+        settings.pf_enabled = !!Number(es.pfApplicable);
+        settings.pf_employee_rate = pick('pf_employee_rate'); settings.pf_employer_rate = pick('pf_employer_rate');
+        settings.pf_apply_ceiling = settings.pf_apply_ceiling === undefined ? true : settings.pf_apply_ceiling;
+        settings.pf_wage_ceiling = pick('pf_wage_ceiling');
+    }
+    if (es.esiApplicable !== null && es.esiApplicable !== undefined) {
+        settings.esi_enabled = !!Number(es.esiApplicable);
+        settings.esi_employee_rate = pick('esi_employee_rate'); settings.esi_employer_rate = pick('esi_employer_rate');
+        settings.esi_wage_ceiling = pick('esi_wage_ceiling');
+    }
 
     let pfEmployee = 0, pfEmployer = 0;
     if (settings.pf_enabled) {
@@ -508,7 +550,9 @@ function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, esiWage, gr
     }
 
     let ptAmount = 0;
-    if (settings.pt_enabled) {
+    if (es.ptAmount !== null && es.ptAmount !== undefined) {
+        ptAmount = round2(Number(es.ptAmount) || 0); // this employee's own fixed PT per month
+    } else if (settings.pt_enabled) {
         const slab = ptSlabs.find(s => {
             const min = Number(s.min_wage);
             const max = s.max_wage === null ? null : Number(s.max_wage);
@@ -522,7 +566,7 @@ function computeStatutoryDeductions(settings, ptSlabs, basePayForPf, esiWage, gr
     // override. Flat amount and percent-of-gross are additive (an
     // employee can have either, both, or neither).
     let tdsAmount = 0;
-    if (override) {
+    if (tdsOverride) {
         const flat = override.tdsAmount !== null && override.tdsAmount !== undefined ? Number(override.tdsAmount) : 0;
         const pct = override.tdsPercent !== null && override.tdsPercent !== undefined ? Number(override.tdsPercent) : 0;
         tdsAmount = round2(flat + (grossPay * pct / 100));

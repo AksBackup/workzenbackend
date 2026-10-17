@@ -258,6 +258,17 @@ router.post('/', requireAdmin, asyncHandler(async (req, res) => {
                 !!statutory_override_active, card_no || null]
         );
 
+        // migration_055: per-employee PF / ESI / PT settings.
+        if (await require('../utils/columnCache').hasColumn('employees', 'pf_applicable')) {
+            const b = req.body;
+            const tri = (v) => (v === undefined || v === null ? null : (v ? 1 : 0));
+            await conn.query(
+                'UPDATE employees SET pf_applicable = ?, pf_number = ?, esi_applicable = ?, esi_number = ?, pt_amount = ? WHERE id = ?',
+                [tri(b.pf_applicable), b.pf_number ? String(b.pf_number).trim().slice(0, 30) : null,
+                    tri(b.esi_applicable), b.esi_number ? String(b.esi_number).trim().slice(0, 30) : null,
+                    b.pt_amount === undefined || b.pt_amount === null || b.pt_amount === '' ? null : Number(b.pt_amount), result.insertId]);
+        }
+
         if (req.body.geofence_enabled !== undefined && (await require('../utils/columnCache').hasColumn('employees', 'geofence_enabled'))) {
             await conn.query('UPDATE employees SET geofence_enabled = ? WHERE id = ?', [req.body.geofence_enabled ? 1 : 0, result.insertId]);
         }
@@ -454,6 +465,10 @@ router.put('/:id', requireAdmin, asyncHandler(async (req, res) => {
         'pf_percent', 'epf_percent', 'esi_percent', 'pf_limit', 'ot_rate_type', 'ot_rate_value', 'tds_amount', 'tds_percent', 'statutory_override_active', 'card_no', 'geofence_enabled'];
     if (!(await require('../utils/columnCache').hasColumn('employees', 'geofence_enabled'))) {
         fields.splice(fields.indexOf('geofence_enabled'), 1); // migration_046 not run yet
+    }
+    // migration_055: per-employee PF / ESI / PT settings (only once that migration has run).
+    if (await require('../utils/columnCache').hasColumn('employees', 'pf_applicable')) {
+        fields.push('pf_applicable', 'pf_number', 'esi_applicable', 'esi_number', 'pt_amount');
     }
     // migration_047: the zone this employee is tied to. Turning geofencing OFF clears it.
     if (await require('../utils/columnCache').hasColumn('employees', 'geofence_zone_id')) {

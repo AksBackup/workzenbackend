@@ -84,13 +84,13 @@ const ROUTE_TABS = {
     '/visitors': ['visitor_management'],
     '/canteen': ['canteen_management'],
     '/loans': ['loans'],
-    '/payroll': ['payroll', 'salary_report'],
+    '/payroll': ['payroll', 'salary_report', 'monthly_salary_statement', 'monthly_payslip'],
     '/salary-structures': ['salary_structure'],
     '/ad-hoc-payments': ['ad_hoc_payment'],
     '/bonuses': ['bonus_payroll'],
     '/conveyance': ['conveyance'],
     '/overtime': ['overtime_report', 'attendance'],
-    '/reports': ['daily_report', 'monthly_report', 'old_monthly_report', 'missed_punch_report', 'weekly_report', 'na_shift_report', 'late_early_report', 'overtime_report', 'salary_report'],
+    '/reports': ['daily_report', 'monthly_report', 'old_monthly_report', 'missed_punch_report', 'weekly_report', 'na_shift_report', 'late_early_report', 'overtime_report', 'salary_report', 'monthly_short_report'],
     '/devices': ['device_connect', 'add_edit_machine', 'download_logs', 'device_users', 'device_admin'],
 };
 
